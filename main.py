@@ -1,0 +1,2981 @@
+"""A small, beginner-friendly Telegram bot for sharing baseball plays."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import os
+import re
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from dotenv import load_dotenv
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
+
+from ai_analysis import (
+    analyze_mlb_slate,
+    analyze_specialized_mlb_slate,
+    build_fallback_card,
+    get_last_analysis_metadata,
+)
+from anime_magazine_generator import (
+    generate_daily_magazine_prompts,
+    save_magazine_prompts,
+)
+from best_hit_prop_image import prepare_best_hit_prop_image
+from card_format import PARLAY_NOTE, RECOMMENDATION_FOOTER, TIMED_CARD_FOOTER
+from card_time import eastern_now, official_sports_date, tomorrow_sports_date
+from card_image_generator import generate_mlb_card_slides, save_mlb_card_slide_prompts
+from game_time import mlb_game_block
+from mlb_data import MLBDataError, get_combined_slate
+from model_report import load_model_report, save_model_report
+from mlb_auto_image import prepare_mlb_auto_image
+from openai_image_generator import generate_image, generate_image_from_prompt
+from player_verification import verify_player_team
+from prop_card_generator import (
+    generate_hits_by_team_prompts,
+    generate_prop_card_prompts,
+    save_prop_prompts,
+)
+from player_props_engine import (
+    approve_prop,
+    build_player_props_lab,
+    player_props_engine_available,
+    render_hits_by_team_card,
+    render_prop_debug,
+    render_prop_type_card,
+    render_props_test,
+    render_props_admin_card,
+)
+from api_sports_baseball import api_sports_baseball_available
+from fangraphs_data import fangraphs_available
+from savant_data import savant_available
+from soccer_analysis import analyze_soccer_slate, soccer_debug_report
+from soccer_master_engines import soccer_slate_summary
+from soccer_data import (
+    SoccerDataError,
+    api_football_available,
+    check_clubelo,
+    fbref_available,
+    check_serpapi,
+    statsbomb_available,
+    check_thesportsdb,
+    check_understat,
+    get_last_soccer_debug,
+    get_soccer_slate,
+)
+from soccer_results import SoccerResultsError, build_soccer_results_dashboard
+from results_tracker import (
+    ResultsTrackerError,
+    build_daily_results_dashboard,
+    build_range_results_dashboard,
+    debug_results_summary,
+    debug_picks_summary,
+    display_date,
+    eastern_today,
+    grade_mlb_picks_for_date,
+    get_most_recent_featured_picks,
+    load_picks,
+    load_results,
+    normalize_pick_date,
+    save_official_picks,
+    save_soccer_picks,
+    update_results_from_mlb,
+)
+from today_pick_image import prepare_today_pick_image
+from posting_scheduler import (
+    post_daily_results_if_ready,
+    results_auto_status_text,
+    run_game_aware_scheduler,
+    set_auto_results_enabled,
+)
+
+
+# Show useful information in the terminal while the bot is running.
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+
+def _admin_telegram_id() -> int | None:
+    """Read the single authorized Telegram user ID from the environment."""
+    try:
+        return int(os.getenv("MY_TELEGRAM_ID", "").strip())
+    except ValueError:
+        logging.error("MY_TELEGRAM_ID must be a numeric Telegram user ID")
+        return None
+
+
+def _is_admin_user(user_id: int | None) -> bool:
+    """Return True only for the configured owner/admin Telegram ID."""
+    configured_id = _admin_telegram_id()
+    return configured_id is not None and user_id == configured_id
+
+
+async def _require_admin(update: Update) -> bool:
+    """Reject private commands unless they come from the configured admin."""
+    configured_id = _admin_telegram_id()
+    requesting_id = update.effective_user.id if update.effective_user else None
+    if _is_admin_user(requesting_id):
+        return True
+    if update.message:
+        await update.message.reply_text("⛔ Unauthorized command.")
+    return False
+
+
+def _database_counts() -> dict[str, int]:
+    """Count tracked, pending, and settled picks for the admin panel."""
+    picks = load_picks()
+    pending = sum(
+        pick.get("status") == "pending" or pick.get("result") in (None, "", "pending")
+        for pick in picks
+    )
+    graded = sum(
+        pick.get("result") in {"win", "loss", "push"} for pick in picks
+    )
+    return {"total": len(picks), "pending": pending, "graded": graded}
+
+
+DAILY_CARD_FILE = Path(__file__).resolve().with_name("daily_card.json")
+
+
+def _save_latest_card_snapshot(
+    *,
+    card_date: str,
+    source_command: str,
+    analysis: str,
+    slate: list[dict[str, object]],
+) -> None:
+    """Save the latest generated MLB card so /save_last_card can recover it."""
+    payload = {
+        "latest_type": "mlb_official",
+        "latest_date": card_date,
+        "cards": {
+            "mlb_official": {
+                "type": "mlb_official",
+                "date": card_date,
+                "display_date": display_date(card_date),
+                "source_command": source_command,
+                "created_at": eastern_now().isoformat(timespec="seconds"),
+                "analysis": analysis,
+                "raw_text": analysis,
+                "slate": slate,
+            }
+        },
+    }
+    DAILY_CARD_FILE.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False, default=str) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _save_official_mlb_card(
+    analysis: str,
+    slate: list[dict[str, object]],
+    card_date: str,
+    source_command: str,
+) -> int:
+    """Persist generated MLB picks and log the source-level save event."""
+    _save_latest_card_snapshot(
+        card_date=card_date,
+        source_command=source_command,
+        analysis=analysis,
+        slate=slate,
+    )
+    saved_count = save_official_picks(
+        analysis,
+        slate,
+        card_date,
+        source_command=source_command,
+    )
+    print(f"Saved {saved_count} official MLB picks for {card_date}.", flush=True)
+    return saved_count
+
+
+def _main_menu_markup(user_id: int | None = None) -> InlineKeyboardMarkup:
+    """Return the modern inline app-style main menu."""
+    rows = [
+        [InlineKeyboardButton("🏠 Home", callback_data="menu:home")],
+        [
+            InlineKeyboardButton("⚾ MLB", callback_data="menu:mlb_hub"),
+            InlineKeyboardButton("⚽ Soccer", callback_data="menu:soccer_hub"),
+        ],
+        [
+            InlineKeyboardButton("📊 Results", callback_data="menu:results_hub"),
+            InlineKeyboardButton("💎 VIP", callback_data="menu:vip_hub"),
+        ],
+        [InlineKeyboardButton("ℹ️ Help", callback_data="menu:help_hub")],
+    ]
+    if _is_admin_user(user_id):
+        rows.append([InlineKeyboardButton("⚙️ Admin", callback_data="menu:admin_hub")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _back_menu_markup() -> InlineKeyboardMarkup:
+    """Return a consistent Back button for inline submenus."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="menu:main")]]
+    )
+
+
+def _hub_markup(hub: str) -> InlineKeyboardMarkup:
+    """Return inline buttons for one public or admin hub."""
+    rows_by_hub = {
+        "mlb": [
+            [InlineKeyboardButton("🔥 Play of the Day", callback_data="menu:mlb_today")],
+            [InlineKeyboardButton("📋 Official MLB Card", callback_data="menu:mlb_card")],
+            [InlineKeyboardButton("🖼 Anime Card Preview", callback_data="menu:mlb_image")],
+            [InlineKeyboardButton("⚾ Best Hit Prop", callback_data="menu:mlb_best_hit")],
+            [InlineKeyboardButton("🧩 Safe Parlay", callback_data="menu:mlb_parlay")],
+        ],
+        "soccer": [
+            [InlineKeyboardButton("🌎 World Cup Card", callback_data="menu:soccer_worldcup")],
+            [InlineKeyboardButton("🔥 Best Soccer Plays", callback_data="menu:soccer_card")],
+            [InlineKeyboardButton("🧩 Soccer Parlay", callback_data="menu:soccer_parlay")],
+        ],
+        "results": [
+            [
+                InlineKeyboardButton("📅 Today", callback_data="menu:results_today"),
+                InlineKeyboardButton("📆 Yesterday", callback_data="menu:results_yesterday"),
+            ],
+            [
+                InlineKeyboardButton("📈 Last 7 Days", callback_data="menu:results_7days"),
+                InlineKeyboardButton("🏆 Season", callback_data="menu:results_season"),
+            ],
+        ],
+        "vip": [
+            [InlineKeyboardButton("🥉 Weekly Pass", callback_data="menu:vip_weekly")],
+            [InlineKeyboardButton("🥈 Monthly Pass", callback_data="menu:vip_monthly")],
+            [InlineKeyboardButton("🥇 Season Pass", callback_data="menu:vip_season")],
+            [InlineKeyboardButton("📌 Benefits", callback_data="menu:vip_benefits")],
+        ],
+        "help": [
+            [InlineKeyboardButton("How BETGPTAI works", callback_data="menu:help_how")],
+            [InlineKeyboardButton("Singles-first approach", callback_data="menu:help_singles")],
+            [InlineKeyboardButton("Disclaimer", callback_data="menu:help_disclaimer")],
+            [InlineKeyboardButton("Contact admin", callback_data="menu:help_contact")],
+        ],
+        "admin": [
+            [InlineKeyboardButton("🧪 Props Lab", callback_data="menu:admin_props")],
+            [InlineKeyboardButton("🖼 Generate Images", callback_data="menu:admin_images")],
+            [InlineKeyboardButton("📊 Model Report", callback_data="menu:admin_model")],
+            [InlineKeyboardButton("🔁 Grade Today", callback_data="menu:admin_grade")],
+            [InlineKeyboardButton("🧰 Debug Tools", callback_data="menu:admin_debug")],
+        ],
+    }
+    rows = rows_by_hub.get(hub, [])
+    return InlineKeyboardMarkup([
+        *rows,
+        [InlineKeyboardButton("⬅️ Back", callback_data="menu:main")],
+    ])
+
+
+def _main_menu_text() -> str:
+    """Render the public home screen."""
+    return (
+        "⚾🏈🏀⚽ BETGPTAI SPORTS HUB\n\n"
+        "AI-Powered Sports Analysis\n\n"
+        "━━━━━━━━━━━━\n\n"
+        "🔥 TODAY’S FEATURED PICKS\n"
+        "Tap 🎯 Today's Picks\n\n"
+        "━━━━━━━━━━━━\n\n"
+        "⚾ MLB CARD\n"
+        "Today’s free MLB analysis\n\n"
+        "━━━━━━━━━━━━\n\n"
+        "⚽ SOCCER CARD\n"
+        "Today’s free soccer analysis\n\n"
+        "━━━━━━━━━━━━\n\n"
+        "📊 RESULTS TRACKER\n"
+        "Official-card performance\n\n"
+        "━━━━━━━━━━━━\n\n"
+        "💎 PREMIUM MEMBERSHIP\n"
+        "Full-card access\n\n"
+        "━━━━━━━━━━━━\n\n"
+        "⚠️ BETGPTAI PHILOSOPHY\n\n"
+        "✅ Pregame only\n"
+        "✅ Simplicity\n"
+        "✅ Stability\n"
+        "✅ Singles-first approach\n"
+        "📈 Long-Term Profitability\n"
+        "🧩 Parlays Optional\n\n"
+        "Educational analysis only. Play responsibly."
+    )
+
+
+def _help_text() -> str:
+    """Render the public command guide."""
+    return (
+        "📋 BETGPTAI COMMANDS\n\n"
+        "🎯 /today\n"
+        "Today’s Play of the Day + Safe Parlay\n\n"
+        "📅 /tomorrow\n"
+        "Next-day cards when lines are available\n\n"
+        "⚾ /mlb_auto\n"
+        "Today’s MLB Card\n\n"
+        "⚽ /soccer\n"
+        "Today’s Soccer Card\n\n"
+        "📊 /results\n"
+        "Performance Tracker\n\n"
+        "💎 /vip\n"
+        "Premium Membership\n\n"
+        "Educational analysis only. Play responsibly."
+    )
+
+
+def _vip_text() -> str:
+    """Render the public premium screen."""
+    return (
+        "💎 BETGPTAI PREMIUM MEMBERSHIP\n\n"
+        "Unlock:\n\n"
+        "⚾ Full MLB Cards\n"
+        "⚾ F5 Plays\n"
+        "⚾ Team Totals\n"
+        "⚾ NRFI Leans\n"
+        "⚽ Soccer Cards\n"
+        "📊 Results Tracking\n\n"
+        "━━━━━━━━━━━━\n\n"
+        "🥉 Weekly Pass — $5.99\n\n"
+        "https://buy.stripe.com/aFadRbgvt1Da75L5xv0ZW00\n\n"
+        "🥈 Premium Monthly — $9.99\n\n"
+        "https://buy.stripe.com/dRm7sN6UT95C89PbVT0ZW01\n\n"
+        "🥇 Season Pass — $49.99 every 6 months\n\n"
+        "https://buy.stripe.com/aFa9AVa75epW1Lre410ZW02\n\n"
+        "━━━━━━━━━━━━\n\n"
+        "After payment, send proof of purchase to @YOUR_USERNAME to receive VIP access.\n\n"
+        "⚠️ Singles are recommended for the best long-term results.\n\n"
+        "Parlays are optional and carry higher risk.\n\n"
+        "Educational analysis only. Play responsibly."
+    )
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Display the clean public BETGPTAI sports hub."""
+    del context
+    if not update.message:
+        return
+    # Remove any persistent reply keyboard left over from older bot versions.
+    cleanup_message = await update.message.reply_text(
+        "Opening BETGPTAI...",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    with contextlib.suppress(Exception):
+        await cleanup_message.delete()
+    await update.message.reply_text(
+        _main_menu_text(),
+        reply_markup=_main_menu_markup(update.effective_user.id if update.effective_user else None),
+    )
+
+
+async def help_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Show the short public command guide."""
+    del context
+    if not update.message:
+        return
+    await update.message.reply_text(
+        _help_text(),
+        reply_markup=_back_menu_markup(),
+    )
+
+
+def _format_line(value: object) -> str:
+    """Format saved American odds without exposing a sportsbook name."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "Unavailable"
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return f"+{value}" if value > 0 else str(value)
+
+
+def _card_date_header(card_date: str) -> str:
+    """Return the public card date line in MM/DD/YYYY format."""
+    return f"📅 Card Date: {display_date(card_date)}"
+
+
+def _with_card_date(text: str, card_date: str) -> str:
+    """Prefix card text with the BETGPTAI card date when not already present."""
+    if "📅 Card Date:" in text[:120]:
+        return text
+    return f"{_card_date_header(card_date)}\n\n{text}"
+
+
+async def _build_today_card_text() -> str | None:
+    """Build the public /today text from the latest saved official picks."""
+    try:
+        featured = await asyncio.to_thread(
+            get_most_recent_featured_picks,
+            official_sports_date().isoformat(),
+        )
+    except Exception:
+        logging.exception("Could not load saved picks for /today")
+        featured = {}
+
+    play = featured.get("play_of_day")
+    legs = featured.get("parlay_legs", [])
+    if not play or not isinstance(legs, list) or len(legs) != 2:
+        return (
+            "Today’s picks are still being prepared. "
+            "Type /mlb_auto to generate today’s card."
+        )
+
+    risk_grade = featured.get("risk_grade")
+    risk_text = (
+        f"{risk_grade}/10"
+        if isinstance(risk_grade, (int, float)) and not isinstance(risk_grade, bool)
+        else "Unavailable"
+    )
+    play_game = featured.get("play_game", {})
+    play_context = (
+        mlb_game_block(play_game)
+        if isinstance(play_game, dict) and play_game.get("away_team")
+        else "🕒 Time unavailable ET"
+    )
+    leg_details = featured.get("parlay_leg_details", [])
+
+    def parlay_leg(index: int) -> str:
+        """Format a saved parlay leg with its original matchup and ET time."""
+        detail = (
+            leg_details[index]
+            if isinstance(leg_details, list)
+            and index < len(leg_details)
+            and isinstance(leg_details[index], dict)
+            else {}
+        )
+        context_text = (
+            mlb_game_block(detail)
+            if detail.get("away_team")
+            else "🕒 Time unavailable ET"
+        )
+        return f"✅ {legs[index]}\n{context_text}"
+
+    return (
+        "🎯 BETGPTAI TODAY\n\n"
+        f"{_card_date_header(official_sports_date().isoformat())}\n\n"
+        "━━━━━━━━━━━━\n\n"
+        "🔥 PLAY OF THE DAY\n\n"
+        f"⚾ {play}\n"
+        f"{play_context}\n"
+        f"🎯 Confidence Grade: {risk_text}\n\n"
+        "━━━━━━━━━━━━\n\n"
+        "🧩 SAFE PARLAY OF THE DAY\n\n"
+        f"{parlay_leg(0)}\n\n"
+        f"{parlay_leg(1)}\n\n"
+        f"{PARLAY_NOTE}\n\n"
+        "━━━━━━━━━━━━\n\n"
+        "📋 Want the full free MLB card?\n"
+        "Type /mlb_auto\n\n"
+        "💎 Want premium full slate?\n"
+        "Type /vip\n\n"
+        f"{TIMED_CARD_FOOTER}"
+    )
+
+
+async def _build_safe_parlay_text() -> str:
+    """Build only today's saved safe parlay block."""
+    try:
+        featured = await asyncio.to_thread(
+            get_most_recent_featured_picks,
+            official_sports_date().isoformat(),
+        )
+    except Exception:
+        logging.exception("Could not load saved picks for safe parlay")
+        featured = {}
+    legs = featured.get("parlay_legs", [])
+    if not isinstance(legs, list) or len(legs) < 2:
+        return "Today’s safe parlay is still being prepared. Type /mlb_auto to generate today’s card."
+    return (
+        "🧩 SAFE PARLAY OF THE DAY\n\n"
+        f"✅ {legs[0]}\n"
+        f"✅ {legs[1]}\n\n"
+        f"{PARLAY_NOTE}\n\n"
+        "Singles are recommended for better long-term results."
+    )
+
+
+def _latest_best_hit_text() -> str:
+    """Read the latest approved/admin best hit prop summary when available."""
+    props_file = Path(__file__).with_name("props_lab.json")
+    try:
+        payload = json.loads(props_file.read_text(encoding="utf-8"))
+    except Exception:
+        return "Best Hit Prop is not ready yet."
+    if not isinstance(payload, dict):
+        return "Best Hit Prop is not ready yet."
+    values = list(payload.values())
+    day = payload.get(official_sports_date().isoformat()) or (values[-1] if values else {})
+    prop = day.get("best_hit") if isinstance(day, dict) else None
+    if not isinstance(prop, dict):
+        return "Best Hit Prop is not ready yet."
+    return (
+        "⚾ BEST HIT PROP\n\n"
+        f"👤 {prop.get('player_name', 'Player')}\n"
+        f"🧢 {prop.get('team_name', prop.get('team', 'Team'))}\n"
+        f"🆚 {prop.get('opponent_name', prop.get('opponent', 'Opponent'))}\n"
+        f"🕒 {prop.get('game_time_et', 'Time unavailable ET')}\n\n"
+        "🎯 Prop:\n"
+        f"Over {prop.get('line', 0.5)} Hits\n\n"
+        "Educational analysis only. Singles are recommended."
+    )
+
+
+async def today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show only the featured play and safe parlay from the latest saved card."""
+    del context
+    if not update.message:
+        return
+    await update.message.reply_text(await _build_today_card_text())
+
+
+async def mlb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show today's MLB plays. Edit this message whenever plays change."""
+    del context
+    today = datetime.now().strftime("%B %d, %Y")
+
+    # This is the daily card shown when a user sends /mlb.
+    plays = (
+        f"🔥 BETGPTAI MLB CARD — {today} ⚾\n\n"
+        "🥇 Best Bet: Phillies -1.5\n"
+        "🥈 Total: Mariners Under 6.5\n"
+        "🥉 Value Play: Royals ML\n\n"
+        "✅ 1 unit = normal play\n"
+        "🔥 2 units = strongest play\n\n"
+        "⚠️ Educational analysis only. Play responsibly."
+    )
+    if update.message:
+        await update.message.reply_text(plays)
+
+
+async def _send_long_message(update: Update, text: str) -> None:
+    """Split long AI output so every message fits Telegram's size limit."""
+    if not update.message:
+        return
+    await _send_long_text_to_message(update.message, text)
+
+
+async def _send_long_text_to_message(message: object, text: str) -> None:
+    """Split long output using any Telegram message-like object."""
+    if not message:
+        return
+
+    remaining = text
+    while remaining:
+        if len(remaining) <= 3900:
+            chunk = remaining
+            remaining = ""
+        else:
+            # Prefer breaking between paragraphs instead of mid-sentence.
+            split_at = remaining.rfind("\n\n", 0, 3900)
+            if split_at < 1:
+                split_at = remaining.rfind("\n", 0, 3900)
+            if split_at < 1:
+                split_at = 3900
+            chunk = remaining[:split_at]
+            remaining = remaining[split_at:].lstrip()
+        await message.reply_text(chunk)
+
+
+async def mlb_auto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Build today's slate and ask OpenAI for automated MLB analysis."""
+    del context
+    if not update.message:
+        return
+
+    await update.message.reply_text(
+        "⏳ Building today’s BETGPTAI card..."
+    )
+
+    odds_api_key = os.getenv("ODDS_API_KEY", "")
+    openai_api_key = os.getenv("OPENAI_API_KEY", "")
+    highlightly_api_key = os.getenv("HIGHLIGHTLY_API_KEY", "")
+    selected_date = official_sports_date().isoformat()
+    message_text = update.message.text or ""
+    source_command = (
+        "generate_today"
+        if message_text.split()[0].lower().startswith("/generate_today")
+        else "mlb_auto"
+    )
+
+    try:
+        # requests is synchronous, so run the data download in another thread.
+        # This keeps the async Telegram bot responsive while APIs are loading.
+        slate = await asyncio.to_thread(
+            get_combined_slate,
+            odds_api_key,
+            game_date=selected_date,
+            highlightly_api_key=highlightly_api_key,
+        )
+        if not slate:
+            await update.message.reply_text("No MLB games were found for today.")
+            return
+
+        try:
+            analysis = await analyze_mlb_slate(
+                slate, openai_api_key, os.getenv("ANTHROPIC_API_KEY", "")
+            )
+        except Exception as error:
+            # Unexpected analyst failures should not stop the bot. Print the
+            # complete error and traceback in the terminal,
+            # then quietly send the data-only fallback card to Telegram.
+            logging.error(
+                "AI Analysis Error:\n%s",
+                error,
+                exc_info=True,
+            )
+            analysis = build_fallback_card(slate)
+
+        await asyncio.to_thread(
+            save_model_report, selected_date, slate, analysis, get_last_analysis_metadata()
+        )
+
+        # Save the exact free card immediately after generation and before the
+        # card is sent. This guarantees that every delivered pick is tracked.
+        try:
+            saved_count = await asyncio.to_thread(
+                _save_official_mlb_card,
+                analysis,
+                slate,
+                selected_date,
+                source_command,
+            )
+        except Exception:
+            logging.exception("Could not save official picks to picks.json")
+            await update.message.reply_text(
+                "The card was generated, but its picks could not be saved. "
+                "No picks were sent. Check picks.json and try again."
+            )
+            return
+
+        # Delivery happens only after picks.json has been updated successfully.
+        await _send_long_message(update, _with_card_date(analysis, selected_date))
+    except MLBDataError:
+        # The MLB schedule is the only required feed; optional sources recover above.
+        logging.exception("MLB or odds data download failed")
+        await update.message.reply_text(
+            "Unable to build today’s card. Please try again shortly."
+        )
+    except Exception:
+        # Avoid exposing unexpected technical details or secret values to users.
+        logging.exception("Unexpected /mlb_auto error")
+        await update.message.reply_text(
+            "Something unexpected went wrong. Check the terminal log and try again."
+        )
+
+
+async def vip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Explain how users can learn more about VIP access."""
+    del context
+    if update.message:
+        await update.message.reply_text(
+            _vip_text(),
+            reply_markup=_back_menu_markup(),
+        )
+
+
+async def _send_soccer_card(
+    update: Update, mode: str, game_date: str | None = None
+) -> None:
+    """Run the soccer pipeline for one public or owner-only card type."""
+    if not update.message:
+        return
+    await update.message.reply_text("⏳ Building today’s BETGPTAI soccer card...")
+    try:
+        selected_date = game_date or official_sports_date().isoformat()
+        slate = await asyncio.to_thread(
+            get_soccer_slate,
+            os.getenv("FOOTBALL_DATA_API_KEY", ""),
+            os.getenv("ODDS_API_KEY", ""),
+            live_only=False,
+            game_date=selected_date,
+            sports_db_api_key=os.getenv("THE_SPORTS_DB_API_KEY", ""),
+            serpapi_key=os.getenv("SERPAPI_KEY", ""),
+            api_football_key=os.getenv("API_FOOTBALL_KEY", ""),
+        )
+        if mode == "corners" and not any(
+            game.get("corners_profile") != "unavailable" for game in slate
+        ):
+            await update.message.reply_text(
+                "DATA LIMITATIONS\n"
+                "- Corners data unavailable from current feeds.\n\n"
+                f"{TIMED_CARD_FOOTER}"
+            )
+            return
+        owner_modes = {
+            "public", "full", "btts", "overs", "corners", "cards",
+            "first_half", "second_half", "double_chance", "asian_handicap",
+        }
+        analysis_mode = mode if mode in owner_modes else "full"
+        card = await analyze_soccer_slate(
+            slate,
+            os.getenv("OPENAI_API_KEY", ""),
+            analysis_mode,
+            os.getenv("ANTHROPIC_API_KEY", ""),
+        )
+        try:
+            saved_count = await asyncio.to_thread(
+                save_soccer_picks, card, slate, selected_date, f"soccer_{analysis_mode}"
+            )
+            if saved_count:
+                print(f"Saved {saved_count} soccer picks to picks.json", flush=True)
+        except Exception:
+            logging.exception("Could not save soccer picks to picks.json")
+        await _send_long_message(update, _with_card_date(card, selected_date))
+    except SoccerDataError as error:
+        logging.warning("Soccer data unavailable: %s", error)
+        await update.message.reply_text(
+            "Unable to build the soccer card right now. Please try again shortly."
+        )
+    except Exception:
+        logging.exception("Unexpected soccer card error")
+        await update.message.reply_text(
+            "Unable to build the soccer card right now. Check the terminal and try again."
+        )
+
+
+async def soccer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the public two-play BETGPTAI soccer card."""
+    del context
+    await _send_soccer_card(update, "public")
+
+
+async def worldcup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show World Cup Mode when active, otherwise the normal soccer card."""
+    del context
+    await _send_soccer_card(update, "public")
+
+
+def _slate_has_lines(slate: object) -> bool:
+    """Return True when at least one game has a real supplied market price."""
+    return isinstance(slate, list) and any(
+        isinstance(game, dict) and bool(game.get("best_available_prices"))
+        for game in slate
+    )
+
+
+async def tomorrow(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Publish next-sports-day MLB and soccer cards only after lines populate."""
+    del context
+    if not update.message:
+        return
+    target_date = tomorrow_sports_date().isoformat()
+    await update.message.reply_text("⏳ Checking tomorrow’s available lines...")
+
+    mlb_task = asyncio.to_thread(
+        get_combined_slate,
+        os.getenv("ODDS_API_KEY", ""),
+        game_date=target_date,
+        highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+    )
+    soccer_task = asyncio.to_thread(
+        get_soccer_slate,
+        os.getenv("FOOTBALL_DATA_API_KEY", ""),
+        os.getenv("ODDS_API_KEY", ""),
+        game_date=target_date,
+        sports_db_api_key=os.getenv("THE_SPORTS_DB_API_KEY", ""),
+        serpapi_key=os.getenv("SERPAPI_KEY", ""),
+        api_football_key=os.getenv("API_FOOTBALL_KEY", ""),
+    )
+    mlb_result, soccer_result = await asyncio.gather(
+        mlb_task, soccer_task, return_exceptions=True
+    )
+    if isinstance(mlb_result, Exception):
+        logging.warning("Tomorrow MLB slate unavailable: %s", mlb_result)
+        mlb_slate: list[dict[str, object]] = []
+    else:
+        mlb_slate = mlb_result
+    if isinstance(soccer_result, Exception):
+        logging.warning("Tomorrow soccer slate unavailable: %s", soccer_result)
+        soccer_slate: list[dict[str, object]] = []
+    else:
+        soccer_slate = soccer_result
+
+    if not _slate_has_lines(mlb_slate) and not _slate_has_lines(soccer_slate):
+        await update.message.reply_text(
+            "Tomorrow’s card is not ready yet. Lines are still populating. "
+            "Check back after 3:00 AM ET."
+        )
+        return
+
+    await update.message.reply_text(
+        f"📅 BETGPTAI TOMORROW — {target_date}"
+    )
+    if _slate_has_lines(mlb_slate):
+        mlb_card = await analyze_mlb_slate(
+            mlb_slate,
+            os.getenv("OPENAI_API_KEY", ""),
+            os.getenv("ANTHROPIC_API_KEY", ""),
+        )
+        await asyncio.to_thread(
+            save_model_report, target_date, mlb_slate, mlb_card, get_last_analysis_metadata()
+        )
+        try:
+            saved_count = await asyncio.to_thread(
+                _save_official_mlb_card,
+                mlb_card,
+                mlb_slate,
+                target_date,
+                "tomorrow",
+            )
+        except Exception:
+            logging.exception("Could not save tomorrow's MLB picks")
+        await _send_long_message(update, _with_card_date(mlb_card, target_date))
+    if _slate_has_lines(soccer_slate):
+        soccer_card = await analyze_soccer_slate(
+            soccer_slate,
+            os.getenv("OPENAI_API_KEY", ""),
+            "public",
+            os.getenv("ANTHROPIC_API_KEY", ""),
+        )
+        await _send_long_message(update, _with_card_date(soccer_card, target_date))
+
+
+async def soccer_owner_card(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Route protected soccer commands to their matching premium view."""
+    if not await _require_admin(update):
+        return
+    message_text = update.message.text if update.message and update.message.text else ""
+    command = message_text.split()[0].lstrip("/").split("@", 1)[0].lower() if message_text else "soccer_full"
+    modes = {
+        "soccer_full": "full",
+        "btts": "btts",
+        "corners": "corners",
+        "overs": "overs",
+        "cards": "cards",
+        "first_half": "first_half",
+        "second_half": "second_half",
+        "double_chance": "double_chance",
+        "asian_handicap": "asian_handicap",
+    }
+    await _send_soccer_card(update, modes.get(command, "full"))
+
+
+async def soccer_results(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Display the protected BETGPTAI soccer results dashboard."""
+    del context
+    if not await _require_admin(update):
+        return
+    if not update.message:
+        return
+    try:
+        dashboard = await asyncio.to_thread(build_soccer_results_dashboard)
+        await _send_long_message(update, dashboard)
+    except SoccerResultsError as error:
+        logging.warning("Soccer results unavailable: %s", error)
+        await update.message.reply_text(f"Soccer results are unavailable: {error}")
+
+
+async def debug_soccer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only diagnostics for the public soccer card builder."""
+    del context
+    if not await _require_admin(update):
+        return
+    if not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+    try:
+        slate = await asyncio.to_thread(
+            get_soccer_slate,
+            os.getenv("FOOTBALL_DATA_API_KEY", ""),
+            os.getenv("ODDS_API_KEY", ""),
+            game_date=selected_date,
+            sports_db_api_key=os.getenv("THE_SPORTS_DB_API_KEY", ""),
+            serpapi_key=os.getenv("SERPAPI_KEY", ""),
+            api_football_key=os.getenv("API_FOOTBALL_KEY", ""),
+        )
+        await update.message.reply_text(
+            soccer_debug_report(slate, get_last_soccer_debug())
+        )
+    except Exception:
+        logging.exception("Unexpected /debug_soccer error")
+        await update.message.reply_text("Unable to inspect soccer data right now.")
+
+
+async def results(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Display today's official-card results only."""
+    del context
+    if not update.message:
+        return
+
+    try:
+        dashboard = await asyncio.to_thread(build_daily_results_dashboard)
+    except ResultsTrackerError as error:
+        logging.warning("Could not load results dashboard: %s", error)
+        await update.message.reply_text(
+            f"Results are temporarily unavailable: {error}"
+        )
+        return
+
+    await update.message.reply_text(dashboard)
+
+
+async def results_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Alias for today's daily results."""
+    await results(update, context)
+
+
+async def results_yesterday(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Display yesterday's official-card results."""
+    del context
+    if not update.message:
+        return
+    target_date = (eastern_today() - timedelta(days=1)).isoformat()
+    dashboard = await asyncio.to_thread(build_daily_results_dashboard, target_date)
+    await update.message.reply_text(dashboard)
+
+
+async def results_7days(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Display the rolling seven-day results dashboard."""
+    del context
+    if not update.message:
+        return
+    dashboard = await asyncio.to_thread(build_range_results_dashboard, 7)
+    await update.message.reply_text(dashboard)
+
+
+async def results_30days(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Display the rolling thirty-day results dashboard."""
+    del context
+    if not update.message:
+        return
+    dashboard = await asyncio.to_thread(build_range_results_dashboard, 30)
+    await update.message.reply_text(dashboard)
+
+
+async def results_season(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Display season-to-date results."""
+    del context
+    if not update.message:
+        return
+    dashboard = await asyncio.to_thread(build_range_results_dashboard, None)
+    await update.message.reply_text(dashboard)
+
+
+async def results_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Display one requested date using MM/DD/YYYY."""
+    if not update.message:
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /results_date MM/DD/YYYY")
+        return
+    target_date = context.args[0]
+    if not normalize_pick_date(target_date):
+        await update.message.reply_text("Use MM/DD/YYYY, example: /results_date 06/23/2026")
+        return
+    dashboard = await asyncio.to_thread(build_daily_results_dashboard, target_date)
+    await update.message.reply_text(dashboard)
+
+
+async def update_results(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Grade pending official picks against final MLB scores."""
+    del context
+    if not await _require_admin(update):
+        return
+    if not update.message:
+        return
+
+    await update.message.reply_text("Checking final MLB scores... ⚾")
+    try:
+        summary = await asyncio.to_thread(update_results_from_mlb)
+    except ResultsTrackerError as error:
+        logging.warning("Automatic result grading failed: %s", error)
+        await update.message.reply_text(f"Unable to update results: {error}")
+        return
+    except Exception:
+        logging.exception("Unexpected /update_results error")
+        await update.message.reply_text(
+            "Unable to update results right now. Check the terminal and try again."
+        )
+        return
+
+    await update.message.reply_text(
+        "✅ RESULTS UPDATE COMPLETE\n\n"
+        f"Total Tracked Picks: {summary['total_picks']}\n"
+        f"Pending Picks: {summary['pending']}\n"
+        f"Graded Picks: {summary['graded']}\n\n"
+        "Use /results to view the updated dashboard."
+    )
+
+
+async def grade_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only command to grade only today's saved MLB picks."""
+    del context
+    if not await _require_admin(update):
+        return
+    if not update.message:
+        return
+    selected_date = eastern_today().isoformat()
+    await update.message.reply_text("Checking today’s saved MLB picks... ⚾")
+    try:
+        summary = await asyncio.to_thread(grade_mlb_picks_for_date, selected_date)
+    except Exception:
+        logging.exception("Unexpected /grade_today error")
+        await update.message.reply_text(
+            "Unable to grade today’s picks right now. Check the terminal and try again."
+        )
+        return
+    await update.message.reply_text(
+        "✅ RESULTS UPDATE COMPLETE\n\n"
+        f"Newly Graded: {summary.get('newly_graded', 0)}\n"
+        f"Still Pending: {summary.get('pending', 0)}\n"
+        f"Missing Metadata: {summary.get('missing_metadata', 0)}\n"
+        f"Errors: {summary.get('errors', 0)}"
+    )
+
+
+async def results_auto_status(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Owner-only status for automatic end-of-day results posting."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    try:
+        text = await asyncio.to_thread(results_auto_status_text)
+    except Exception:
+        logging.exception("Unexpected /results_auto_status error")
+        text = "Unable to inspect automatic results status right now."
+    await update.message.reply_text(text)
+
+
+async def post_results_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only manual run of the automatic results poster."""
+    if not await _require_admin(update) or not update.message:
+        return
+    await update.message.reply_text("Checking saved official MLB picks for final results...")
+    try:
+        summary = await post_daily_results_if_ready(
+            context.bot,
+            force=True,
+        )
+    except Exception:
+        logging.exception("Unexpected /post_results_now error")
+        await update.message.reply_text("Unable to post results right now. Check the terminal log.")
+        return
+    if summary.get("posted"):
+        await update.message.reply_text(
+            "✅ Daily results posted.\n\n"
+            f"Date: {summary.get('day')}\n"
+            f"Official Picks: {summary.get('picks', 0)}\n"
+            f"Tracked Games: {summary.get('games', 0)}"
+        )
+    else:
+        await update.message.reply_text(
+            "Daily results were not posted.\n\n"
+            f"Reason: {summary.get('reason', 'Unavailable')}\n"
+            f"Date: {summary.get('day', 'Unavailable')}"
+        )
+
+
+async def enable_auto_results(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Owner-only switch for automatic daily results posting."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    await asyncio.to_thread(set_auto_results_enabled, True)
+    await update.message.reply_text("✅ Automatic MLB results posting enabled.")
+
+
+async def disable_auto_results(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Owner-only switch for automatic daily results posting."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    await asyncio.to_thread(set_auto_results_enabled, False)
+    await update.message.reply_text("✅ Automatic MLB results posting disabled.")
+
+
+async def debug_picks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only saved-pick diagnostics without exposing internals to members."""
+    del context
+    if not await _require_admin(update):
+        return
+    if not update.message:
+        return
+    try:
+        summary = await asyncio.to_thread(
+            debug_picks_summary, official_sports_date().isoformat()
+        )
+    except Exception:
+        logging.exception("Unexpected /debug_picks error")
+        await update.message.reply_text("Unable to inspect picks right now.")
+        return
+    errors = summary.get("last_errors") or []
+    error_text = "\n".join(f"- {item}" for item in errors) if errors else "None"
+    await update.message.reply_text(
+        "🧪 BETGPTAI PICK DEBUG\n\n"
+        f"Total picks saved today: {summary.get('total_today', 0)}\n"
+        f"Pending picks: {summary.get('pending', 0)}\n"
+        f"Graded picks: {summary.get('graded', 0)}\n"
+        f"Picks missing game_id: {summary.get('missing_game_id', 0)}\n"
+        f"Picks missing market_type: {summary.get('missing_market_type', 0)}\n"
+        f"Picks missing selected_team: {summary.get('missing_selected_team', 0)}\n"
+        f"Picks missing card_date: {summary.get('missing_card_date', 0)}\n\n"
+        "Last grading errors:\n"
+        f"{error_text}"
+    )
+
+
+async def debug_results(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only diagnostics for daily result scoping."""
+    del context
+    if not await _require_admin(update):
+        return
+    if not update.message:
+        return
+    try:
+        summary = await asyncio.to_thread(debug_results_summary)
+    except Exception:
+        logging.exception("Unexpected /debug_results error")
+        await update.message.reply_text("Unable to inspect results right now.")
+        return
+    dates_text = ", ".join(summary.get("dates", [])) or "None"
+    last_rows = []
+    for pick in summary.get("last_10", []):
+        last_rows.append(
+            f"- {pick.get('date')} | card_date={pick.get('card_date')} | {pick.get('status')} | "
+            f"{pick.get('result')} | {pick.get('pick_text')}"
+        )
+    await update.message.reply_text(
+        "🧪 BETGPTAI RESULTS DEBUG\n\n"
+        f"Total picks in picks.json: {summary.get('total_picks', 0)}\n"
+        f"Picks for today: {summary.get('picks_today', 0)}\n"
+        f"Picks already graded today: {summary.get('graded_today', 0)}\n"
+        f"Pending today: {summary.get('pending_today', 0)}\n"
+        f"Dates found in picks.json: {dates_text}\n"
+        f"Picks missing card_date: {summary.get('missing_card_date', 0)}\n"
+        f"Picks missing game_pk: {summary.get('missing_game_pk', 0)}\n"
+        f"Picks missing market_type: {summary.get('missing_market_type', 0)}\n\n"
+        "Last 10 picks:\n"
+        + ("\n".join(last_rows) if last_rows else "None")
+    )
+
+
+async def save_last_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only recovery command that saves the latest generated MLB card."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+    await update.message.reply_text("Attempting to save the latest official MLB card...")
+    try:
+        analysis = ""
+        slate: list[dict[str, object]] = []
+        recovered_source = "mlb_auto"
+        if DAILY_CARD_FILE.exists():
+            payload = json.loads(DAILY_CARD_FILE.read_text(encoding="utf-8"))
+            latest_type = payload.get("latest_type")
+            cards = payload.get("cards") if isinstance(payload.get("cards"), dict) else {}
+            latest_card = cards.get(latest_type) if latest_type else None
+            if isinstance(latest_card, dict):
+                analysis = str(
+                    latest_card.get("analysis")
+                    or latest_card.get("raw_text")
+                    or ""
+                )
+                saved_slate = latest_card.get("slate")
+                if isinstance(saved_slate, list):
+                    slate = [game for game in saved_slate if isinstance(game, dict)]
+                selected_date = normalize_pick_date(
+                    latest_card.get("date") or latest_card.get("card_date")
+                ) or selected_date
+                if latest_card.get("source_command"):
+                    recovered_source = str(latest_card["source_command"])
+
+        if not analysis.strip() or not slate:
+            slate = await asyncio.to_thread(
+                get_combined_slate,
+                os.getenv("ODDS_API_KEY", ""),
+                game_date=selected_date,
+                highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+            )
+            if not slate:
+                await update.message.reply_text("No MLB games were found to save.")
+                return
+            try:
+                analysis = await analyze_mlb_slate(
+                    slate,
+                    os.getenv("OPENAI_API_KEY", ""),
+                    os.getenv("ANTHROPIC_API_KEY", ""),
+                )
+            except Exception as error:
+                logging.error("AI Analysis Error:\n%s", error, exc_info=True)
+                analysis = build_fallback_card(slate)
+
+        saved_count = await asyncio.to_thread(
+            _save_official_mlb_card,
+            analysis,
+            slate,
+            selected_date,
+            recovered_source,
+        )
+        await update.message.reply_text(
+            f"✅ Saved {saved_count} official MLB picks for {selected_date}."
+        )
+    except Exception as error:
+        logging.exception("/save_last_card failed")
+        await update.message.reply_text(
+            f"Unable to save the latest card. Error: {error}"
+        )
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show private configuration status without revealing secret values."""
+    del context
+    if not await _require_admin(update):
+        return
+    if not update.message:
+        return
+
+    def configured(name: str) -> str:
+        return "✅ Available" if os.getenv(name, "").strip() else "❌ Missing"
+
+    try:
+        counts = await asyncio.to_thread(_database_counts)
+    except ResultsTrackerError:
+        logging.exception("Could not count picks for /status")
+        counts = {"total": 0}
+
+    try:
+        await asyncio.to_thread(load_results)
+        database_status = "✅ Healthy"
+    except ResultsTrackerError:
+        logging.exception("Could not read results database for /status")
+        database_status = "❌ Unavailable"
+
+    (
+        sportsdb_available,
+        baseball_savant_available,
+        fangraphs_ok,
+        clubelo_available,
+        understat_available,
+        api_football_ok,
+        api_sports_baseball_ok,
+    ) = await asyncio.gather(
+        asyncio.to_thread(
+            check_thesportsdb, os.getenv("THE_SPORTS_DB_API_KEY", "")
+        ),
+        asyncio.to_thread(savant_available),
+        asyncio.to_thread(fangraphs_available),
+        asyncio.to_thread(check_clubelo),
+        asyncio.to_thread(check_understat),
+        asyncio.to_thread(api_football_available, os.getenv("API_FOOTBALL_KEY", "")),
+        (
+            asyncio.to_thread(
+                api_sports_baseball_available,
+                os.getenv("API_SPORTS_KEY", "") or os.getenv("API_FOOTBALL_KEY", ""),
+            )
+            if _truthy_env("API_SPORTS_BASEBALL_ENABLED")
+            else asyncio.sleep(0, result=False)
+        ),
+    )
+    sportsdb_status = "✅ Available" if sportsdb_available else "❌ Unavailable"
+    savant_status = (
+        "✅ Available" if baseball_savant_available else "❌ Unavailable"
+    )
+    fangraphs_status = "✅ Available" if fangraphs_ok else "❌ Unavailable"
+    clubelo_status = "✅ Available" if clubelo_available else "❌ Unavailable"
+    understat_status = "✅ Available" if understat_available else "❌ Unavailable"
+    api_football_status = "✅ Available" if api_football_ok else "❌ Unavailable"
+    api_sports_baseball_status = (
+        "➖ Disabled"
+        if not _truthy_env("API_SPORTS_BASEBALL_ENABLED")
+        else "✅ Available" if api_sports_baseball_ok else "❌ Unavailable"
+    )
+    props_engine_status = (
+        "✅ Available" if player_props_engine_available() else "❌ Unavailable"
+    )
+    serpapi_status = (
+        "✅ Configured"
+        if check_serpapi(os.getenv("SERPAPI_KEY", ""))
+        else "➖ Not configured"
+    )
+    props_engine_status = (
+        "✅ Available" if player_props_engine_available() else "❌ Unavailable"
+    )
+
+    await update.message.reply_text(
+        "🕊 BETGPTAI API STATUS\n\n"
+        "Telegram Bot: ✅ Online\n"
+        "MLB Stats: ✅ Available\n"
+        f"Baseball Savant: {savant_status}\n"
+        f"Odds API: {configured('ODDS_API_KEY')}\n"
+        f"OpenAI: {configured('OPENAI_API_KEY')}\n"
+        f"Claude: {configured('ANTHROPIC_API_KEY')}\n"
+        f"Highlightly: {configured('HIGHLIGHTLY_API_KEY')}\n"
+        f"API-Sports Baseball: {api_sports_baseball_status}\n"
+        f"Optional API-Football: {api_football_status}\n"
+        f"Football-Data.org: {configured('FOOTBALL_DATA_API_KEY')}\n"
+        f"TheSportsDB: {sportsdb_status}\n"
+        f"ClubElo: {clubelo_status}\n"
+        f"Understat: {understat_status}\n"
+        f"FanGraphs/pybaseball: {fangraphs_status}\n"
+        f"Player Props Engine: {props_engine_status}\n"
+        f"SerpApi: {serpapi_status}\n"
+        "🌦 Weather API: ✅ Available\n\n"
+        f"📊 Picks Tracked: {counts['total']}\n"
+        f"💾 Results Database: {database_status}\n\n"
+        "🤖 Current Version: BETGPTAI v1.2"
+    )
+
+
+async def specialized_mlb_card(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Build one hidden, owner-only Statcast-first premium MLB card."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    command = update.message.text.split()[0].lstrip("/").split("@")[0]
+    await update.message.reply_text("⏳ Building Statcast matchup card...")
+    try:
+        slate = await asyncio.to_thread(
+            get_combined_slate,
+            os.getenv("ODDS_API_KEY", ""),
+            game_date=official_sports_date().isoformat(),
+            highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+        )
+        card = await analyze_specialized_mlb_slate(
+            slate, os.getenv("OPENAI_API_KEY", ""), command,
+            os.getenv("ANTHROPIC_API_KEY", ""),
+        )
+        try:
+            saved_count = await asyncio.to_thread(
+                _save_official_mlb_card,
+                card,
+                slate,
+                official_sports_date().isoformat(),
+                command,
+            )
+        except Exception:
+            logging.exception("Could not save /%s official picks", command)
+        await _send_long_message(update, _with_card_date(card, official_sports_date().isoformat()))
+    except Exception:
+        logging.exception("Unexpected /%s error", command)
+        await update.message.reply_text("Unable to build that MLB card right now.")
+
+
+async def _send_props_lab(
+    update: Update, mode: str = "summary"
+) -> None:
+    """Build and send an owner-only MLB player props lab view."""
+    if not await _require_admin(update) or not update.message:
+        return
+    await update.message.reply_text("⏳ Building BETGPTAI Player Prop Lab...")
+    selected_date = official_sports_date().isoformat()
+    try:
+        slate = await asyncio.to_thread(
+            get_combined_slate,
+            os.getenv("ODDS_API_KEY", ""),
+            game_date=selected_date,
+            highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+        )
+        if not slate:
+            await update.message.reply_text("No MLB games were found for today.")
+            return
+        payload = await asyncio.to_thread(
+            build_player_props_lab, slate, selected_date
+        )
+        if mode == "hits":
+            card = render_prop_type_card(payload, "hits")
+        elif mode == "hits_by_team":
+            card = render_hits_by_team_card(payload)
+        elif mode == "home_runs":
+            card = render_prop_type_card(payload, "home_runs")
+        elif mode == "strikeouts":
+            card = render_prop_type_card(payload, "strikeouts")
+        elif mode == "debug":
+            card = render_prop_debug(payload)
+        elif mode == "test":
+            card = render_props_test(payload)
+        else:
+            card = render_props_admin_card(payload)
+        await _send_long_message(update, card)
+    except Exception:
+        logging.exception("Unexpected player props lab error")
+        await update.message.reply_text(
+            "Unable to build the Player Prop Lab right now. Check terminal logs."
+        )
+
+
+async def _build_verified_props_payload(selected_date: str) -> tuple[list[dict], dict]:
+    """Build today's verified admin prop payload from the full MLB slate."""
+    slate = await asyncio.to_thread(
+        get_combined_slate,
+        os.getenv("ODDS_API_KEY", ""),
+        game_date=selected_date,
+        highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+    )
+    if not slate:
+        return [], {}
+    payload = await asyncio.to_thread(build_player_props_lab, slate, selected_date)
+    return slate, payload
+
+
+async def _send_prompt_previews(
+    update: Update,
+    prompt_items: list[dict[str, str]],
+    output_dir: Path,
+    *,
+    save_function,
+    image_prefix: str,
+) -> None:
+    """Save prompts, send them to the owner, and optionally generate images."""
+    if not update.message:
+        return
+    saved_paths = await asyncio.to_thread(save_function, prompt_items, output_dir)
+    for index, item in enumerate(prompt_items, start=1):
+        await _send_long_message(
+            update,
+            f"🖼 {image_prefix}\n"
+            f"{index}/{len(prompt_items)} — {item.get('title', item.get('name'))}\n\n"
+            f"{item['prompt']}",
+        )
+    await update.message.reply_text(
+        "✅ Anime Vault prompts saved.\n\n"
+        + "\n".join(str(path) for path in saved_paths)
+    )
+    if not _truthy_env("IMAGE_GENERATION_ENABLED"):
+        await update.message.reply_text(
+            "IMAGE_GENERATION_ENABLED=false, so I sent prompt-ready cards only."
+        )
+        return
+
+    await update.message.reply_text(
+        "🎨 IMAGE_GENERATION_ENABLED=true. Generating owner-only preview images..."
+    )
+    for index, item in enumerate(prompt_items, start=1):
+        image_path = output_dir / f"{index:02d}_{item['name']}.png"
+        try:
+            saved_image = await asyncio.to_thread(
+                generate_image_from_prompt, item["prompt"], str(image_path)
+            )
+            with Path(saved_image).open("rb") as image_file:
+                await update.message.reply_photo(
+                    photo=image_file,
+                    caption=f"{image_prefix} Preview — {index}/{len(prompt_items)}",
+                )
+        except Exception as error:
+            logging.exception("Image generation failed for %s %s", image_prefix, index)
+            await _send_long_message(
+                update,
+                f"❌ Image generation failed for {image_prefix} {index}.\n\n"
+                f"Error: {error}\n\n"
+                f"Fallback prompt:\n\n{item['prompt']}",
+            )
+
+
+async def _send_single_image_preview(
+    update_or_message: object,
+    result: dict,
+    *,
+    title: str,
+    approved_post_hint: str = "",
+) -> None:
+    """Send one owner-only generated image, or the prompt fallback."""
+    message = getattr(update_or_message, "message", None) or update_or_message
+    if not message:
+        return
+    image_path = result.get("image_path")
+    prompt_path = result.get("prompt_path")
+    if image_path:
+        with Path(image_path).open("rb") as image_file:
+            await message.reply_photo(
+                photo=image_file,
+                caption=(
+                    f"{title} — OWNER PREVIEW\n\n"
+                    f"{approved_post_hint}".strip()
+                ),
+            )
+        await message.reply_text(
+            f"✅ Preview image saved.\n\nImage: {image_path}\nPrompt: {prompt_path}"
+        )
+        return
+
+    error_text = f"\nImage Error: {result.get('image_error')}\n" if result.get("image_error") else ""
+    await _send_long_text_to_message(
+        message,
+        f"✅ Prompt saved for {title}.\n\n"
+        f"Prompt: {prompt_path}\n"
+        f"{error_text}\n"
+        "Prompt-only fallback:\n\n"
+        f"{result.get('prompt')}",
+    )
+
+
+async def props_images_admin(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Owner-only Anime Vault image prompts/previews for the main props."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    await update.message.reply_text("⏳ Building verified prop image cards...")
+    selected_date = official_sports_date().isoformat()
+    try:
+        _, payload = await _build_verified_props_payload(selected_date)
+        if not payload:
+            await update.message.reply_text("No MLB games were found for today.")
+            return
+        prompt_items = generate_prop_card_prompts(payload)
+        if not prompt_items:
+            await update.message.reply_text(
+                "No verified player props are available for image cards."
+            )
+            return
+        output_dir = _dated_generated_cards_dir(selected_date) / "props"
+        await _send_prompt_previews(
+            update,
+            prompt_items,
+            output_dir,
+            save_function=save_prop_prompts,
+            image_prefix="BETGPTAI Props Anime Vault",
+        )
+    except Exception as error:
+        logging.exception("/props_images_admin failed")
+        await update.message.reply_text(f"Unable to build prop images. Error: {error}")
+
+
+async def hits_by_team_image_admin(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Owner-only Anime Vault image prompts/previews for team hit props."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    await update.message.reply_text("⏳ Building verified hits-by-team image cards...")
+    selected_date = official_sports_date().isoformat()
+    try:
+        _, payload = await _build_verified_props_payload(selected_date)
+        if not payload:
+            await update.message.reply_text("No MLB games were found for today.")
+            return
+        prompt_items = generate_hits_by_team_prompts(payload)
+        if not prompt_items:
+            await update.message.reply_text(
+                "No verified hits-by-team props are available for image cards."
+            )
+            return
+        output_dir = _dated_generated_cards_dir(selected_date) / "hits_by_team"
+        await _send_prompt_previews(
+            update,
+            prompt_items,
+            output_dir,
+            save_function=save_prop_prompts,
+            image_prefix="BETGPTAI Hits By Team Anime Vault",
+        )
+    except Exception as error:
+        logging.exception("/hits_by_team_image_admin failed")
+        await update.message.reply_text(
+            f"Unable to build hits-by-team images. Error: {error}"
+        )
+
+
+async def best_hit_image_admin(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Owner-only: generate the official Best Hit Prop image preview."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    await update.message.reply_text("⏳ Building verified BEST HIT PROP OF THE DAY image...")
+    selected_date = official_sports_date().isoformat()
+    try:
+        slate = await asyncio.to_thread(
+            get_combined_slate,
+            os.getenv("ODDS_API_KEY", ""),
+            game_date=selected_date,
+            highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+        )
+        if not slate:
+            await update.message.reply_text("No MLB games were found for today.")
+            return
+        result = await asyncio.to_thread(
+            prepare_best_hit_prop_image,
+            slate,
+            selected_date,
+            image_generation_enabled=_truthy_env("IMAGE_GENERATION_ENABLED"),
+        )
+        if result.get("status") != "ready":
+            await update.message.reply_text(
+                "❌ Best Hit image was not generated.\n\n"
+                f"Reason: {result.get('reason')}"
+            )
+            return
+        prop = result.get("prop") or {}
+        summary = (
+            "✅ BEST HIT PROP IMAGE READY\n\n"
+            f"Player: {prop.get('player_name')}\n"
+            f"Team: {prop.get('team_name')}\n"
+            f"Opponent: {prop.get('opponent_name')}\n"
+            f"Game Time: {prop.get('game_time_et')}\n"
+            f"Prompt: {result.get('prompt_path')}\n"
+        )
+        image_path = result.get("image_path")
+        if image_path:
+            with Path(image_path).open("rb") as image_file:
+                await update.message.reply_photo(
+                    photo=image_file,
+                    caption=(
+                        "BETGPTAI BEST HIT PROP OF THE DAY — OWNER PREVIEW\n\n"
+                        "Review this image. If approved, run /post_best_hit_image_admin."
+                    ),
+                )
+            await update.message.reply_text(summary + f"Image: {image_path}")
+        else:
+            await _send_long_message(
+                update,
+                summary
+                + "\nImage was not generated. Prompt-only fallback below.\n"
+                + (f"Image Error: {result.get('image_error')}\n\n" if result.get("image_error") else "\n")
+                + str(result.get("prompt")),
+            )
+    except Exception as error:
+        logging.exception("/best_hit_image_admin failed")
+        await update.message.reply_text(
+            f"Unable to build Best Hit image right now. Error: {error}"
+        )
+
+
+async def post_best_hit_image_admin(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Owner-only approval step: post the generated Best Hit image to FREE."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+    folder_name = datetime.fromisoformat(selected_date).strftime("%m-%d-%Y")
+    image_path = Path(__file__).with_name("generated_cards") / folder_name / "best_hit_prop.png"
+    if not image_path.exists():
+        await update.message.reply_text(
+            "❌ No approved Best Hit image found.\n\n"
+            "Run /best_hit_image_admin with IMAGE_GENERATION_ENABLED=true first, "
+            "review the owner preview, then run this approval command."
+        )
+        return
+    try:
+        chat_id = _telegram_destination(os.getenv("FREE_CHANNEL_ID", ""))
+        with image_path.open("rb") as image_file:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=image_file,
+                caption=(
+                    "🔥 BETGPTAI HIT PROP OF THE DAY\n\n"
+                    "Educational analysis only. Singles are recommended."
+                ),
+            )
+        await update.message.reply_text(
+            f"✅ Best Hit image posted to FREE channel.\n\n{image_path}"
+        )
+    except Exception as error:
+        logging.exception("/post_best_hit_image_admin failed")
+        await update.message.reply_text(
+            f"❌ Failed to post Best Hit image to FREE channel.\n\nError: {error}"
+        )
+
+
+async def image_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: verify OpenAI image generation independent of betting logic."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    output_path = Path(__file__).with_name("generated_cards") / "test.png"
+    prompt = "A baseball with blue lightning"
+    try:
+        await update.message.reply_text("Generating OpenAI image...")
+        saved_image = await asyncio.to_thread(generate_image, prompt, str(output_path))
+        with Path(saved_image).open("rb") as image_file:
+            await update.message.reply_photo(
+                photo=image_file,
+                caption=f"✅ OpenAI image test created.\n{saved_image}",
+            )
+    except Exception as error:
+        logging.exception("/image_test failed")
+        await update.message.reply_text(
+            "❌ OpenAI image test failed.\n\n"
+            f"Error: {error}\n\n"
+            f"Prompt: {prompt}"
+        )
+
+
+async def today_image_admin(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Owner-only: preview one Anime Vault image for /today."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    await update.message.reply_text("⏳ Building /today Anime Vault image preview...")
+    selected_date = official_sports_date().isoformat()
+    try:
+        featured = await asyncio.to_thread(
+            get_most_recent_featured_picks,
+            selected_date,
+        )
+        play = featured.get("play_of_day")
+        legs = featured.get("parlay_legs", [])
+        if not play or not isinstance(legs, list) or len(legs) != 2:
+            await update.message.reply_text(
+                "Today’s official picks are not saved yet. Run /mlb_auto first, "
+                "then run /today_image_admin."
+            )
+            return
+        result = await asyncio.to_thread(
+            prepare_today_pick_image,
+            featured,
+            selected_date,
+            image_generation_enabled=_truthy_env("IMAGE_GENERATION_ENABLED"),
+        )
+        await _send_single_image_preview(
+            update,
+            result,
+            title="BETGPTAI Today Pick Image",
+            approved_post_hint="Preview only. Public posting command will be added later.",
+        )
+    except Exception as error:
+        logging.exception("/today_image_admin failed")
+        await update.message.reply_text(
+            f"Unable to build /today image preview. Error: {error}"
+        )
+
+
+async def mlb_auto_image_admin(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Owner-only: preview one Anime Vault image for /mlb_auto."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    await update.message.reply_text("⏳ Building /mlb_auto Anime Vault image preview...")
+    selected_date = official_sports_date().isoformat()
+    try:
+        slate = await asyncio.to_thread(
+            get_combined_slate,
+            os.getenv("ODDS_API_KEY", ""),
+            game_date=selected_date,
+            highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+        )
+        if not slate:
+            await update.message.reply_text("No MLB games were found for today.")
+            return
+        try:
+            analysis = await analyze_mlb_slate(
+                slate,
+                os.getenv("OPENAI_API_KEY", ""),
+                os.getenv("ANTHROPIC_API_KEY", ""),
+            )
+        except Exception as error:
+            logging.error("AI Analysis Error:\n%s", error, exc_info=True)
+            analysis = build_fallback_card(slate)
+
+        await asyncio.to_thread(
+            save_model_report, selected_date, slate, analysis, get_last_analysis_metadata()
+        )
+        try:
+            saved_count = await asyncio.to_thread(
+                _save_official_mlb_card,
+                analysis,
+                slate,
+                selected_date,
+                "mlb_auto_image_admin",
+            )
+        except Exception:
+            logging.exception("Could not save official picks before /mlb_auto image")
+
+        result = await asyncio.to_thread(
+            prepare_mlb_auto_image,
+            _with_card_date(analysis, selected_date),
+            selected_date,
+            image_generation_enabled=_truthy_env("IMAGE_GENERATION_ENABLED"),
+        )
+        await _send_single_image_preview(
+            update,
+            result,
+            title="BETGPTAI MLB Auto Image",
+            approved_post_hint="Preview only. Public posting command will be added later.",
+        )
+    except Exception as error:
+        logging.exception("/mlb_auto_image_admin failed")
+        await update.message.reply_text(
+            f"Unable to build /mlb_auto image preview. Error: {error}"
+        )
+
+
+async def magazine_admin(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Owner-only Daily Anime Sports Magazine prompt/image preview."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    await update.message.reply_text("⏳ Building BETGPTAI Daily Anime Sports Magazine...")
+    selected_date = official_sports_date().isoformat()
+    try:
+        slate, payload = await _build_verified_props_payload(selected_date)
+        if not payload:
+            await update.message.reply_text("No MLB games were found for today.")
+            return
+        mlb_card_data: dict[str, object] = {}
+        try:
+            analysis = await analyze_mlb_slate(
+                slate,
+                os.getenv("OPENAI_API_KEY", ""),
+                os.getenv("ANTHROPIC_API_KEY", ""),
+            )
+            mlb_card_data = _official_mlb_card_data(analysis, slate, selected_date)
+        except Exception:
+            logging.exception("Magazine MLB plays enrichment failed")
+        prompt_items = generate_daily_magazine_prompts(payload, mlb_card_data)
+        output_dir = _dated_generated_cards_dir(selected_date) / "magazine"
+        await _send_prompt_previews(
+            update,
+            prompt_items,
+            output_dir,
+            save_function=save_magazine_prompts,
+            image_prefix="BETGPTAI Daily Anime Sports Magazine",
+        )
+    except Exception as error:
+        logging.exception("/magazine_admin failed")
+        await update.message.reply_text(f"Unable to build magazine cards. Error: {error}")
+
+
+async def verify_player_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Owner-only current-team verification command."""
+    if not await _require_admin(update) or not update.message:
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /verify_player PLAYER_NAME")
+        return
+    player_name = " ".join(context.args)
+    result = await asyncio.to_thread(verify_player_team, player_name, "")
+    icon = "✅" if result.get("verified") else "❌"
+    await update.message.reply_text(
+        f"{icon} PLAYER VERIFICATION\n\n"
+        f"Player: {player_name}\n"
+        f"Current Team: {result.get('current_team') or 'Unavailable'}\n"
+        f"Player ID: {result.get('player_id') or 'Unavailable'}\n"
+        f"Status: {result.get('status')}\n"
+        f"Reason: {result.get('reason')}"
+    )
+
+
+async def props_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only full player props lab preview."""
+    del context
+    await _send_props_lab(update, "summary")
+
+
+async def hits_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only hit prop preview."""
+    del context
+    await _send_props_lab(update, "hits")
+
+
+async def hits_by_team_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only best hit prop candidate for each team playing today."""
+    del context
+    await _send_props_lab(update, "hits_by_team")
+
+
+async def hr_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only HR watch preview."""
+    del context
+    await _send_props_lab(update, "home_runs")
+
+
+async def strikeouts_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only strikeout prop preview."""
+    del context
+    await _send_props_lab(update, "strikeouts")
+
+
+async def prop_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only raw prop candidate debug output."""
+    del context
+    await _send_props_lab(update, "debug")
+
+
+async def props_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only engine status card."""
+    del context
+    await _send_props_lab(update, "test")
+
+
+async def approve_prop_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Owner-only: move one lab prop to approved_props.json without posting it."""
+    if not await _require_admin(update):
+        return
+    if not update.message:
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /approve_prop PROP_ID")
+        return
+    ok, message = await asyncio.to_thread(approve_prop, context.args[0])
+    prefix = "✅" if ok else "❌"
+    await update.message.reply_text(
+        f"{prefix} {message}\n\n"
+        "Approval is admin-only and does not post props to any channel."
+    )
+
+
+async def backfill_today(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Privately regenerate and save today's official card without publishing it."""
+    del context
+    if not await _require_admin(update):
+        return
+    if not update.message:
+        return
+
+    await update.message.reply_text("⏳ Backfilling today’s official picks...")
+    selected_date = official_sports_date().isoformat()
+    try:
+        slate = await asyncio.to_thread(
+            get_combined_slate,
+            os.getenv("ODDS_API_KEY", ""),
+            game_date=selected_date,
+            highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+        )
+        if not slate:
+            await update.message.reply_text("No MLB games were found for today.")
+            return
+        analysis = await analyze_mlb_slate(
+            slate,
+            os.getenv("OPENAI_API_KEY", ""),
+            os.getenv("ANTHROPIC_API_KEY", ""),
+        )
+        await asyncio.to_thread(
+            save_model_report, selected_date, slate, analysis, get_last_analysis_metadata()
+        )
+        saved_count = await asyncio.to_thread(
+            _save_official_mlb_card,
+            analysis,
+            slate,
+            selected_date,
+            "backfill_today",
+        )
+        await update.message.reply_text(
+            f"✅ Backfill complete. Saved {saved_count} official picks."
+        )
+    except Exception:
+        logging.exception("Unexpected /backfill_today error")
+        await update.message.reply_text(
+            "Unable to backfill today’s picks. Check the terminal and try again."
+        )
+
+
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Display the private BETGPTAI administration panel."""
+    del context
+    if not await _require_admin(update):
+        return
+    if not update.message:
+        return
+
+    try:
+        counts = await asyncio.to_thread(_database_counts)
+    except ResultsTrackerError as error:
+        logging.warning("Could not load admin database counts: %s", error)
+        counts = {"total": 0, "pending": 0, "graded": 0}
+
+    await update.message.reply_text(
+        "⚙️ BETGPTAI ADMIN PANEL\n\n"
+        "📡 API STATUS\n"
+        "/status\n\n"
+        "🧠 MODEL REPORT\n"
+        "/model_report\n\n"
+        "📊 UPDATE RESULTS\n"
+        "/update_results\n\n"
+        "✅ GRADE TODAY\n"
+        "/grade_today\n\n"
+        "🧪 DEBUG PICKS\n"
+        "/debug_picks\n\n"
+        "🧪 DEBUG RESULTS\n"
+        "/debug_results\n\n"
+        "⚾ PLAYER PROP LAB\n"
+        "/props_admin · /hits_admin · /hr_admin · /strikeouts_admin\n"
+        "/hits_by_team_admin\n"
+        "/props_images_admin · /hits_by_team_image_admin\n"
+        "/best_hit_image_admin · /post_best_hit_image_admin\n"
+        "/magazine_admin · /verify_player PLAYER_NAME\n"
+        "/props_test · /prop_debug\n"
+        "/approve_prop PROP_ID\n\n"
+        "📝 BACKFILL PICKS\n"
+        "/backfill_today\n\n"
+        "📡 TEST CHANNELS\n"
+        "/test_channels\n\n"
+        "🖼 IMAGE CARD TESTS\n"
+        "/image_test\n"
+        "/today_image_admin · /mlb_auto_image_admin\n"
+        "/mlb_images\n"
+        "/post_mlb_images\n"
+        "/test_image_card\n"
+        "/post_test_image\n\n"
+        "⚽ SOCCER TOOLS\n"
+        "/soccer_full · /btts · /corners · /overs · /cards\n"
+        "/first_half · /second_half · /double_chance · /asian_handicap\n"
+        "/soccer_results · /debug_soccer\n\n"
+        "💾 DATABASE INFO\n\n"
+        f"Total Tracked Picks: {counts['total']}\n"
+        f"Pending Picks: {counts['pending']}\n"
+        f"Graded Picks: {counts['graded']}\n\n"
+        "🤖 BOT VERSION\n\n"
+        "Current Version:\n"
+        "BETGPTAI v1.2\n\n"
+        "━━━━━━━━━━━━"
+    )
+
+
+async def model_report(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Show the owner which sources actually contributed to today's MLB card."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+
+    async def load_soccer_summary() -> dict[str, object]:
+        """Build a small owner-only soccer engine summary without affecting users."""
+        try:
+            slate = await asyncio.to_thread(
+                get_soccer_slate,
+                os.getenv("FOOTBALL_DATA_API_KEY", ""),
+                os.getenv("ODDS_API_KEY", ""),
+                game_date=selected_date,
+                sports_db_api_key=os.getenv("THE_SPORTS_DB_API_KEY", ""),
+                serpapi_key=os.getenv("SERPAPI_KEY", ""),
+                api_football_key=os.getenv("API_FOOTBALL_KEY", ""),
+            )
+            return soccer_slate_summary(slate)
+        except Exception:
+            logging.info("Soccer model summary unavailable for /model_report")
+            return {}
+
+    (
+        report,
+        clubelo_available,
+        understat_available,
+        fangraphs_ok,
+        statsbomb_ok,
+        fbref_ok,
+        api_football_ok,
+        api_sports_baseball_ok,
+        sportsdb_ok,
+        soccer_summary,
+    ) = await asyncio.gather(
+        asyncio.to_thread(load_model_report, selected_date),
+        asyncio.to_thread(check_clubelo),
+        asyncio.to_thread(check_understat),
+        asyncio.to_thread(fangraphs_available),
+        asyncio.to_thread(statsbomb_available),
+        asyncio.to_thread(fbref_available),
+        asyncio.to_thread(api_football_available, os.getenv("API_FOOTBALL_KEY", "")),
+        (
+            asyncio.to_thread(
+                api_sports_baseball_available,
+                os.getenv("API_SPORTS_KEY", "") or os.getenv("API_FOOTBALL_KEY", ""),
+            )
+            if _truthy_env("API_SPORTS_BASEBALL_ENABLED")
+            else asyncio.sleep(0, result=False)
+        ),
+        asyncio.to_thread(check_thesportsdb, os.getenv("THE_SPORTS_DB_API_KEY", "")),
+        load_soccer_summary(),
+    )
+    football_data_status = (
+        "✅ Configured" if os.getenv("FOOTBALL_DATA_API_KEY", "").strip()
+        else "❌ Missing"
+    )
+    serpapi_status = (
+        "✅ Configured"
+        if check_serpapi(os.getenv("SERPAPI_KEY", ""))
+        else "➖ Not configured"
+    )
+    if not report:
+        await update.message.reply_text(
+            "No model report exists for today yet. Run /mlb_auto first.\n\n"
+            f"API-Sports Baseball status: {'➖ Disabled' if not _truthy_env('API_SPORTS_BASEBALL_ENABLED') else '✅ Available' if api_sports_baseball_ok else '❌ Unavailable'}\n"
+            f"Football-Data status: {football_data_status}\n"
+            f"TheSportsDB status: {'✅ Available' if sportsdb_ok else '❌ Unavailable'}\n"
+            "Weather API status: ✅ Available\n"
+            f"Odds API status: {'✅ Configured' if os.getenv('ODDS_API_KEY', '').strip() else '❌ Missing'}\n"
+            f"OpenAI status: {'✅ Configured' if os.getenv('OPENAI_API_KEY', '').strip() else '❌ Missing'}\n"
+            f"Claude status: {'✅ Configured' if os.getenv('ANTHROPIC_API_KEY', '').strip() else '❌ Missing'}\n"
+            f"ClubElo status: {'✅ Available' if clubelo_available else '❌ Unavailable'}\n"
+            f"Understat status: {'✅ Available' if understat_available else '❌ Unavailable'}\n"
+            f"StatsBomb status: {'✅ Available' if statsbomb_ok else '❌ Unavailable'}\n"
+            f"FBref status: {'✅ Available' if fbref_ok else '❌ Unavailable'}\n"
+            f"FanGraphs/pybaseball status: {'✅ Available' if fangraphs_ok else '❌ Unavailable'}\n"
+            f"Player Props Engine: {props_engine_status}\n"
+            f"SerpApi status: {serpapi_status}\n\n"
+            "Soccer candidates:\n"
+            f"BTTS candidates: {soccer_summary.get('btts_candidates', 0)}\n"
+            f"Over candidates: {soccer_summary.get('over_candidates', 0)}\n"
+            f"Double Chance candidates: {soccer_summary.get('double_chance_dnb_candidates', 0)}\n"
+            f"World Cup candidates: {soccer_summary.get('world_cup_candidates', 0)}"
+        )
+        return
+
+    sources = report.get("sources", {})
+
+    def status(key: str) -> str:
+        return "✅ Used" if sources.get(key) is True else "❌ Unavailable"
+
+    fallbacks = report.get("fallbacks_used", [])
+    fallback_names = ", ".join(fallbacks) if fallbacks else "None"
+    auto_posting = report.get("auto_posting", {})
+    if not isinstance(auto_posting, dict):
+        auto_posting = {}
+    await update.message.reply_text(
+        "🧠 BETGPTAI MODEL REPORT\n\n"
+        f"Card Date: {report.get('date', selected_date)}\n\n"
+        f"MLB Stats API: {status('mlb_stats')}\n"
+        f"Baseball Savant: {status('baseball_savant')}\n"
+        f"FanGraphs: {status('fangraphs')}\n"
+        f"Highlightly: {status('highlightly')}\n"
+        f"Weather: {status('weather')}\n"
+        f"Odds API: {status('odds_api')}\n"
+        f"OpenAI: {status('openai')}\n"
+        f"Claude: {status('claude')}\n"
+        f"API-Sports Baseball: {status('api_sports_baseball')}\n"
+        f"API-Sports Baseball status: {'➖ Disabled' if not _truthy_env('API_SPORTS_BASEBALL_ENABLED') else '✅ Available' if api_sports_baseball_ok else '❌ Unavailable'}\n"
+        f"Football-Data status: {football_data_status}\n"
+        f"TheSportsDB status: {'✅ Available' if sportsdb_ok else '❌ Unavailable'}\n"
+        "Weather API status: ✅ Available\n"
+        f"Odds API status: {'✅ Configured' if os.getenv('ODDS_API_KEY', '').strip() else '❌ Missing'}\n"
+        f"OpenAI status: {'✅ Configured' if os.getenv('OPENAI_API_KEY', '').strip() else '❌ Missing'}\n"
+        f"Claude status: {'✅ Configured' if os.getenv('ANTHROPIC_API_KEY', '').strip() else '❌ Missing'}\n"
+        f"ClubElo status: {'✅ Available' if clubelo_available else '❌ Unavailable'}\n"
+        f"Understat status: {'✅ Available' if understat_available else '❌ Unavailable'}\n"
+        f"StatsBomb status: {'✅ Available' if statsbomb_ok else '❌ Unavailable'}\n"
+        f"FBref status: {'✅ Available' if fbref_ok else '❌ Unavailable'}\n"
+        f"FanGraphs/pybaseball status: {'✅ Available' if fangraphs_ok else '❌ Unavailable'}\n"
+        f"Player Props Engine: {props_engine_status}\n"
+        f"SerpApi status: {serpapi_status}\n\n"
+        "━━━━━━━━━━━━\n\n"
+        f"Savant games enriched: {report.get('savant_games_enriched', 0)}/"
+        f"{report.get('total_games', 0)}\n"
+        f"FanGraphs games enriched: {report.get('fangraphs_games_enriched', 0)}/"
+        f"{report.get('total_games', 0)}\n"
+        f"API-Sports Baseball games enriched: "
+        f"{report.get('api_sports_baseball_games_enriched', 0)}/"
+        f"{report.get('total_games', 0)}\n"
+        f"Consensus picks found: {report.get('consensus_picks_found', 0)}\n"
+        f"Value engine count: {report.get('value_engine_count', 0)}\n"
+        f"NRFI candidates: {report.get('nrfi_candidates', 0)}\n"
+        f"F5 candidates: {report.get('f5_candidates', 0)}\n"
+        f"Team total candidates: {report.get('team_total_candidates', 0)}\n"
+        f"Strikeout candidates: {report.get('strikeout_candidates', 0)}\n"
+        f"HR watch candidates: {report.get('home_run_candidates', 0)}\n"
+        "\nSoccer candidates:\n"
+        f"BTTS candidates: {soccer_summary.get('btts_candidates', 0)}\n"
+        f"Over candidates: {soccer_summary.get('over_candidates', 0)}\n"
+        f"Double Chance candidates: {soccer_summary.get('double_chance_dnb_candidates', 0)}\n"
+        f"World Cup candidates: {soccer_summary.get('world_cup_candidates', 0)}\n"
+        f"Fallbacks used: {len(fallbacks)}\n"
+        f"Fallback details: {fallback_names}\n\n"
+        "━━━━━━━━━━━━\n\n"
+        "Auto-posting status:\n"
+        f"Status: {auto_posting.get('status', 'Unavailable')}\n"
+        f"Sent: {auto_posting.get('sent', 0)}\n"
+        f"Skipped: {auto_posting.get('skipped', 0)}\n"
+        f"Failed: {auto_posting.get('failed', 0)}\n"
+        f"Last Recorded: {auto_posting.get('last_recorded_at', 'Unavailable')}"
+    )
+
+
+def _telegram_destination(value: str) -> int | str:
+    """Convert numeric Telegram IDs while still allowing @channel usernames."""
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError("Channel ID is missing from .env.")
+    if cleaned.startswith("@"):
+        return cleaned
+    try:
+        numeric_id = int(cleaned)
+    except ValueError as error:
+        raise ValueError("Channel ID must be numeric or an @username.") from error
+
+    # Telegram's copied channel/supergroup IDs normally begin with -100. Some
+    # dashboards omit the minus sign, so accept that beginner-friendly format.
+    if numeric_id > 0 and cleaned.startswith("100"):
+        numeric_id = -numeric_id
+    return numeric_id
+
+
+async def test_channels(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Privately verify delivery to every configured BETGPTAI destination."""
+    if not await _require_admin(update):
+        return
+    if not update.message:
+        return
+
+    destinations = (
+        ("Free Channel", "FREE_CHANNEL_ID"),
+        ("VIP Channel", "VIP_CHANNEL_ID"),
+        ("Community Group", "COMMUNITY_GROUP_ID"),
+    )
+    results: list[str] = []
+    for label, environment_name in destinations:
+        try:
+            chat_id = _telegram_destination(os.getenv(environment_name, ""))
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="✅ BETGPTAI test message",
+            )
+            results.append(f"{label}: ✅ Success")
+        except Exception as error:
+            # The full Telegram error is shown only in this owner-protected chat.
+            logging.warning("Channel test failed for %s: %s", label, error)
+            results.append(f"{label}: ❌ Failed\nError: {error}")
+
+    await update.message.reply_text(
+        "📡 CHANNEL TEST RESULTS\n\n" + "\n\n".join(results)
+    )
+
+
+MLB_IMAGE_HEADINGS = [
+    "🔥 PLAY OF THE DAY",
+    "🏆 TOP 2 MONEYLINE",
+    "🔥 TOP 2 F5 MONEYLINE",
+    "📈 TOP 2 RUNLINE/SPREAD",
+    "🎯 TOP 2 OVER/UNDER TOTAL RUNS",
+    "💰 TOP 2 TEAM TOTALS",
+    "🧩 2-LEG SAFE PARLAY",
+]
+
+
+def _truthy_env(name: str) -> bool:
+    """Read true/false feature flags from .env in a beginner-friendly way."""
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _dated_generated_cards_dir(selected_date: str) -> Path:
+    """Return generated_cards/YYYY-MM-DD and create it if needed."""
+    output_dir = Path(__file__).with_name("generated_cards") / selected_date
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def _section_from_card(card: str, heading: str) -> str:
+    """Extract one section from the Telegram MLB card text."""
+    start = card.find(heading)
+    if start < 0:
+        return ""
+    end = len(card)
+    for other_heading in MLB_IMAGE_HEADINGS:
+        if other_heading == heading:
+            continue
+        candidate = card.find(other_heading, start + len(heading))
+        if candidate >= 0:
+            end = min(end, candidate)
+    divider = card.find("━━━━━━━━━━━━", start + len(heading))
+    if divider >= 0:
+        end = min(end, divider)
+    return card[start:end].strip()
+
+
+def _clean_image_pick_line(line: str) -> str:
+    """Remove Telegram-only decorations while keeping betting market text."""
+    cleaned = re.sub(r"^[\s\d️⃣1-9.✅⚾🔥🏆📈🎯💰🧩-]+", "", line).strip()
+    cleaned = re.sub(r"^(Pick|Line|Risk Grade|Confidence Grade|Reason):\s*", "", cleaned, flags=re.I)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _picks_from_section(section: str, limit: int = 5) -> list[str]:
+    """Pull concise pick lines from one section of the generated card."""
+    skip_prefixes = (
+        "reason", "line:", "risk grade", "confidence grade", "safer line",
+        "parlay note", "singles", "parlays", "educational", "card timing",
+        "odds vary", "please shop", "🆚", "🕒", "🔴",
+    )
+    picks: list[str] = []
+    for raw_line in section.splitlines():
+        line = raw_line.strip()
+        if not line or line in MLB_IMAGE_HEADINGS or line == "━━━━━━━━━━━━":
+            continue
+        if line.lower().startswith(skip_prefixes):
+            continue
+        cleaned = _clean_image_pick_line(line)
+        if not cleaned or cleaned.lower().startswith(skip_prefixes):
+            continue
+        if cleaned not in picks:
+            picks.append(cleaned)
+        if len(picks) >= limit:
+            break
+    return picks
+
+
+def _official_mlb_card_data(
+    analysis: str, slate: list[dict[str, object]], selected_date: str
+) -> dict[str, object]:
+    """Convert the official Telegram MLB card into image-carousel data."""
+    play_section = _section_from_card(analysis, "🔥 PLAY OF THE DAY")
+    moneyline_section = _section_from_card(analysis, "🏆 TOP 2 MONEYLINE")
+    f5_section = _section_from_card(analysis, "🔥 TOP 2 F5 MONEYLINE")
+    runline_section = _section_from_card(analysis, "📈 TOP 2 RUNLINE/SPREAD")
+    totals_section = _section_from_card(analysis, "🎯 TOP 2 OVER/UNDER TOTAL RUNS")
+    team_totals_section = _section_from_card(analysis, "💰 TOP 2 TEAM TOTALS")
+    parlay_section = _section_from_card(analysis, "🧩 2-LEG SAFE PARLAY")
+
+    play_candidates = _picks_from_section(play_section, 1)
+    moneylines = _picks_from_section(moneyline_section, 5)
+    f5 = _picks_from_section(f5_section, 5)
+    runlines = _picks_from_section(runline_section, 5)
+    totals = _picks_from_section(totals_section, 5)
+    team_totals = _picks_from_section(team_totals_section, 5)
+    safe_parlay = [
+        _clean_image_pick_line(line)
+        for line in parlay_section.splitlines()
+        if line.strip().startswith("✅")
+    ][:3]
+    core_five = (
+        [*play_candidates, *moneylines, *f5, *runlines, *totals, *team_totals]
+    )[:5]
+    matchups = [
+        f"{game.get('away_team', 'Away')} @ {game.get('home_team', 'Home')}"
+        for game in slate[:8]
+    ]
+
+    return {
+        "date": selected_date,
+        "play_of_day": play_candidates[0] if play_candidates else "Play of the Day TBD",
+        "best_bet": play_candidates[0] if play_candidates else "Best Bet TBD",
+        "moneylines": moneylines,
+        "f5": f5,
+        "runlines": runlines,
+        "totals": totals,
+        "team_totals": team_totals,
+        "safe_parlay": safe_parlay,
+        "value_parlay": [*runlines, *totals][:3],
+        "ev_parlay": [*moneylines, *team_totals][:3],
+        "core_five": core_five,
+        "matchups": matchups,
+        "raw_text": analysis,
+    }
+
+
+async def test_image_card(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Owner-only: explain that placeholder image generation is disabled."""
+    del context
+    if not await _require_admin(update):
+        return
+    if not update.message:
+        return
+    await update.message.reply_text(
+        "🛑 Image card generation is disabled.\n\n"
+        "The previous Pillow-only placeholder style did not meet the BETGPTAI "
+        "Anime Vault standard.\n\n"
+        "Use /mlb_images to get 7 detailed prompts for ChatGPT image generation.\n\n"
+        "No image was generated or posted."
+    )
+
+
+async def post_test_image(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Owner-only: prevent placeholder image posting to configured destinations."""
+    del context
+    if not await _require_admin(update):
+        return
+    if not update.message:
+        return
+    await update.message.reply_text(
+        "🛑 Test image posting is disabled.\n\n"
+        "No image was sent to FREE_CHANNEL_ID, VIP_CHANNEL_ID, or "
+        "COMMUNITY_GROUP_ID.\n\n"
+        "Use /mlb_images to generate prompt-ready Anime Vault directions first."
+    )
+
+
+async def mlb_images(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: build prompts and optionally generate image previews."""
+    del context
+    if not await _require_admin(update):
+        return
+    if not update.message:
+        return
+
+    await update.message.reply_text("⏳ Building BETGPTAI Anime Edition v7.0 MLB images...")
+    selected_date = official_sports_date().isoformat()
+    try:
+        output_dir = _dated_generated_cards_dir(selected_date)
+        slate = await asyncio.to_thread(
+            get_combined_slate,
+            os.getenv("ODDS_API_KEY", ""),
+            game_date=selected_date,
+            highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+        )
+        if not slate:
+            await update.message.reply_text("No MLB games were found for today.")
+            return
+
+        analysis = await analyze_mlb_slate(
+            slate,
+            os.getenv("OPENAI_API_KEY", ""),
+            os.getenv("ANTHROPIC_API_KEY", ""),
+        )
+        card_data = _official_mlb_card_data(analysis, slate, selected_date)
+        prompts = generate_mlb_card_slides(card_data)
+        saved_paths = await asyncio.to_thread(
+            save_mlb_card_slide_prompts, prompts, output_dir
+        )
+
+        for index, prompt in enumerate(prompts, start=1):
+            await _send_long_message(
+                update,
+                f"🖼 BETGPTAI Anime Edition v7.0\n"
+                f"Slide {index}/7 Prompt\n\n{prompt}",
+            )
+
+        saved_list = "\n".join(str(path) for path in saved_paths)
+        await update.message.reply_text(
+            "✅ Anime Vault prompts saved.\n\n"
+            f"{saved_list}"
+        )
+
+        if not _truthy_env("IMAGE_GENERATION_ENABLED"):
+            await update.message.reply_text(
+                "IMAGE_GENERATION_ENABLED=false, so I sent prompt-ready slides only."
+            )
+            return
+
+        await update.message.reply_text(
+            "🎨 IMAGE_GENERATION_ENABLED=true. Generating owner-only preview images..."
+        )
+        for index, prompt in enumerate(prompts, start=1):
+            image_path = output_dir / f"slide_{index}.png"
+            try:
+                saved_image = await asyncio.to_thread(
+                    generate_image_from_prompt, prompt, str(image_path)
+                )
+                with Path(saved_image).open("rb") as image_file:
+                    await update.message.reply_photo(
+                        photo=image_file,
+                        caption=f"BETGPTAI Anime Vault Preview — Slide {index}/7",
+                    )
+            except Exception as error:
+                logging.exception("OpenAI image generation failed for slide %s", index)
+                await _send_long_message(
+                    update,
+                    f"❌ Image generation failed for slide {index}.\n\n"
+                    f"Error: {error}\n\n"
+                    f"Fallback prompt:\n\n{prompt}",
+                )
+    except Exception as error:
+        logging.exception("/mlb_images failed")
+        await update.message.reply_text(
+            "Unable to build Anime Edition prompts right now. "
+            f"Owner debug error: {error}"
+        )
+
+
+async def post_mlb_images(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Owner-only: post approved generated MLB images to configured channels."""
+    del context
+    if not await _require_admin(update):
+        return
+    if not update.message:
+        return
+
+    selected_date = official_sports_date().isoformat()
+    output_dir = _dated_generated_cards_dir(selected_date)
+    image_paths = [output_dir / f"slide_{index}.png" for index in range(1, 8)]
+    missing = [path.name for path in image_paths if not path.exists()]
+    if missing:
+        await update.message.reply_text(
+            "❌ Approved image set is incomplete.\n\n"
+            f"Missing: {', '.join(missing)}\n\n"
+            "Run /mlb_images with IMAGE_GENERATION_ENABLED=true first, review the "
+            "images, then run /post_mlb_images."
+        )
+        return
+
+    destinations = (
+        ("Free Channel", "FREE_CHANNEL_ID"),
+        ("VIP Channel", "VIP_CHANNEL_ID"),
+        ("Community Group", "COMMUNITY_GROUP_ID"),
+    )
+    results: list[str] = []
+    for label, environment_name in destinations:
+        try:
+            chat_id = _telegram_destination(os.getenv(environment_name, ""))
+            for index, image_path in enumerate(image_paths, start=1):
+                with image_path.open("rb") as image_file:
+                    await context.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=image_file,
+                        caption=(
+                            "BETGPTAI Anime Vault Official MLB Card"
+                            if index == 1 else ""
+                        ),
+                    )
+            results.append(f"{label}: ✅ Posted 7 images")
+        except Exception as error:
+            logging.exception("Posting MLB images failed for %s", label)
+            results.append(f"{label}: ❌ Failed\nError: {error}")
+
+    await update.message.reply_text(
+        "🖼 MLB IMAGE POST RESULTS\n\n" + "\n\n".join(results)
+    )
+
+
+async def _edit_app_message(query: object, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
+    """Edit the current inline-menu message, falling back to a reply if needed."""
+    try:
+        await query.edit_message_text(text=text, reply_markup=markup)
+    except Exception:
+        if getattr(query, "message", None):
+            await query.message.reply_text(text, reply_markup=markup)
+
+
+async def _build_mlb_auto_card_for_menu() -> str:
+    """Run the public MLB card pipeline for inline-menu users."""
+    selected_date = official_sports_date().isoformat()
+    slate = await asyncio.to_thread(
+        get_combined_slate,
+        os.getenv("ODDS_API_KEY", ""),
+        game_date=selected_date,
+        highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+    )
+    if not slate:
+        return "No MLB games were found for today."
+    try:
+        analysis = await analyze_mlb_slate(
+            slate,
+            os.getenv("OPENAI_API_KEY", ""),
+            os.getenv("ANTHROPIC_API_KEY", ""),
+        )
+    except Exception as error:
+        logging.error("AI Analysis Error:\n%s", error, exc_info=True)
+        analysis = build_fallback_card(slate)
+    await asyncio.to_thread(
+        save_model_report, selected_date, slate, analysis, get_last_analysis_metadata()
+    )
+    try:
+        saved_count = await asyncio.to_thread(
+            _save_official_mlb_card,
+            analysis,
+            slate,
+            selected_date,
+            "tap_menu_mlb_card",
+        )
+    except Exception:
+        logging.exception("Could not save official picks to picks.json")
+        return (
+            "The card was generated, but its picks could not be saved. "
+            "No picks were sent. Check picks.json and try again."
+        )
+    return _with_card_date(analysis, selected_date)
+
+
+async def _build_soccer_card_for_menu() -> str:
+    """Run the public soccer pipeline for inline-menu users."""
+    selected_date = official_sports_date().isoformat()
+    slate = await asyncio.to_thread(
+        get_soccer_slate,
+        os.getenv("FOOTBALL_DATA_API_KEY", ""),
+        os.getenv("ODDS_API_KEY", ""),
+        live_only=False,
+        game_date=selected_date,
+        sports_db_api_key=os.getenv("THE_SPORTS_DB_API_KEY", ""),
+        serpapi_key=os.getenv("SERPAPI_KEY", ""),
+        api_football_key=os.getenv("API_FOOTBALL_KEY", ""),
+    )
+    card = await analyze_soccer_slate(
+        slate,
+        os.getenv("OPENAI_API_KEY", ""),
+        "public",
+        os.getenv("ANTHROPIC_API_KEY", ""),
+    )
+    try:
+        saved_count = await asyncio.to_thread(
+            save_soccer_picks, card, slate, selected_date, "soccer_public"
+        )
+        if saved_count:
+            print(f"Saved {saved_count} soccer picks to picks.json", flush=True)
+    except Exception:
+        logging.exception("Could not save soccer picks to picks.json")
+    return _with_card_date(card, selected_date)
+
+
+def _mmddyyyy_folder(card_date: str) -> str:
+    """Return MM-DD-YYYY for legacy Best Hit image folders."""
+    return datetime.fromisoformat(card_date).strftime("%m-%d-%Y")
+
+
+def _available_public_image(kind: str) -> Path | None:
+    """Return an already-generated public preview image when available."""
+    selected_date = official_sports_date().isoformat()
+    base = Path(__file__).with_name("generated_cards")
+    candidates = {
+        "mlb_auto": [base / selected_date / "mlb_auto_card.png"],
+        "best_hit": [base / _mmddyyyy_folder(selected_date) / "best_hit_prop.png"],
+    }.get(kind, [])
+    return next((path for path in candidates if path.exists()), None)
+
+
+async def inline_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Route inline menu buttons like a modern mobile app."""
+    del context
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    action = query.data or ""
+
+    user_id = update.effective_user.id if update.effective_user else None
+    is_admin = _is_admin_user(user_id)
+
+    if action in {"menu:main", "menu:home"}:
+        await _edit_app_message(query, _main_menu_text(), _main_menu_markup(user_id))
+        return
+
+    hub_screens = {
+        "menu:mlb_hub": ("⚾ MLB HUB\n\nChoose today’s MLB section.", "mlb"),
+        "menu:soccer_hub": ("⚽ SOCCER HUB\n\nChoose today’s soccer section.", "soccer"),
+        "menu:results_hub": ("📊 RESULTS HUB\n\nChoose a results view.", "results"),
+        "menu:vip_hub": ("💎 BETGPTAI PREMIUM\n\nChoose a membership section.", "vip"),
+        "menu:help_hub": ("ℹ️ HELP\n\nChoose a help topic.", "help"),
+    }
+    if action in hub_screens:
+        text, hub = hub_screens[action]
+        await _edit_app_message(query, text, _hub_markup(hub))
+        return
+
+    if action == "menu:admin_hub":
+        if not is_admin:
+            await _edit_app_message(query, "⛔ Unauthorized command.", _back_menu_markup())
+            return
+        await _edit_app_message(query, "⚙️ ADMIN HUB\n\nOwner-only BETGPTAI controls.", _hub_markup("admin"))
+        return
+
+    if action in {"menu:help", "menu:help_how"}:
+        await _edit_app_message(query, _help_text(), _back_menu_markup())
+        return
+    if action == "menu:help_singles":
+        await _edit_app_message(
+            query,
+            "✅ SINGLES-FIRST APPROACH\n\nBETGPTAI is built around single bets for better long-term discipline. Parlays are optional and higher variance.",
+            _hub_markup("help"),
+        )
+        return
+    if action == "menu:help_disclaimer":
+        await _edit_app_message(query, "⚠️ DISCLAIMER\n\nEducational analysis only. Play responsibly. Past performance does not guarantee future results.", _hub_markup("help"))
+        return
+    if action == "menu:help_contact":
+        await _edit_app_message(query, "📩 CONTACT ADMIN\n\nAfter payment or for support, send proof/details to @YOUR_USERNAME.", _hub_markup("help"))
+        return
+
+    if action in {"menu:vip", "menu:vip_benefits"}:
+        await _edit_app_message(query, _vip_text(), _hub_markup("vip"))
+        return
+    if action == "menu:vip_weekly":
+        await _edit_app_message(query, "🥉 Weekly Pass — $5.99\n\nhttps://buy.stripe.com/aFadRbgvt1Da75L5xv0ZW00", _hub_markup("vip"))
+        return
+    if action == "menu:vip_monthly":
+        await _edit_app_message(query, "🥈 Premium Monthly — $9.99\n\nhttps://buy.stripe.com/dRm7sN6UT95C89PbVT0ZW01", _hub_markup("vip"))
+        return
+    if action == "menu:vip_season":
+        await _edit_app_message(query, "🥇 Season Pass — $49.99 every 6 months\n\nhttps://buy.stripe.com/aFa9AVa75epW1Lre410ZW02", _hub_markup("vip"))
+        return
+
+    if action == "menu:mlb_today":
+        await _edit_app_message(query, await _build_today_card_text(), _back_menu_markup())
+        return
+    if action == "menu:mlb_parlay":
+        await _edit_app_message(query, await _build_safe_parlay_text(), _hub_markup("mlb"))
+        return
+    if action == "menu:mlb_best_hit":
+        image = _available_public_image("best_hit")
+        await _edit_app_message(query, _latest_best_hit_text(), _hub_markup("mlb"))
+        if image and query.message:
+            with image.open("rb") as image_file:
+                await query.message.reply_photo(photo=image_file, caption="⚾ BETGPTAI Best Hit Prop")
+        return
+    if action == "menu:mlb_image":
+        if is_admin:
+            await _edit_app_message(query, "⏳ Generating admin Anime Card Preview...", _hub_markup("mlb"))
+            if query.message:
+                selected_date = official_sports_date().isoformat()
+                slate = await asyncio.to_thread(
+                    get_combined_slate,
+                    os.getenv("ODDS_API_KEY", ""),
+                    game_date=selected_date,
+                    highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+                )
+                analysis = await analyze_mlb_slate(
+                    slate,
+                    os.getenv("OPENAI_API_KEY", ""),
+                    os.getenv("ANTHROPIC_API_KEY", ""),
+                )
+                try:
+                    await asyncio.to_thread(
+                        _save_official_mlb_card,
+                        analysis,
+                        slate,
+                        selected_date,
+                        "tap_menu_mlb_image",
+                    )
+                except Exception:
+                    logging.exception("Could not save official picks before tap-menu MLB image")
+                result = await asyncio.to_thread(
+                    prepare_mlb_auto_image,
+                    _with_card_date(analysis, selected_date),
+                    selected_date,
+                    image_generation_enabled=_truthy_env("IMAGE_GENERATION_ENABLED"),
+                )
+                await _send_single_image_preview(query.message, result, title="BETGPTAI MLB Auto Image")
+            return
+        image = _available_public_image("mlb_auto")
+        if image and query.message:
+            await _edit_app_message(query, "🖼 Anime Card Preview", _hub_markup("mlb"))
+            with image.open("rb") as image_file:
+                await query.message.reply_photo(photo=image_file, caption="BETGPTAI MLB Anime Card Preview")
+        else:
+            await _edit_app_message(query, "Anime preview is not ready yet. Check back after today’s card is generated.", _hub_markup("mlb"))
+        return
+    if action in {"menu:mlb_card", "menu:mlb"}:
+        await _edit_app_message(
+            query,
+            "⏳ Building today’s BETGPTAI MLB card...\n\nThe card will appear below when ready.",
+            _hub_markup("mlb"),
+        )
+        if query.message:
+            await _send_long_text_to_message(query.message, await _build_mlb_auto_card_for_menu())
+        return
+
+    if action == "menu:soccer_worldcup":
+        await _edit_app_message(query, "⏳ Building World Cup / soccer card...\n\nThe card will appear below when ready.", _hub_markup("soccer"))
+        if query.message:
+            await _send_long_text_to_message(query.message, await _build_soccer_card_for_menu())
+        return
+    if action in {"menu:soccer_card", "menu:soccer"}:
+        await _edit_app_message(query, "⏳ Building today’s BETGPTAI soccer card...\n\nThe card will appear below when ready.", _hub_markup("soccer"))
+        if query.message:
+            try:
+                card = await _build_soccer_card_for_menu()
+            except Exception:
+                logging.exception("Unexpected inline soccer card error")
+                card = "Unable to build the soccer card right now. Please try again shortly."
+            await _send_long_text_to_message(query.message, card)
+        return
+    if action == "menu:soccer_parlay":
+        await _edit_app_message(query, "🧩 SOCCER PARLAY\n\nSoccer parlay appears inside today’s soccer card when available.\n\nTap 🔥 Best Soccer Plays to generate it.", _hub_markup("soccer"))
+        return
+
+    if action in {"menu:results_today", "menu:results"}:
+        try:
+            dashboard = await asyncio.to_thread(build_daily_results_dashboard)
+        except ResultsTrackerError as error:
+            logging.warning("Could not load results dashboard: %s", error)
+            dashboard = f"Results are temporarily unavailable: {error}"
+        await _edit_app_message(query, dashboard, _hub_markup("results"))
+        return
+    if action == "menu:results_yesterday":
+        target_date = (eastern_today() - timedelta(days=1)).isoformat()
+        dashboard = await asyncio.to_thread(build_daily_results_dashboard, target_date)
+        await _edit_app_message(query, dashboard, _hub_markup("results"))
+        return
+    if action == "menu:results_7days":
+        dashboard = await asyncio.to_thread(build_range_results_dashboard, 7)
+        await _edit_app_message(query, dashboard, _hub_markup("results"))
+        return
+    if action == "menu:results_season":
+        dashboard = await asyncio.to_thread(build_range_results_dashboard, 3650)
+        await _edit_app_message(query, dashboard, _hub_markup("results"))
+        return
+
+    if action.startswith("menu:admin_"):
+        if not is_admin:
+            await _edit_app_message(query, "⛔ Unauthorized command.", _back_menu_markup())
+            return
+        admin_messages = {
+            "menu:admin_props": "🧪 PROPS LAB\n\nUse /props_admin, /hits_admin, /hr_admin, or /strikeouts_admin.",
+            "menu:admin_images": "🖼 GENERATE IMAGES\n\nUse /best_hit_image_admin, /today_image_admin, /mlb_auto_image_admin, or /mlb_images.",
+            "menu:admin_model": "📊 MODEL REPORT\n\nUse /model_report for full diagnostics.",
+            "menu:admin_grade": "🔁 GRADE TODAY\n\nUse /grade_today, /results_auto_status, /post_results_now, /enable_auto_results, or /disable_auto_results.",
+            "menu:admin_debug": "🧰 DEBUG TOOLS\n\nUse /status, /debug_picks, /debug_results, /prop_debug, or /debug_soccer.",
+        }
+        await _edit_app_message(query, admin_messages.get(action, "Admin tool unavailable."), _hub_markup("admin"))
+        return
+
+
+async def _configure_command_menus(application: object) -> None:
+    """Keep every Telegram command menu limited to public app navigation."""
+    public_commands = [
+        BotCommand("start", "Open BETGPTAI sports hub"),
+    ]
+    await application.bot.set_my_commands(public_commands)
+
+    admin_id = _admin_telegram_id()
+    if admin_id is not None:
+        # Overwrite any older owner-specific menu that exposed admin commands.
+        # The commands remain registered and work when the owner types them.
+        await application.bot.set_my_commands(
+            public_commands,
+            scope=BotCommandScopeChat(chat_id=admin_id),
+        )
+
+
+async def main() -> None:
+    """Load settings, register commands, and keep the bot running."""
+    # load_dotenv reads BOT_TOKEN from a local .env file if one exists.
+    load_dotenv()
+    token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+
+    # Stop early with a clear message if the private token is missing.
+    if not token:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN or BOT_TOKEN is missing. Copy .env.example "
+            "to .env and add your token."
+        )
+
+    # ApplicationBuilder creates the python-telegram-bot application.
+    application = ApplicationBuilder().token(token).build()
+
+    # Connect each Telegram command to its matching async function above.
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("today", today))
+    application.add_handler(CommandHandler("tomorrow", tomorrow))
+    application.add_handler(CommandHandler("mlb_auto", mlb_auto))
+    application.add_handler(CommandHandler("generate_today", mlb_auto))
+    application.add_handler(CommandHandler("soccer", soccer))
+    application.add_handler(CommandHandler("worldcup", worldcup))
+    application.add_handler(CommandHandler("vip", vip))
+    application.add_handler(CommandHandler("results", results))
+    application.add_handler(CommandHandler("results_today", results_today))
+    application.add_handler(CommandHandler("results_yesterday", results_yesterday))
+    application.add_handler(CommandHandler("results_7days", results_7days))
+    application.add_handler(CommandHandler("results_30days", results_30days))
+    application.add_handler(CommandHandler("results_season", results_season))
+    application.add_handler(CommandHandler("results_date", results_date))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("update_results", update_results))
+    application.add_handler(CommandHandler("grade_today", grade_today))
+    application.add_handler(CommandHandler("results_auto_status", results_auto_status))
+    application.add_handler(CommandHandler("post_results_now", post_results_now))
+    application.add_handler(CommandHandler("enable_auto_results", enable_auto_results))
+    application.add_handler(CommandHandler("disable_auto_results", disable_auto_results))
+    application.add_handler(CommandHandler("debug_picks", debug_picks))
+    application.add_handler(CommandHandler("debug_results", debug_results))
+    application.add_handler(CommandHandler("save_last_card", save_last_card))
+    application.add_handler(CommandHandler("backfill_today", backfill_today))
+    application.add_handler(CommandHandler("f5", specialized_mlb_card))
+    application.add_handler(CommandHandler("nrfi", specialized_mlb_card))
+    application.add_handler(CommandHandler("teamtotals", specialized_mlb_card))
+    application.add_handler(CommandHandler("parlay", specialized_mlb_card))
+    application.add_handler(CommandHandler("fullday", specialized_mlb_card))
+    application.add_handler(CommandHandler("strikeouts", specialized_mlb_card))
+    application.add_handler(CommandHandler("hits", specialized_mlb_card))
+    application.add_handler(CommandHandler("home_runs", specialized_mlb_card))
+    application.add_handler(CommandHandler("props_admin", props_admin))
+    application.add_handler(CommandHandler("hits_admin", hits_admin))
+    application.add_handler(CommandHandler("hits_by_team_admin", hits_by_team_admin))
+    application.add_handler(CommandHandler("hr_admin", hr_admin))
+    application.add_handler(CommandHandler("strikeouts_admin", strikeouts_admin))
+    application.add_handler(CommandHandler("props_images_admin", props_images_admin))
+    application.add_handler(CommandHandler("hits_by_team_image_admin", hits_by_team_image_admin))
+    application.add_handler(CommandHandler("best_hit_image_admin", best_hit_image_admin))
+    application.add_handler(CommandHandler("post_best_hit_image_admin", post_best_hit_image_admin))
+    application.add_handler(CommandHandler("magazine_admin", magazine_admin))
+    application.add_handler(CommandHandler("verify_player", verify_player_command))
+    application.add_handler(CommandHandler("props_test", props_test))
+    application.add_handler(CommandHandler("prop_debug", prop_debug))
+    application.add_handler(CommandHandler("approve_prop", approve_prop_command))
+    application.add_handler(CommandHandler("soccer_full", soccer_owner_card))
+    application.add_handler(CommandHandler("btts", soccer_owner_card))
+    application.add_handler(CommandHandler("corners", soccer_owner_card))
+    application.add_handler(CommandHandler("overs", soccer_owner_card))
+    application.add_handler(CommandHandler("cards", soccer_owner_card))
+    application.add_handler(CommandHandler("first_half", soccer_owner_card))
+    application.add_handler(CommandHandler("second_half", soccer_owner_card))
+    application.add_handler(CommandHandler("double_chance", soccer_owner_card))
+    application.add_handler(CommandHandler("asian_handicap", soccer_owner_card))
+    application.add_handler(CommandHandler("soccer_results", soccer_results))
+    application.add_handler(CommandHandler("debug_soccer", debug_soccer))
+    application.add_handler(CommandHandler("admin", admin))
+    application.add_handler(CommandHandler("model_report", model_report))
+    application.add_handler(CommandHandler("test_channels", test_channels))
+    application.add_handler(CommandHandler("image_test", image_test))
+    application.add_handler(CommandHandler("today_image_admin", today_image_admin))
+    application.add_handler(CommandHandler("mlb_auto_image_admin", mlb_auto_image_admin))
+    application.add_handler(CommandHandler("mlb_images", mlb_images))
+    application.add_handler(CommandHandler("post_mlb_images", post_mlb_images))
+    application.add_handler(CommandHandler("test_image_card", test_image_card))
+    application.add_handler(CommandHandler("post_test_image", post_test_image))
+    application.add_handler(CallbackQueryHandler(inline_menu_router, pattern=r"^menu:"))
+
+    # Start polling Telegram for new messages, then wait until Ctrl+C is pressed.
+    async with application:
+        try:
+            await _configure_command_menus(application)
+        except Exception:
+            # Command-menu setup is cosmetic and should never stop the bot.
+            logging.exception("Could not configure Telegram command menus")
+        await application.start()
+        scheduler_task = asyncio.create_task(
+            run_game_aware_scheduler(application),
+            name="betgptai-game-aware-scheduler",
+        )
+        if application.updater is None:
+            scheduler_task.cancel()
+            raise RuntimeError("The Telegram updater could not be created.")
+        await application.updater.start_polling()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            scheduler_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await scheduler_task
+            # Shut down cleanly when the program is stopped.
+            await application.updater.stop()
+            await application.stop()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        # Ctrl+C is a normal way to stop a polling bot.
+        pass

@@ -1,0 +1,16 @@
+venv/
+.env
+__pycache__/
+*.pyc
+
+generated_cards/
+generated_prompts/
+downloads/
+logs/
+
+*.log
+.DS_Store
+
+results.json
+posting_log.json
+model_reports.json

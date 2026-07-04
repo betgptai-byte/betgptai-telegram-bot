@@ -1,5 +1,79 @@
 # BETGPTAI Telegram Bot
 
+## Safe local → GitHub → Railway workflow
+
+BETGPTAI uses a simple production-safety workflow:
+
+1. Local Mac is for editing and testing only.
+2. GitHub is the source of truth.
+3. Railway is production only.
+4. Never run two Telegram polling instances with the same bot token.
+
+### Environment detection
+
+The bot treats the environment as:
+
+```text
+RAILWAY_ENVIRONMENT exists → railway
+otherwise                  → local
+```
+
+When running locally, Telegram polling is blocked unless you explicitly set:
+
+```env
+LOCAL_BOT_ALLOWED=true
+```
+
+Keep this false unless Railway is paused/stopped:
+
+```env
+LOCAL_BOT_ALLOWED=false
+APP_TIMEZONE=America/New_York
+TZ=America/New_York
+DATA_DIR=/data
+```
+
+If you try to start the bot locally without approval, it exits safely:
+
+```text
+Local bot blocked. Set LOCAL_BOT_ALLOWED=true only when Railway is paused.
+```
+
+### Daily development workflow
+
+```text
+Codex edits locally
+→ Test non-bot modules locally
+→ Commit and push to GitHub
+→ Railway auto-deploys production
+→ Verify with /version and /status
+```
+
+Local compile test:
+
+```bash
+scripts/test_local.sh
+```
+
+Deploy through GitHub:
+
+```bash
+scripts/deploy.sh "your commit message"
+```
+
+### `/version`
+
+Use `/version` in Telegram to verify the running deployment:
+
+```text
+App Version
+Git Commit
+Environment: local or railway
+Deploy Time
+APP_TIMEZONE
+DATA_DIR
+```
+
 ## Pregame-only platform
 
 BETGPTAI is designed as a pregame analysis platform, not a live score bot.
@@ -132,7 +206,6 @@ vertical format. If your selected model supports exact `1080x1920`, update
 
 - `FREE_CHANNEL_ID`
 - `VIP_CHANNEL_ID`
-- `COMMUNITY_GROUP_ID`
 
 Automatic image posting is not enabled. Run `/post_mlb_images` only after
 reviewing the `/mlb_images` owner preview.

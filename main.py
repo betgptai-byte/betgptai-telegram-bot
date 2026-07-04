@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -191,6 +192,62 @@ STORAGE_LOG = _attach_file_logger("betgptai.storage", "storage.log")
 
 OWNER_TELEGRAM_ID = 594425739
 LAST_RESULTS_BUTTON_DATE: str | None = None
+PROCESS_STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _truthy_value(value: str | None) -> bool:
+    """Return True for common env-var truthy values."""
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _runtime_environment() -> str:
+    """Railway is production; everything else is local."""
+    return "railway" if os.getenv("RAILWAY_ENVIRONMENT") else "local"
+
+
+def _git_commit_hash() -> str:
+    """Return the current short git commit hash when available."""
+    for env_name in ("RAILWAY_GIT_COMMIT_SHA", "GIT_COMMIT_SHA"):
+        value = os.getenv(env_name, "").strip()
+        if value:
+            return value[:12]
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def _deploy_time() -> str:
+    """Return Railway deploy time when configured, otherwise process start time."""
+    return (
+        os.getenv("DEPLOY_TIME")
+        or os.getenv("RAILWAY_DEPLOYMENT_CREATED_AT")
+        or os.getenv("RAILWAY_DEPLOYMENT_ID")
+        or PROCESS_STARTED_AT
+    )
+
+
+def _app_version() -> str:
+    """Return the public app version label."""
+    return os.getenv("APP_VERSION", "BETGPTAI v2.0")
+
+
+def _version_text() -> str:
+    """Build the /version diagnostics message."""
+    return (
+        "🤖 BETGPTAI VERSION\n\n"
+        f"App Version: {_app_version()}\n"
+        f"Git Commit: {_git_commit_hash()}\n"
+        f"Environment: {_runtime_environment()}\n"
+        f"Deploy Time: {_deploy_time()}\n"
+        f"APP_TIMEZONE: {os.getenv('APP_TIMEZONE', 'America/New_York')}\n"
+        f"DATA_DIR: {data_file('').resolve()}"
+    )
 
 
 def _admin_telegram_id() -> int | None:
@@ -580,6 +637,14 @@ async def help_command(
         _help_text(),
         reply_markup=_back_menu_markup(),
     )
+
+
+async def version(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show local/Railway deployment diagnostics."""
+    del context
+    if not update.message:
+        return
+    await update.message.reply_text(_version_text())
 
 
 def _format_line(value: object) -> str:
@@ -4201,6 +4266,12 @@ async def main() -> None:
     """Load settings, register commands, and keep the bot running."""
     # load_dotenv reads BOT_TOKEN from a local .env file if one exists.
     load_dotenv()
+    if _runtime_environment() == "local" and not _truthy_value(os.getenv("LOCAL_BOT_ALLOWED")):
+        print(
+            "Local bot blocked. Set LOCAL_BOT_ALLOWED=true only when Railway is paused.",
+            flush=True,
+        )
+        return
     token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 
     # Stop early with a clear message if the private token is missing.
@@ -4216,6 +4287,7 @@ async def main() -> None:
     # Connect each Telegram command to its matching async function above.
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("version", version))
     application.add_handler(CommandHandler("today", today))
     application.add_handler(CommandHandler("tomorrow", tomorrow))
     application.add_handler(CommandHandler("mlb_auto", mlb_auto))

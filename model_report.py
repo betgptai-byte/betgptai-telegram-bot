@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
+from storage import data_file
 
-REPORT_FILE = Path(__file__).with_name("model_reports.json")
-POSTING_LOG_FILE = Path(__file__).with_name("posting_log.json")
+REPORT_FILE = data_file("model_reports.json")
+POSTING_LOG_FILE = data_file("posting_log.json")
 UNAVAILABLE_VALUES = (None, "", "unavailable", [], {})
 
 

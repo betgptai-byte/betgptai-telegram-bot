@@ -13,9 +13,8 @@ from typing import Any
 
 from game_time import format_game_clock
 from openai_image_generator import generate_image_from_prompt
+from storage import data_file
 
-
-BASE_DIR = Path(__file__).resolve().parent
 
 ANIME_VAULT_STYLE = (
     "BETGPTAI Anime Vault, 1080x1920 vertical premium anime sports magazine card, "
@@ -93,7 +92,7 @@ def prepare_today_pick_image(
     image_generation_enabled: bool | None = None,
 ) -> dict[str, Any]:
     """Save today's pick prompt and optionally generate the preview image."""
-    output_base = Path(output_root) if output_root else BASE_DIR / "generated_cards"
+    output_base = Path(output_root) if output_root else data_file("generated_cards")
     output_dir = output_base / card_date
     output_dir.mkdir(parents=True, exist_ok=True)
 

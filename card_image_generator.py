@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from mascot_style import MLB_MASCOT_STYLE, MLB_TEAM_ALIASES
+from storage import data_file
 
 
 IMAGE_SIZE = "1080x1920"
@@ -220,10 +221,10 @@ def generate_mlb_card_slides(card_data: dict[str, Any]) -> list[str]:
 
 
 def save_mlb_card_slide_prompts(
-    prompts: list[str], output_dir: str | Path = "generated_cards"
+    prompts: list[str], output_dir: str | Path | None = None
 ) -> list[Path]:
     """Save slide prompts as generated_cards/slide_N_prompt.txt files."""
-    destination = Path(output_dir)
+    destination = Path(output_dir) if output_dir else data_file("generated_prompts")
     destination.mkdir(parents=True, exist_ok=True)
     saved_paths: list[Path] = []
     for index, prompt in enumerate(prompts, start=1):

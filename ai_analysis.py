@@ -11,8 +11,9 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
-from card_format import PARLAY_NOTE, TIMED_CARD_FOOTER
-from game_time import game_sort_key, mlb_game_block
+from card_format import PARLAY_NOTE
+from card_time import eastern_now
+from game_time import game_sort_key, mlb_game_block, parse_game_time
 from consensus_analysis import (
     analyze_slate_with_claude,
     analyze_specialized_with_claude,
@@ -43,7 +44,11 @@ Premium includes:
 
 Type /vip to unlock the full card.
 
-{TIMED_CARD_FOOTER}"""
+{DIVIDER}
+
+📌 Odds vary by sportsbook. Shop for the best available number.
+
+Tap the Disclaimer button for BETGPTAI notes and responsible-play info."""
 
 
 class AIAnalysisError(Exception):
@@ -113,6 +118,7 @@ def _apply_public_confidence(
     card: str, grade: int, value_note: str
 ) -> str:
     """Hide model/provider internals and show only confidence/value wording."""
+    del value_note
     cleaned = re.sub(r"(?im)^Risk Grade:\s*(\d+(?:\.\d+)?)/10", _risk_to_confidence, card)
     cleaned = re.sub(
         r"(?i)\n?🤖 AI (?:CONSENSUS EDGE|SPLIT OPINION).*?(?=\n━━━━━━━━━━━━|\Z)",
@@ -127,18 +133,7 @@ def _apply_public_confidence(
         cleaned,
         count=1,
     )
-    if "📈 Value Note:" in cleaned:
-        cleaned = re.sub(
-            r"📈 Value Note:\s*.*?(?=\n\n━━━━━━━━━━━━|\n\n[A-Z⚾🔥🏆📈🎯💰🧩📋]|$)",
-            f"📈 Value Note:\n{value_note}",
-            cleaned,
-            count=1,
-            flags=re.S,
-        )
-    else:
-        marker = f"\n\n{DIVIDER}"
-        note = f"\n\n📈 Value Note:\n{value_note}"
-        cleaned = cleaned.replace(marker, f"{note}{marker}", 1)
+    cleaned = re.sub(r"(?ims)^📈 Value Note:\s*\n?.*?(?=\n\n|$)", "", cleaned)
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
 
@@ -347,6 +342,21 @@ def _fallback_candidates(
     return unique
 
 
+def upcoming_mlb_slate(slate: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return only games that have not started yet for public free cards."""
+    now = eastern_now()
+    upcoming: list[dict[str, Any]] = []
+    for game in slate:
+        status_text = str(game.get("status") or "").lower()
+        if any(word in status_text for word in ("live", "in progress", "warmup", "final", "game over")):
+            continue
+        parsed = parse_game_time(game.get("game_time"))
+        if parsed is not None and parsed <= now:
+            continue
+        upcoming.append(game)
+    return upcoming
+
+
 def _pick_name(candidate: dict[str, Any]) -> str:
     """Turn an odds outcome into a readable betting pick."""
     point = candidate.get("point")
@@ -372,15 +382,9 @@ def _format_fallback_pick(
         prefix = f"{NUMBER_EMOJIS[number - 1]} "
     else:
         prefix = "⚾ "
-    reason = (
-        f"Available schedule and matchup data support this "
-        f"{candidate['away_team']}–{candidate['home_team']} angle."
-    )
-    reason_label = f"\nReason:\n{reason}" if featured else f"Reason: {reason}"
     return (
         f"{prefix}{_pick_name(candidate)}\n"
-        f"Risk Grade: {risk_grade}/10\n"
-        f"{reason_label}"
+        f"Risk Grade: {risk_grade}/10"
     )
 
 
@@ -417,23 +421,89 @@ def _format_team_total_pick(candidate: dict[str, Any], number: int | None = None
     risk_grade = max(1, min(10, round(10 - probability * 9)))
     return (
         f"{prefix}{team} Team Total {direction} {point:g}\n"
-        f"Safer Line: {direction} {safer_point:g}\n"
-        f"Risk Grade: {risk_grade}/10\n"
-        "Reason: Safer alternate gives one extra run of protection."
+        f"Safer Alt: {direction} {safer_point:g}\n"
+        f"Risk Grade: {risk_grade}/10"
     )
 
 
+def _infer_safe_team_total_picks(slate: list[dict[str, Any]], limit: int = 2) -> list[dict[str, Any]]:
+    """Create conservative team-total displays when the official market is absent.
+
+    These are display-safe defaults, not sportsbook-specific lines. We only use
+    them when a side can be inferred from available moneyline/total context.
+    """
+    inferred: list[dict[str, Any]] = []
+    moneylines = _fallback_candidates(slate, "h2h")
+    totals = _fallback_candidates(slate, "totals")
+    by_game_moneylines: dict[Any, list[dict[str, Any]]] = {}
+    for pick in moneylines:
+        by_game_moneylines.setdefault(pick.get("game_id"), []).append(pick)
+    by_game_totals: dict[Any, list[dict[str, Any]]] = {}
+    for pick in totals:
+        by_game_totals.setdefault(pick.get("game_id"), []).append(pick)
+
+    for game in slate:
+        game_id = game.get("game_id")
+        ml = sorted(
+            by_game_moneylines.get(game_id, []),
+            key=lambda item: item.get("implied_probability") or 0,
+            reverse=True,
+        )
+        if not ml:
+            continue
+        total_side = next(
+            (
+                item for item in by_game_totals.get(game_id, [])
+                if str(item.get("outcome", "")).lower() in {"over", "under"}
+            ),
+            None,
+        )
+        if total_side and str(total_side.get("outcome", "")).lower() == "under" and len(ml) > 1:
+            # Low-scoring game context: safer default is the weaker side under.
+            team = ml[-1].get("outcome")
+            inferred.append({
+                "team": team,
+                "direction": "Under",
+                "line": 5.5,
+                "safer": 6.5,
+                "risk_grade": 6,
+            })
+        else:
+            # Stronger team/offense context: safer default is favorite over.
+            team = ml[0].get("outcome")
+            inferred.append({
+                "team": team,
+                "direction": "Over",
+                "line": 4.5,
+                "safer": 3.5,
+                "risk_grade": 6,
+            })
+        if len(inferred) >= limit:
+            break
+    return [item for item in inferred if item.get("team")]
+
+
 def _format_team_total_list(slate: list[dict[str, Any]], limit: int = 2) -> str:
-    """Format real team-total markets only; never derive from full-game totals."""
+    """Format team totals with safe defaults when official team totals are absent."""
     candidates = _fallback_candidates(slate, "team_totals")
-    if not candidates:
-        return "Team-total markets unavailable from current odds feed."
-    formatted = [
-        text for index, candidate in enumerate(candidates[:limit], start=1)
-        if (text := _format_team_total_pick(candidate, index))
-    ]
+    formatted: list[str] = []
+    if candidates:
+        formatted = [
+            text for index, candidate in enumerate(candidates[:limit], start=1)
+            if (text := _format_team_total_pick(candidate, index))
+        ]
     if not formatted:
-        return "Team-total markets unavailable from current odds feed."
+        inferred = _infer_safe_team_total_picks(slate, limit)
+        formatted = [
+            (
+                f"{NUMBER_EMOJIS[index - 1]} {pick['team']} Team Total {pick['direction']} {pick['line']:g}\n"
+                f"Safer Alt: {pick['direction']} {pick['safer']:g}\n"
+                f"Risk Grade: {pick['risk_grade']}/10"
+            )
+            for index, pick in enumerate(inferred, start=1)
+        ]
+    if not formatted:
+        return "Team-total side unavailable from current feed."
     return "\n\n".join(formatted)
 
 
@@ -449,8 +519,7 @@ def _format_f5_moneyline_list(
         risk_grade = max(1, min(10, round(10 - probability * 9)))
         formatted.append(
             f"{NUMBER_EMOJIS[index - 1]} {pick['outcome']} F5 ML\n"
-            f"Risk Grade: {risk_grade}/10\n"
-            "Reason: Starting matchup and overall market support the early-game lean."
+            f"Risk Grade: {risk_grade}/10"
         )
     return "\n\n".join(formatted)
 
@@ -482,7 +551,6 @@ def build_fallback_card(slate: list[dict[str, Any]]) -> str:
         parlay = "\n".join(
             f"✅ {_pick_name(leg)}" for leg in parlay_legs
         )
-        parlay += f"\n\n{PARLAY_NOTE}"
     else:
         parlay = "No qualified two-leg parlay — fewer than two usable games."
 
@@ -748,6 +816,20 @@ def _sanitize_telegram_output(text: str, slate: list[dict[str, Any]]) -> str:
         cleaned = re.sub(pattern, replacement, cleaned, flags=re.I)
     # Older prompt habits sometimes put a Missing: line under every pick.
     cleaned = re.sub(r"(?im)^Missing:\s*.*(?:\n|$)", "", cleaned)
+    # Free cards should stay clean. Reasons, value prose, and long disclaimers
+    # are reserved for VIP/deeper cards or the inline Disclaimer tab.
+    cleaned = re.sub(r"(?ims)^Reason:\s*\n?.*?(?=\n\n|$)", "", cleaned)
+    cleaned = re.sub(r"(?im)^Reason:\s*.*(?:\n|$)", "", cleaned)
+    cleaned = re.sub(r"(?ims)^📈 Value Note:\s*\n?.*?(?=\n\n|$)", "", cleaned)
+    cleaned = re.sub(r"(?im)^📈 Value Note:\s*.*(?:\n|$)", "", cleaned)
+    cleaned = re.sub(r"(?ims)^⚠️ BETGPTAI NOTE\s*.*?(?=\n\n━━━━━━━━━━━━|\Z)", "", cleaned)
+    cleaned = re.sub(r"(?ims)^⚠️ BETGPTAI RECOMMENDATION\s*.*?(?=\n\n━━━━━━━━━━━━|\Z)", "", cleaned)
+    cleaned = re.sub(r"(?im)^Educational analysis only.*(?:\n|$)", "", cleaned)
+    cleaned = re.sub(r"(?im)^Singles are recommended.*(?:\n|$)", "", cleaned)
+    cleaned = re.sub(r"(?im)^Parlays .*optional.*(?:\n|$)", "", cleaned)
+    cleaned = re.sub(r"(?im)^Past performance.*(?:\n|$)", "", cleaned)
+    cleaned = re.sub(r"(?im)^Card timing follows.*(?:\n|$)", "", cleaned)
+    cleaned = re.sub(r"(?im)^⏰ All game times.*(?:\n|$)", "", cleaned)
     cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
@@ -775,8 +857,8 @@ async def _analyze_mlb_slate_with_openai(
         "list missing data and do not discuss every matchup. "
         "Compare all supplied books and use best_available_prices to select the "
         "best price internally. Never reveal a sportsbook or bookmaker name. "
-        "Never use the words guaranteed, lock, 99.9%, or sure win. Keep every "
-        "reason short, clean, and suitable for a free Telegram preview card. "
+        "Never use the words guaranteed, lock, 99.9%, or sure win. Do not "
+        "include Reason lines in the free card; reasons are reserved for VIP. "
         "You may use betgptai_internal fields as hidden support, but never "
         "mention internal scoring, formulas, engines, provider names, raw "
         "Savant statistics, or model disagreements to members."
@@ -807,14 +889,10 @@ Format PLAY OF THE DAY like this:
 ⚾ [selection]
 Risk Grade: [1-10]
 
-Reason:
-[short reason]
-
 Format each top-two pick like this, using only 1️⃣ and 2️⃣:
 
 1️⃣ [selection, including spread or total point when applicable]
 Risk Grade: [1-10, where 10 means highest risk]
-Reason: [short evidence-based explanation]
 
 For F5, output exactly two moneyline-only leans when available in this format
 and no other F5 market:
@@ -823,11 +901,9 @@ and no other F5 market:
 
 1️⃣ [Team] F5 ML
 Risk Grade: [number]/10
-Reason: [short reason based only on available starting-pitcher and matchup data]
 
 2️⃣ [Team] F5 ML
 Risk Grade: [number]/10
-Reason: [short reason based only on available starting-pitcher and matchup data]
 
 Never output an F5 total or F5 runline. Do not display a line or price in the
 F5 section.
@@ -836,24 +912,25 @@ For every total, include its matchup in the selection so it can be tracked,
 for example: "Under 8.5 (Dodgers at Giants)". Do not add matchups that are not
 part of one of the two selected totals.
 
-For TOP 2 TEAM TOTALS, use picks only when best_available_prices explicitly
-contains a team_totals market for that team and line. Never derive or invent a
-team total from the full-game total. When unavailable, write exactly:
-
-Team-total markets unavailable from current odds feed.
+For TOP 2 TEAM TOTALS, use official team_total markets when available. If the
+official team-total market is missing but a team-total side can be inferred from
+the model edge, use the safe default display:
+Team Total Over 4.5 / Safer Alt: Over 3.5
+or
+Team Total Under 5.5 / Safer Alt: Under 6.5
+Only write "Team-total side unavailable from current feed." if no side can be
+inferred.
 
 When real team-total markets are available, output up to two picks in this exact
 numbered format:
 
 1️⃣ [Team] Team Total [Over/Under] [line]
-Safer Line: [Over one run lower / Under one run higher]
+Safer Alt: [Over one run lower / Under one run higher]
 Risk Grade: [number]/10
-Reason: Safer alternate gives one extra run of protection.
 
 2️⃣ [Team] Team Total [Over/Under] [line]
-Safer Line: [Over one run lower / Under one run higher]
+Safer Alt: [Over one run lower / Under one run higher]
 Risk Grade: [number]/10
-Reason: Safer alternate gives one extra run of protection.
 
 Put one blank line between picks and put {DIVIDER} between sections. Use all
 bookmakers internally to find the best number, but NEVER display, mention, or
@@ -863,10 +940,8 @@ Under 8.5 Runs, or Team Total Over 3.5.
 Within every multi-pick section and the parlay, list the selected games in
 chronological scheduled order. The application adds exact ET matchup/time lines.
 
-Format the parlay as exactly two lines beginning with ✅, followed by this exact
-note:
-
-{PARLAY_NOTE}
+Format the parlay as exactly two lines beginning with ✅. Do not include a
+parlay note, disclaimer, or recommendation footer.
 
 Score every MLB game behind the scenes before choosing the free card. Prioritize:
 starting-pitcher edge (ERA, WHIP, K-BB %, xERA, xBA/xSLG allowed, Barrel %,
@@ -942,8 +1017,9 @@ async def analyze_mlb_slate(
     slate: list[dict[str, Any]], api_key: str, anthropic_api_key: str = ""
 ) -> str:
     """Run both analysts independently and preserve an API-only final fallback."""
+    slate = upcoming_mlb_slate(slate)
     if not slate:
-        return "No MLB games were found for today."
+        return "No upcoming MLB games are available for today’s free card."
 
     # Keep the requested analyst order explicit: OpenAI writes the first card,
     # then Claude reviews the identical slate independently.
@@ -1125,11 +1201,13 @@ def _claude_f5_list(data: dict[str, Any], limit: int = 2) -> str:
     return "\n\n".join(lines) if lines else "No qualified F5 moneyline lean is available."
 
 
-def _claude_team_total_list(data: dict[str, Any], limit: int = 2) -> str:
+def _claude_team_total_list(
+    data: dict[str, Any], slate: list[dict[str, Any]] | None = None, limit: int = 2
+) -> str:
     """Render team totals with safer one-run alternates when Claude has them."""
     picks = data.get("team_totals", [])
     if not isinstance(picks, list) or not picks:
-        return "Team-total markets unavailable from current odds feed."
+        return _format_team_total_list(slate or [], limit)
     rendered: list[str] = []
     for index, pick in enumerate(picks[:limit]):
         if not isinstance(pick, dict):
@@ -1142,13 +1220,13 @@ def _claude_team_total_list(data: dict[str, Any], limit: int = 2) -> str:
             direction = match.group(1).title()
             point = float(match.group(2))
             safer = point - 1 if direction == "Over" else point + 1
-            safer_line = f"\nSafer Line: {direction} {safer:g}"
+            safer_line = f"\nSafer Alt: {direction} {safer:g}"
         if safer_line and "\nLine:" in text:
             text = text.replace("\nLine:", f"{safer_line}\nLine:", 1)
         elif safer_line:
             text = text.replace("\nRisk Grade:", f"{safer_line}\nRisk Grade:", 1)
         rendered.append(text)
-    return "\n\n".join(rendered) if rendered else "Team-total markets unavailable from current odds feed."
+    return "\n\n".join(rendered) if rendered else _format_team_total_list(slate or [], limit)
 
 
 def _build_claude_mlb_card(data: dict[str, Any], slate: list[dict[str, Any]]) -> str:
@@ -1158,7 +1236,6 @@ def _build_claude_mlb_card(data: dict[str, Any], slate: list[dict[str, Any]]) ->
     parlay = data.get("safe_parlay", [])
     parlay_text = (
         "\n".join(f"✅ {pick.get('selection')}" for pick in parlay[:2])
-        + f"\n\n{PARLAY_NOTE}"
         if isinstance(parlay, list) and len(parlay) >= 2
         else "No qualified two-leg parlay."
     )
@@ -1194,7 +1271,7 @@ def _build_claude_mlb_card(data: dict[str, Any], slate: list[dict[str, Any]]) ->
 
 💰 TOP 2 TEAM TOTALS
 
-{_claude_team_total_list(data)}
+{_claude_team_total_list(data, slate)}
 
 {DIVIDER}
 

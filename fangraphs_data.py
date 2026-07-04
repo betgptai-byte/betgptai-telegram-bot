@@ -16,10 +16,11 @@ import logging
 import re
 import time
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+from storage import data_file
 
 try:
     from pybaseball import batting_stats, pitching_stats, team_batting, team_pitching
@@ -30,8 +31,7 @@ except ImportError:  # pybaseball is optional at runtime.
     team_pitching = None
 
 
-BASE_DIR = Path(__file__).resolve().parent
-CACHE_FILE = BASE_DIR / "fangraphs_cache.json"
+CACHE_FILE = data_file("fangraphs_cache.json")
 CACHE_SECONDS = 24 * 60 * 60
 FAILURE_COOLDOWN_SECONDS = 24 * 60 * 60
 HEALTH_SECONDS = 10 * 60
@@ -40,6 +40,7 @@ UNAVAILABLE = "unavailable"
 _MEMORY_CACHE: dict[int, dict[str, Any]] = {}
 _HEALTH_CACHE: tuple[float, bool] | None = None
 _LAST_FAILURE_AT: float | None = None
+_LAST_FAILURE_REASON: str | None = None
 
 TEAM_ABBREVIATIONS = {
     "Arizona Diamondbacks": "ARI",
@@ -200,7 +201,9 @@ def _write_disk_cache(season: int, data: dict[str, Any]) -> None:
 
 def _call_fangraphs(loader: Any, *args: Any, **kwargs: Any) -> pd.DataFrame:
     """Call one pybaseball FanGraphs loader and normalize expected failures."""
+    global _LAST_FAILURE_REASON
     if loader is None:
+        _LAST_FAILURE_REASON = "missing_pybaseball"
         return pd.DataFrame()
     try:
         frame = loader(*args, **kwargs)
@@ -211,8 +214,10 @@ def _call_fangraphs(loader: Any, *args: Any, **kwargs: Any) -> pd.DataFrame:
         # HTTP 403 and similar blocks are expected. Keep them out of member
         # output and normal logs unless debug logging is enabled.
         if "403" in str(error):
+            _LAST_FAILURE_REASON = "blocked"
             logging.debug("FanGraphs returned HTTP 403; using cache/skip.")
         else:
+            _LAST_FAILURE_REASON = "unavailable"
             logging.debug("FanGraphs/pybaseball unavailable; using cache/skip.", exc_info=True)
         return pd.DataFrame()
 
@@ -237,7 +242,7 @@ def _download_fangraphs(season: int) -> dict[str, pd.DataFrame] | None:
 
 def get_fangraphs_dataset(season: int) -> dict[str, pd.DataFrame] | None:
     """Return cached FanGraphs data, refreshing only after 24 hours."""
-    global _LAST_FAILURE_AT
+    global _LAST_FAILURE_AT, _LAST_FAILURE_REASON
     if season in _MEMORY_CACHE:
         cached = _MEMORY_CACHE[season]
         if time.time() - float(cached.get("fetched_at", 0) or 0) <= CACHE_SECONDS:
@@ -265,8 +270,11 @@ def get_fangraphs_dataset(season: int) -> dict[str, pd.DataFrame] | None:
     downloaded = _download_fangraphs(season)
     if not downloaded:
         _LAST_FAILURE_AT = time.time()
+        if not _LAST_FAILURE_REASON:
+            _LAST_FAILURE_REASON = "unavailable"
         return None
     _LAST_FAILURE_AT = None
+    _LAST_FAILURE_REASON = None
     serializable = {
         "fetched_at": time.time(),
         "fetched_at_iso": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -408,3 +416,23 @@ def fangraphs_available() -> bool:
     available = bool(dataset and any(not frame.empty for frame in dataset.values()))
     _HEALTH_CACHE = (now, available)
     return available
+
+
+def fangraphs_status_label() -> str:
+    """Return a neutral owner-facing status for optional FanGraphs support."""
+    if not all((pitching_stats, batting_stats, team_batting, team_pitching)):
+        return "➖ Optional unavailable"
+    if fangraphs_available():
+        return "✅ Available"
+    if _LAST_FAILURE_REASON == "blocked":
+        return "➖ Blocked/optional"
+    return "➖ Optional unavailable"
+
+
+def pybaseball_status_label() -> str:
+    """Return whether the optional pybaseball package is importable."""
+    return (
+        "✅ Available"
+        if all((pitching_stats, batting_stats, team_batting, team_pitching))
+        else "➖ Optional unavailable"
+    )

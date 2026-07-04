@@ -20,12 +20,13 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from hitting_streaks import get_hitting_streak, hitting_streak_score_adjustment
 from player_verification import verify_player_team
+from storage import data_file
 
 
-BASE_DIR = Path(__file__).resolve().parent
-PROPS_LAB_FILE = BASE_DIR / "props_lab.json"
-APPROVED_PROPS_FILE = BASE_DIR / "approved_props.json"
+PROPS_LAB_FILE = data_file("props_lab.json")
+APPROVED_PROPS_FILE = data_file("approved_props.json")
 EASTERN = ZoneInfo("America/New_York")
 MLB_PEOPLE_URL = "https://statsapi.mlb.com/api/v1/people"
 REQUEST_TIMEOUT = 10
@@ -412,6 +413,12 @@ def _build_hitter_props(context: dict[str, Any]) -> tuple[list[dict[str, Any]], 
         name = _player_name(hitter)
         pid = _player_id(hitter)
         base = hitter.get("_raw_hitter_score", 50)
+        streak = get_hitting_streak(
+            pid,
+            name,
+            str(context.get("team_name") or context.get("team") or ""),
+        )
+        streak_adjustment = hitting_streak_score_adjustment(streak)
         contact_score = (
             base
             + _metric_score(pitcher.get("xBA"), average=0.240, weight=85)
@@ -419,11 +426,22 @@ def _build_hitter_props(context: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             + _metric_score(team.get("xwOBA"), average=0.315, weight=65)
             + _metric_score(bullpen.get("WHIP"), average=1.30, weight=7)
             + park_boost
+            + streak_adjustment
         )
         reason = _reason([
             "Projected top-half bat with contact indicators.",
             f"xwOBA {hitter.get('xwOBA')}." if hitter.get("xwOBA") not in (None, "unavailable") else "",
             f"HardHit {hitter.get('Hard Hit %')}%." if hitter.get("Hard Hit %") not in (None, "unavailable") else "",
+            (
+                f"Active {streak.get('games_with_hit_streak')}-game hit streak."
+                if streak.get("available") and streak.get("games_with_hit_streak", 0) >= 3
+                else ""
+            ),
+            (
+                f"Hit in {streak.get('hit_rate_last_10')}."
+                if streak.get("available") and streak.get("hit_games_last_10", 0) >= 7
+                else ""
+            ),
             "Opposing starter shows elevated contact risk." if pitcher else "",
             "Park/weather adds support." if park_boost or wind_boost else "",
         ])
@@ -443,6 +461,8 @@ def _build_hitter_props(context: dict[str, Any]) -> tuple[list[dict[str, Any]], 
                 reason=reason or "Batter profile supports contact upside.",
             )
             if prop:
+                prop["hitting_streak"] = streak
+                prop["hitting_streak_adjustment"] = streak_adjustment
                 prop["savant_verification"] = {
                     "verified": any(
                         hitter.get(field) not in (None, "", "unavailable")
@@ -475,7 +495,7 @@ def _build_hitter_props(context: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             + _metric_score(hitter.get("Exit Velocity"), average=88.0, weight=1.25)
             + _metric_score(pitcher.get("Barrel %"), average=8.0, weight=1.6)
             + _metric_score(pitcher.get("xSLG"), average=0.410, weight=40)
-            + park_boost + wind_boost - 10
+            + park_boost + wind_boost + max(0, streak_adjustment * 0.35) - 10
         )
         hr_reason = _reason([
             "Power profile supports HR watch.",
@@ -491,6 +511,8 @@ def _build_hitter_props(context: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             score=hr_score, reason=hr_reason or "Power indicators create a HR watch spot.",
         )
         if prop:
+            prop["hitting_streak"] = streak
+            prop["hitting_streak_adjustment"] = streak_adjustment
             prop["savant_verification"] = {
                 "verified": any(
                     hitter.get(field) not in (None, "", "unavailable")
@@ -524,6 +546,8 @@ def _build_hitter_props(context: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             reason="Speed/OBP proxy creates a stolen-base watch, but lineup and catcher data should be confirmed.",
         )
         if prop:
+            prop["hitting_streak"] = streak
+            prop["hitting_streak_adjustment"] = streak_adjustment
             created.append(prop)
     return created, rejected
 
@@ -646,6 +670,12 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
         missing_data.append("Confirmed lineups")
     if not any(game.get("weather") not in (None, "", "unavailable", {}, []) for game in slate):
         missing_data.append("Weather")
+    if not any(
+        isinstance(prop.get("hitting_streak"), dict)
+        and prop["hitting_streak"].get("available")
+        for prop in all_props
+    ):
+        missing_data.append("Hitting streak game logs")
 
     payload = {
         "engine_version": "Elite Admin v2",
@@ -669,6 +699,7 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
                 "odds_props_optional": any(prop.get("odds") is not None for prop in all_props),
                 "weather": "Weather" not in missing_data,
                 "lineups": "Confirmed lineups" not in missing_data,
+                "hitting_streaks": "Hitting streak game logs" not in missing_data,
             },
             "players_scanned": players_scanned,
             "starting_pitchers_scanned": pitchers_scanned,
@@ -685,6 +716,7 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
             "odds_api_props": any(prop.get("odds") is not None for prop in all_props),
             "weather": "Weather" not in missing_data,
             "lineups": "Confirmed lineups" not in missing_data,
+            "hitting_streaks": "Hitting streak game logs" not in missing_data,
         },
     }
     _save_props_lab(payload)
@@ -705,11 +737,57 @@ def _write_json(path: Path, payload: Any) -> None:
 
 
 def _save_props_lab(payload: dict[str, Any]) -> None:
-    existing = _read_json(PROPS_LAB_FILE, {})
-    if not isinstance(existing, dict):
-        existing = {}
-    existing[payload["card_date"]] = payload
-    _write_json(PROPS_LAB_FILE, existing)
+    # Props Lab is a same-day cache only. Keeping yesterday's prop pool around
+    # is how stale names can accidentally reappear in public-facing paths.
+    _write_json(PROPS_LAB_FILE, {payload["card_date"]: payload})
+
+
+def remove_prop_from_today_cache(card_date: str, prop: dict[str, Any] | None, reason: str = "") -> None:
+    """Remove a rejected prop from today's cache so it cannot be reused later."""
+    if not isinstance(prop, dict):
+        return
+    cache = _read_json(PROPS_LAB_FILE, {})
+    if not isinstance(cache, dict):
+        return
+    payload = cache.get(card_date)
+    if not isinstance(payload, dict):
+        return
+    prop_id = prop.get("prop_id")
+    player_id = str(prop.get("player_id") or "")
+    player_name = str(prop.get("player_name") or "")
+
+    def same(candidate: Any) -> bool:
+        if not isinstance(candidate, dict):
+            return False
+        if prop_id and candidate.get("prop_id") == prop_id:
+            return True
+        if player_id and str(candidate.get("player_id") or "") == player_id:
+            return True
+        return bool(player_name and candidate.get("player_name") == player_name)
+
+    for key in ("all_props",):
+        if isinstance(payload.get(key), list):
+            payload[key] = [candidate for candidate in payload[key] if not same(candidate)]
+    candidates = payload.get("candidates")
+    if isinstance(candidates, dict):
+        for key, values in list(candidates.items()):
+            if isinstance(values, list):
+                candidates[key] = [candidate for candidate in values if not same(candidate)]
+    for key in ("best_hit", "best_two_hit", "hr_watch", "best_strikeout"):
+        if same(payload.get(key)):
+            payload[key] = None
+    hits_by_team = payload.get("hits_by_team")
+    if isinstance(hits_by_team, dict):
+        for team, value in list(hits_by_team.items()):
+            if same(value):
+                hits_by_team[team] = None
+    debug = payload.setdefault("debug", {})
+    if isinstance(debug, dict):
+        rejected = debug.setdefault("rejected_props", [])
+        if isinstance(rejected, list):
+            rejected.insert(0, f"{player_name or prop_id} removed from cache: {reason}")
+    cache[card_date] = payload
+    _write_json(PROPS_LAB_FILE, cache)
 
 
 def _prop_display(item: dict[str, Any] | None) -> str:
@@ -737,6 +815,31 @@ def _prop_display(item: dict[str, Any] | None) -> str:
         return f"Over {line} {over_label[prop_type]}" if line is not None else over_label[prop_type]
     market = str(item.get("market_type") or "Prop").replace("_", " ").title()
     return f"Over {line} {market}" if line is not None else market
+
+
+def _hitting_streak_lines(item: dict[str, Any]) -> list[str]:
+    """Return admin-only hitting-streak display lines for hitter props."""
+    if str(item.get("market_type") or "").lower() not in {
+        "hits",
+        "home_runs",
+        "total_bases",
+        "rbis",
+        "runs",
+        "stolen_bases",
+    }:
+        return []
+    streak = item.get("hitting_streak")
+    if not isinstance(streak, dict) or not streak.get("available"):
+        return [
+            "Hit Streak: Unavailable",
+            "Last 10 Hit Rate: Unavailable",
+        ]
+    games = _num(streak.get("games_with_hit_streak")) or 0
+    games_text = f"{int(games)} game" if int(games) == 1 else f"{int(games)} games"
+    return [
+        f"Hit Streak: {games_text}",
+        f"Last 10 Hit Rate: {streak.get('hit_rate_last_10', 'Unavailable')}",
+    ]
 
 
 def approve_prop(prop_id: str) -> tuple[bool, str]:
@@ -784,6 +887,8 @@ def _format_prop(item: dict[str, Any] | None, label: str, player_label: str = "P
         )
     item = _ensure_prop_display_fields(item) or item
     del player_label
+    streak_lines = _hitting_streak_lines(item)
+    streak_block = ("\n".join(streak_lines) + "\n\n") if streak_lines else ""
     return (
         f"{label}\n"
         "\n"
@@ -793,6 +898,7 @@ def _format_prop(item: dict[str, Any] | None, label: str, player_label: str = "P
         f"🕒 {item.get('game_time_et')}\n\n"
         "🎯 Prop:\n"
         f"{_prop_display(item)}\n\n"
+        f"{streak_block}"
         "⭐ Confidence:\n"
         f"{item.get('confidence_grade')}\n\n"
         "📈 Why:\n"
@@ -841,7 +947,8 @@ def render_prop_type_card(payload: dict[str, Any], prop_type: str) -> str:
     ]
     for index, item in enumerate(items[:7], start=1):
         item = _ensure_prop_display_fields(item) or item
-        lines.extend([
+        streak_lines = _hitting_streak_lines(item)
+        entry_lines = [
             f"{index}.",
             f"👤 {item.get('player_name')}",
             f"🧢 {item.get('team_name')}",
@@ -858,7 +965,10 @@ def render_prop_type_card(payload: dict[str, Any], prop_type: str) -> str:
             str(item.get("reason")),
             f"Prop ID: {item.get('prop_id')}",
             "",
-        ])
+        ]
+        if streak_lines:
+            entry_lines[9:9] = [*streak_lines, ""]
+        lines.extend(entry_lines)
     if not items:
         lines.append("No qualified candidates available from current data.")
     lines.extend(["━━━━━━━━━━━━", "", "⚠️ Admin-only test card. Not posted to members."])
@@ -880,7 +990,8 @@ def render_hits_by_team_card(payload: dict[str, Any]) -> str:
         lines.append(f"{team}:")
         if item:
             item = _ensure_prop_display_fields(item) or item
-            lines.extend([
+            streak_lines = _hitting_streak_lines(item)
+            entry_lines = [
                 f"👤 {item.get('player_name')}",
                 f"🧢 {item.get('team_name')}",
                 f"🆚 {item.get('opponent_name')}",
@@ -896,7 +1007,10 @@ def render_hits_by_team_card(payload: dict[str, Any]) -> str:
                 str(item.get("reason")),
                 f"Prop ID: {item.get('prop_id')}",
                 "",
-            ])
+            ]
+            if streak_lines:
+                entry_lines[8:8] = [*streak_lines, ""]
+            lines.extend(entry_lines)
         else:
             lines.extend(["No qualified hit prop found.", ""])
     if not teams:
@@ -921,6 +1035,7 @@ def render_prop_debug(payload: dict[str, Any]) -> str:
         f"- Odds props optional: {'✅' if sources.get('odds_props_optional') else '❌'}",
         f"- Weather: {'✅' if sources.get('weather') else '❌'}",
         f"- Lineups: {'✅' if sources.get('lineups') else '❌'}",
+        f"- Hitting streaks: {'✅' if sources.get('hitting_streaks') else '❌'}",
         "",
         f"Players scanned: {debug.get('players_scanned', 0)}",
         f"Starting pitchers scanned: {debug.get('starting_pitchers_scanned', 0)}",

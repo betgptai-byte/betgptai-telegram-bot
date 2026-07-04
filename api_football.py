@@ -9,7 +9,7 @@ Football-Data.org and TheSportsDB.
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import requests
@@ -18,16 +18,51 @@ import requests
 BASE_URL = "https://v3.football.api-sports.io"
 REQUEST_TIMEOUT = 20
 UNAVAILABLE = "unavailable"
+_QUOTA_COOLDOWN_UNTIL: datetime | None = None
+_QUOTA_LOGGED = False
 
 
 class APIFootballError(Exception):
     """Raised when the primary API-Football source cannot provide fixtures."""
 
 
+def _quota_limited() -> bool:
+    """Return True when the API already told us today's quota is exhausted."""
+    return _QUOTA_COOLDOWN_UNTIL is not None and datetime.now() < _QUOTA_COOLDOWN_UNTIL
+
+
+def _mark_quota_limited(errors: Any) -> None:
+    """Stop repeated API-Football calls after the daily limit is reached."""
+    global _QUOTA_COOLDOWN_UNTIL, _QUOTA_LOGGED
+    _QUOTA_COOLDOWN_UNTIL = datetime.now().replace(hour=23, minute=59, second=59, microsecond=0) + timedelta(minutes=5)
+    if not _QUOTA_LOGGED:
+        logging.info(
+            "API-Football daily request limit reached; disabling optional API-Football calls until tomorrow. errors=%s",
+            errors,
+        )
+        _QUOTA_LOGGED = True
+
+
+def api_football_quota_limited() -> bool:
+    """Expose quota state for owner-only status/debug commands."""
+    return _quota_limited()
+
+
+def api_football_status_label(api_key: str) -> str:
+    """Return clean optional-provider status wording without forcing failures."""
+    if not api_key:
+        return "➖ Not configured"
+    if _quota_limited():
+        return "➖ Daily limit reached"
+    return "✅ Available" if api_football_available(api_key) else "➖ Optional unavailable"
+
+
 def _get_json(api_key: str, endpoint: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     """Call API-Football without leaking the key in exceptions."""
     if not api_key:
         raise APIFootballError("API_FOOTBALL_KEY is missing from .env.")
+    if _quota_limited():
+        raise APIFootballError("API-Football daily request limit already reached.")
     try:
         response = requests.get(
             f"{BASE_URL.rstrip('/')}/{endpoint.lstrip('/')}",
@@ -43,12 +78,18 @@ def _get_json(api_key: str, endpoint: str, params: dict[str, Any] | None = None)
         raise APIFootballError("API-Football returned an unexpected response.")
     errors = payload.get("errors")
     if errors:
-        logging.warning("API-Football returned errors: %s", errors)
+        error_text = str(errors).lower()
+        if "request limit" in error_text or "limit for the day" in error_text:
+            _mark_quota_limited(errors)
+            raise APIFootballError("API-Football daily request limit reached.")
+        logging.info("Optional API-Football returned errors: %s", errors)
     return payload
 
 
 def api_football_available(api_key: str) -> bool:
     """Return whether API-Football accepts a lightweight status request."""
+    if _quota_limited():
+        return False
     try:
         payload = _get_json(api_key, "status")
         return isinstance(payload.get("response"), dict) or "results" in payload

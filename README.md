@@ -1,5 +1,75 @@
 # BETGPTAI Telegram Bot
 
+## Pregame-only platform
+
+BETGPTAI is designed as a pregame analysis platform, not a live score bot.
+
+Disabled by design:
+
+- Live score polling
+- Inning updates
+- Score notifications
+- Live Telegram edit loops
+- Live scheduler jobs
+- Game-progress messages
+
+Kept active:
+
+- 45-minute pregame card scheduler
+- Lineup verification
+- Starting pitcher verification
+- Player prop generation
+- Anime image generation
+- Official MLB card
+- Official Soccer card
+- Automatic grading
+- Automatic results posting
+- Admin approval workflow
+
+### Scheduler behavior
+
+```text
+45 minutes before the first scheduled game
+→ Generate today's cards and Anime image previews for owner approval
+
+During games
+→ No updates
+
+After all saved official games finish
+→ Grade today's picks
+→ Generate daily results
+→ Post results
+```
+
+The `/status` command reports `Live Updates: ➖ Disabled` so the owner can
+confirm live updates are intentionally off.
+
+## Admin-only hitting streak tracking
+
+`hitting_streaks.py` enriches MLB player prop analysis with MLB Stats API game
+logs. It is used only inside admin prop commands:
+
+- `/props_admin`
+- `/hits_admin`
+- `/hits_by_team_admin`
+- `/best_hit_image_admin`
+- `/streak_report_admin`
+- `/streak_debug_admin`
+
+Hit props now consider active hit streaks, last-10 hit rate, multi-hit trend,
+and cold-streak downgrades. Streaks are only a supporting factor; the engine
+still requires player/team verification, lineup context, opponent matchup,
+Statcast contact profile, park/weather, and bullpen context.
+
+`/streak_report_admin` creates a daily research report of hitters batting 1-5
+who have an active 2+ game hitting streak. Reports are saved to:
+
+```text
+DATA_DIR/hitting_streak_report_YYYY-MM-DD.json
+```
+
+This report is admin-only and does not automatically recommend a bet.
+
 ## BETGPTAI Anime Edition v7.0
 
 BETGPTAI Anime Edition v7.0 adds a visual-first MLB carousel workflow for the

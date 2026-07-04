@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import re
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -19,13 +20,18 @@ from typing import Any
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
 from openai_image_generator import generate_image
-from player_props_engine import build_player_props_lab
-from player_verification import verify_player_team_by_id
+from player_props_engine import (
+    APPROVED_PROPS_FILE,
+    build_player_props_lab,
+    remove_prop_from_today_cache,
+)
+from player_verification import verify_hit_prop_context
+from storage import data_file
 from team_colors import get_team_colors
 
 
-BASE_DIR = Path(__file__).resolve().parent
 CARD_SIZE = (1080, 1920)
+BEST_HIT_CACHE_FILE = data_file("best_hit_prop.json")
 
 
 def _truthy_env(name: str) -> bool:
@@ -43,6 +49,20 @@ def _display_folder(card_date: str) -> str:
 def _clean(value: Any, fallback: str = "Unavailable") -> str:
     text = re.sub(r"\s+", " ", str(value or "").strip())
     return text or fallback
+
+
+def _read_json(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        return default
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
 
 
 def _format_player_name(value: Any) -> str:
@@ -117,36 +137,27 @@ def _lineup_verified(prop: dict[str, Any]) -> bool:
 
 def _verification_result(prop: dict[str, Any], slate: list[dict[str, Any]]) -> dict[str, Any]:
     """Run all V2 checks for one hit prop."""
-    player_id = prop.get("player_id")
-    expected_team = prop.get("team_name") or prop.get("team")
-    player_check = verify_player_team_by_id(player_id, str(expected_team or ""))
-    matchup_check = _matchup_verified(prop, slate)
+    strict_check = verify_hit_prop_context(prop, slate)
     savant_ok = _savant_verified(prop)
-    lineup_ok = _lineup_verified(prop)
-    verified = (
-        bool(player_check.get("verified"))
-        and bool(matchup_check.get("verified"))
-        and savant_ok
-        and lineup_ok
-        and bool(player_id)
-    )
+    verified = bool(strict_check.get("valid")) and savant_ok
     reasons = []
-    if not player_check.get("verified"):
-        reasons.append(str(player_check.get("reason")))
-    if not matchup_check.get("verified"):
-        reasons.append(str(matchup_check.get("reason")))
+    if not strict_check.get("valid"):
+        reasons.append(str(strict_check.get("reason")))
     if not savant_ok:
         reasons.append("Baseball Savant player ID/contact metrics were not confirmed.")
-    if not lineup_ok:
-        reasons.append("Projected or confirmed lineup could not be confirmed.")
     return {
         "verified": verified,
-        "player_id": player_id,
-        "current_team": player_check.get("current_team"),
-        "player_name": player_check.get("player_name") or prop.get("player_name"),
-        "matchup": matchup_check,
+        "valid": verified,
+        "player_id": strict_check.get("player_id"),
+        "current_team": strict_check.get("verified_current_team"),
+        "player_name": strict_check.get("player") or prop.get("player_name"),
+        "active_roster": strict_check.get("active_roster"),
+        "today_opponent": strict_check.get("today_opponent"),
+        "lineup_status": strict_check.get("lineup_status"),
+        "lineup_spot": strict_check.get("lineup_spot"),
+        "matchup": strict_check,
         "savant_verified": savant_ok,
-        "lineup_verified": lineup_ok,
+        "lineup_verified": bool(strict_check.get("lineup_spot")),
         "reason": "All V2 checks passed." if verified else " ".join(reasons),
     }
 
@@ -163,9 +174,116 @@ def select_best_hit_prop(
         if check.get("verified"):
             prop["player_name"] = _format_player_name(check.get("player_name") or prop.get("player_name"))
             prop["team_name"] = check.get("current_team") or prop.get("team_name")
+            prop["team"] = prop["team_name"]
+            prop["opponent_name"] = check.get("today_opponent") or prop.get("opponent_name")
+            prop["opponent"] = prop["opponent_name"]
+            prop["lineup_verification"] = {
+                "verified": True,
+                "status": check.get("lineup_status"),
+                "lineup_spot": check.get("lineup_spot"),
+                "reason": "Confirmed by MLB Stats API boxscore.",
+            }
             return prop, rejections
         rejections.append(f"{prop.get('player_name')}: {check.get('reason')}")
+        remove_prop_from_today_cache(str(payload.get("card_date") or prop.get("card_date") or ""), prop, str(check.get("reason")))
     return None, rejections
+
+
+def _save_best_hit_cache(card_date: str, prop: dict[str, Any]) -> None:
+    """Save a verified same-day Best Hit Prop cache keyed by card_date."""
+    cache = _read_json(BEST_HIT_CACHE_FILE, {})
+    if not isinstance(cache, dict):
+        cache = {}
+    cache = {
+        card_date: {
+            "card_date": card_date,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "prop": prop,
+        }
+    }
+    _write_json(BEST_HIT_CACHE_FILE, cache)
+
+
+def _approved_verified_prop(card_date: str, slate: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, list[str]]:
+    """Return today's approved hit prop only if it still verifies live."""
+    approved = _read_json(APPROVED_PROPS_FILE, {})
+    if not isinstance(approved, dict):
+        return None, []
+    rejections: list[str] = []
+    rejected_keys: list[str] = []
+    for prop_key, prop in approved.items():
+        if not isinstance(prop, dict):
+            continue
+        if prop.get("card_date") != card_date:
+            continue
+        if prop.get("prop_type") not in {"hits", "2_plus_hits"} and prop.get("market_type") != "hits":
+            continue
+        check = _verification_result(prop, slate)
+        prop["image_v2_verification"] = check
+        if check.get("verified"):
+            prop["player_name"] = _format_player_name(check.get("player_name") or prop.get("player_name"))
+            prop["team_name"] = check.get("current_team") or prop.get("team_name")
+            prop["team"] = prop["team_name"]
+            prop["opponent_name"] = check.get("today_opponent") or prop.get("opponent_name")
+            prop["opponent"] = prop["opponent_name"]
+            prop["lineup_verification"] = {
+                "verified": True,
+                "status": check.get("lineup_status"),
+                "lineup_spot": check.get("lineup_spot"),
+                "reason": "Confirmed by MLB Stats API boxscore.",
+            }
+            return prop, rejections
+        rejections.append(f"{prop.get('player_name')}: {check.get('reason')}")
+        rejected_keys.append(str(prop_key))
+    for prop_key in rejected_keys:
+        approved.pop(prop_key, None)
+    if rejected_keys:
+        _write_json(APPROVED_PROPS_FILE, approved)
+    return None, rejections
+
+
+def get_verified_best_hit_prop(
+    slate: list[dict[str, Any]],
+    card_date: str,
+    *,
+    prefer_approved: bool = True,
+) -> dict[str, Any]:
+    """Regenerate/select today's Best Hit Prop from a verified player pool.
+
+    The only reusable cache is keyed by card_date and written after live
+    verification. Previous-day prop names are never considered.
+    """
+    rejections: list[str] = []
+    if prefer_approved:
+        approved_prop, approved_rejections = _approved_verified_prop(card_date, slate)
+        rejections.extend(approved_rejections)
+        if approved_prop:
+            _save_best_hit_cache(card_date, approved_prop)
+            return {
+                "status": "ready",
+                "source": "approved_verified_today",
+                "prop": approved_prop,
+                "payload": None,
+                "rejections": rejections,
+            }
+    payload = build_player_props_lab(slate, card_date)
+    prop, selected_rejections = select_best_hit_prop(payload, slate)
+    rejections.extend(selected_rejections)
+    if not prop:
+        return {
+            "status": "no_verified_prop",
+            "reason": "❌ Best hit prop rejected due to failed team verification.",
+            "payload": payload,
+            "rejections": rejections,
+        }
+    _save_best_hit_cache(card_date, prop)
+    return {
+        "status": "ready",
+        "source": "regenerated_verified_today",
+        "prop": prop,
+        "payload": payload,
+        "rejections": rejections,
+    }
 
 
 def create_artwork_prompt(prop: dict[str, Any]) -> str:
@@ -343,18 +461,19 @@ def prepare_best_hit_prop_image(
     image_generation_enabled: bool | None = None,
 ) -> dict[str, Any]:
     """Build, verify, generate artwork, and compose the final Best Hit card."""
-    output_base = Path(output_root) if output_root else BASE_DIR / "generated_cards"
+    output_base = Path(output_root) if output_root else data_file("generated_cards")
     output_dir = output_base / _display_folder(card_date)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    payload = build_player_props_lab(slate, card_date)
-    prop, rejections = select_best_hit_prop(payload, slate)
-    if not prop:
+    selection = get_verified_best_hit_prop(slate, card_date, prefer_approved=True)
+    prop = selection.get("prop")
+    rejections = selection.get("rejections") or []
+    if selection.get("status") != "ready" or not isinstance(prop, dict):
         return {
             "status": "no_verified_prop",
-            "reason": "No hit prop passed V2 player/team/matchup/lineup/Savant verification.",
+            "reason": "❌ Best hit prop rejected due to failed team verification.",
             "rejections": rejections,
-            "payload": payload,
+            "payload": selection.get("payload"),
         }
 
     prompt = create_artwork_prompt(prop)
@@ -362,6 +481,20 @@ def prepare_best_hit_prop_image(
     prompt_path.write_text(prompt, encoding="utf-8")
     art_path = output_dir / "best_hit_art.png"
     final_path = output_dir / "best_hit_prop.png"
+    meta_path = output_dir / "best_hit_prop_meta.json"
+    _write_json(
+        meta_path,
+        {
+            "card_date": card_date,
+            "prop_id": prop.get("prop_id"),
+            "player_id": prop.get("player_id"),
+            "player_name": prop.get("player_name"),
+            "team_name": prop.get("team_name"),
+            "opponent_name": prop.get("opponent_name"),
+            "verified": True,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        },
+    )
     image_error = None
 
     enabled = _truthy_env("IMAGE_GENERATION_ENABLED") if image_generation_enabled is None else image_generation_enabled
@@ -379,9 +512,10 @@ def prepare_best_hit_prop_image(
         "prop": prop,
         "prompt": prompt,
         "prompt_path": str(prompt_path),
+        "meta_path": str(meta_path),
         "art_path": str(art_path) if art_path.exists() else None,
         "image_path": str(final_path) if final_path.exists() else None,
         "image_error": image_error,
         "rejections": rejections,
-        "payload": payload,
+        "payload": selection.get("payload"),
     }

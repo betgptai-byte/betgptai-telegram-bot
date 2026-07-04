@@ -11,14 +11,14 @@ import logging
 import os
 import re
 from datetime import date
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
+from storage import data_file
 
 UNAVAILABLE = "unavailable"
-SOCCERDATA_DIR = Path(__file__).with_name(".soccerdata")
+SOCCERDATA_DIR = data_file(".soccerdata")
 
 
 def _prepare_soccerdata_env() -> None:

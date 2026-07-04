@@ -1,0 +1,19 @@
+{
+  "version": "pregame_v1",
+  "card_date": "2026-07-04",
+  "created_at": "2026-07-04T11:10:21-04:00",
+  "schedule_games": 15,
+  "lineups": "not_confirmed",
+  "pitchers_verified": 30,
+  "weather": "available",
+  "props": "unavailable",
+  "stale_props_cleared": {
+    "props_lab.json": 0,
+    "approved_props.json": 0,
+    "best_hit_prop.json": 0
+  },
+  "stale_images_removed": 4,
+  "storage_healthy": true,
+  "ready_for_image_generation": true,
+  "critical_failures": []
+}

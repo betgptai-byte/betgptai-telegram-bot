@@ -1,0 +1,30 @@
+{
+  "version": "Official MLB War Room v1",
+  "card_date": "2026-07-03",
+  "display_date": "07/03/2026",
+  "created_at": "2026-07-03T17:39:10-04:00",
+  "saved_picks": 0,
+  "games": [],
+  "top_lists": {
+    "top_10_moneylines": [],
+    "top_10_runlines": [],
+    "top_10_totals": [],
+    "top_10_team_totals": [],
+    "top_10_f5": [],
+    "top_10_hit_props": [],
+    "top_10_hr_props": [],
+    "top_10_strikeout_props": [],
+    "top_10_underdogs": []
+  },
+  "todays_official_card": {
+    "play_of_the_day": "Unavailable",
+    "safe_parlay": "Unavailable",
+    "value_parlay": "Unavailable in free-card feed",
+    "core_five": []
+  },
+  "official_card_text": "",
+  "errors": [
+    "No MLB games/slate rows returned by MLB Stats API for this date."
+  ],
+  "admin_only": true
+}

@@ -14,13 +14,14 @@ from zoneinfo import ZoneInfo
 import requests
 
 from game_time import parse_game_time
+from storage import data_file
 
 
-BASE_DIR = Path(__file__).resolve().parent
-PICKS_FILE = BASE_DIR / "picks.json"
-RESULTS_FILE = BASE_DIR / "results.json"
+PICKS_FILE = data_file("picks.json")
+RESULTS_FILE = data_file("results.json")
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
 MLB_LINESCORE_URL = "https://statsapi.mlb.com/api/v1/game/{game_id}/linescore"
+MLB_GAME_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{game_id}/feed/live"
 REQUEST_TIMEOUT = 20
 DIVIDER = "━━━━━━━━━━━━"
 VALID_MARKET_TYPES = {
@@ -974,7 +975,7 @@ def debug_picks_summary(target_date: str | None = None) -> dict[str, Any]:
     picks = [pick for pick in all_picks if _pick_card_date(pick) == selected_date]
     errors = []
     try:
-        payload = _read_json(BASE_DIR / "grading_errors.json", default={})
+        payload = _read_json(data_file("grading_errors.json"), default={})
         if isinstance(payload, dict) and isinstance(payload.get("errors"), list):
             errors.extend(str(item) for item in payload["errors"][-5:])
     except ResultsTrackerError:
@@ -1032,6 +1033,58 @@ def _fetch_f5_score(game_id: int) -> dict[str, int] | None:
     return {"f5_away_score": away_runs, "f5_home_score": home_runs}
 
 
+def _coerce_game_pk(value: Any) -> int | None:
+    """Return a numeric MLB game_pk from modern or older saved pick fields."""
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _final_game_from_feed(game_id: int, include_f5: bool = False) -> dict[str, Any] | None:
+    """Fetch one exact MLB game by game_pk and return final score metadata.
+
+    This is intentionally used as a second source after the schedule endpoint so
+    a saved official pick never stays pending when its exact game_pk is final.
+    """
+    try:
+        response = requests.get(
+            MLB_GAME_FEED_URL.format(game_id=game_id),
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError):
+        logging.warning("MLB game feed unavailable for game_pk %s", game_id)
+        return None
+
+    status = payload.get("gameData", {}).get("status", {})
+    if status.get("abstractGameState") != "Final":
+        return None
+    teams = payload.get("gameData", {}).get("teams", {})
+    linescore = payload.get("liveData", {}).get("linescore", {})
+    away_score = linescore.get("teams", {}).get("away", {}).get("runs")
+    home_score = linescore.get("teams", {}).get("home", {}).get("runs")
+    if not isinstance(away_score, int) or not isinstance(home_score, int):
+        return None
+    final_game = {
+        "game_id": game_id,
+        "game_pk": game_id,
+        "status": status.get("detailedState") or status.get("abstractGameState"),
+        "away_team": teams.get("away", {}).get("name"),
+        "home_team": teams.get("home", {}).get("name"),
+        "away_score": away_score,
+        "home_score": home_score,
+    }
+    if include_f5:
+        f5_score = _fetch_f5_score(game_id)
+        if f5_score:
+            final_game.update(f5_score)
+    return final_game
+
+
 def _fetch_final_games(
     game_date: str, f5_game_ids: set[int] | None = None
 ) -> dict[int, dict[str, Any]]:
@@ -1072,6 +1125,62 @@ def _fetch_final_games(
     return finals
 
 
+def _fetch_final_games_by_pk(
+    game_ids: set[int], f5_game_ids: set[int] | None = None
+) -> dict[int, dict[str, Any]]:
+    """Fetch exact saved MLB games by game_pk."""
+    finals: dict[int, dict[str, Any]] = {}
+    for game_id in sorted(game_ids):
+        final_game = _final_game_from_feed(
+            game_id,
+            include_f5=bool(f5_game_ids and game_id in f5_game_ids),
+        )
+        if final_game:
+            finals[game_id] = final_game
+    return finals
+
+
+def _debug_game_by_pk(game_id: int, include_f5: bool = False) -> dict[str, Any]:
+    """Return a best-effort debug snapshot for one MLB game_pk."""
+    snapshot: dict[str, Any] = {
+        "game_pk": game_id,
+        "api_status": "unavailable",
+        "final_score": "Unavailable",
+    }
+    try:
+        response = requests.get(
+            MLB_GAME_FEED_URL.format(game_id=game_id),
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError) as error:
+        snapshot["error"] = str(error)
+        return snapshot
+    status = payload.get("gameData", {}).get("status", {})
+    teams = payload.get("gameData", {}).get("teams", {})
+    linescore = payload.get("liveData", {}).get("linescore", {})
+    away_team = teams.get("away", {}).get("name")
+    home_team = teams.get("home", {}).get("name")
+    away_score = linescore.get("teams", {}).get("away", {}).get("runs")
+    home_score = linescore.get("teams", {}).get("home", {}).get("runs")
+    snapshot.update({
+        "api_status": status.get("detailedState") or status.get("abstractGameState") or "Unknown",
+        "away_team": away_team,
+        "home_team": home_team,
+        "away_score": away_score,
+        "home_score": home_score,
+        "final_score": (
+            f"{away_team} {away_score} - {home_team} {home_score}"
+            if isinstance(away_score, int) and isinstance(home_score, int)
+            else "Unavailable"
+        ),
+    })
+    if include_f5:
+        snapshot.update(_fetch_f5_score(game_id) or {})
+    return snapshot
+
+
 def _find_final_game(
     pick: dict[str, Any], final_games: dict[int, dict[str, Any]]
 ) -> dict[str, Any] | None:
@@ -1095,6 +1204,82 @@ def _find_final_game(
         ):
             return game
     return None
+
+
+def grade_debug_report(target_date: str | None = None) -> str:
+    """Owner-only grading diagnostic for a specific card date."""
+    selected_date = normalize_pick_date(target_date) or eastern_today().isoformat()
+    picks = [
+        pick for pick in load_picks()
+        if pick.get("sport", "mlb") == "mlb"
+        and pick.get("category") != "parlay_leg"
+        and _pick_card_date(pick) == selected_date
+    ]
+    if not picks:
+        return f"🧪 MLB GRADE DEBUG\n\nDate: {display_date(selected_date)}\nPicks found: 0"
+
+    game_ids: set[int] = set()
+    f5_ids: set[int] = set()
+    for pick in picks:
+        game_id = _coerce_game_pk(pick.get("game_pk", pick.get("game_id")))
+        if game_id:
+            game_ids.add(game_id)
+            if _market_type_for_pick(pick) == "f5_moneyline":
+                f5_ids.add(game_id)
+        for leg in pick.get("legs", []) if isinstance(pick.get("legs"), list) else []:
+            if not isinstance(leg, dict):
+                continue
+            leg_game_id = _coerce_game_pk(leg.get("game_pk", leg.get("game_id")))
+            if leg_game_id:
+                game_ids.add(leg_game_id)
+                if _market_type_for_pick(leg) == "f5_moneyline":
+                    f5_ids.add(leg_game_id)
+    finals = _fetch_final_games_by_pk(game_ids, f5_ids)
+    snapshots = {
+        game_id: _debug_game_by_pk(game_id, game_id in f5_ids)
+        for game_id in sorted(game_ids)
+    }
+    lines = [
+        "🧪 MLB GRADE DEBUG",
+        f"Date: {display_date(selected_date)}",
+        f"Picks found: {len(picks)}",
+        "",
+    ]
+    for index, pick in enumerate(picks, 1):
+        market_type = _market_type_for_pick(pick)
+        game_id = _coerce_game_pk(pick.get("game_pk", pick.get("game_id")))
+        result = (
+            _grade_parlay(pick, {selected_date: finals})
+            if market_type == "parlay"
+            else _grade_single(pick, finals)
+        )
+        snapshot = snapshots.get(game_id or 0, {})
+        lines.extend([
+            f"{index}. {_pending_pick_label(pick)}",
+            f"game_pk: {game_id or 'Missing'}",
+            f"MLB API status: {snapshot.get('api_status', 'Unavailable')}",
+            f"Final score: {snapshot.get('final_score', 'Unavailable')}",
+            f"market_type: {market_type}",
+            f"grading decision: {result}",
+        ])
+        if pick.get("last_grading_error"):
+            lines.append(f"error: {pick['last_grading_error']}")
+        if market_type == "parlay" and isinstance(pick.get("legs"), list):
+            for leg_index, leg in enumerate(pick["legs"], 1):
+                if not isinstance(leg, dict):
+                    continue
+                leg_game_id = _coerce_game_pk(leg.get("game_pk", leg.get("game_id")))
+                leg_snapshot = snapshots.get(leg_game_id or 0, {})
+                leg_result = _grade_single(leg, finals)
+                lines.extend([
+                    f"  Leg {leg_index}: {_pending_pick_label(leg)}",
+                    f"  leg_game_pk: {leg_game_id or 'Missing'}",
+                    f"  leg_status: {leg_snapshot.get('api_status', 'Unavailable')}",
+                    f"  leg_score: {leg_snapshot.get('final_score', 'Unavailable')}",
+                    f"  leg_decision: {leg_result}",
+                ])
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 def _team_scores(
@@ -1404,6 +1589,33 @@ def build_daily_results_dashboard(target_date: str | None = None) -> str:
     )
 
 
+def available_card_dates() -> list[str]:
+    """Return saved card_date values from picks.json as YYYY-MM-DD."""
+    dates = {
+        card_date for pick in load_picks()
+        if (card_date := _pick_card_date(pick))
+    }
+    return sorted(dates)
+
+
+def missing_results_message(target_date: str) -> str:
+    """Explain that a requested date has no picks and list available card dates."""
+    selected_date = normalize_pick_date(target_date) or target_date
+    dates = available_card_dates()
+    if not dates:
+        return (
+            f"No official picks saved for {display_date(selected_date)}.\n\n"
+            "No saved card dates were found in picks.json."
+        )
+    rows = "\n".join(f"- {display_date(day)}" for day in dates)
+    return (
+        f"No official picks saved for {display_date(selected_date)}.\n\n"
+        "Available card dates:\n"
+        f"{rows}\n\n"
+        "Tap one below:"
+    )
+
+
 def build_range_results_dashboard(days: int | None = None) -> str:
     """Render 7-day, 30-day, or season results from picks.json."""
     picks = [
@@ -1483,6 +1695,7 @@ def update_results_from_mlb() -> dict[str, int]:
 
 def grade_mlb_picks_for_date(target_date: str | None = None) -> dict[str, int]:
     """Grade saved MLB picks for one date, or all pending MLB dates."""
+    normalized_target = normalize_pick_date(target_date) if target_date else None
     picks = load_picks()
 
     # An empty tracker needs no MLB request and nothing should be graded.
@@ -1501,36 +1714,55 @@ def grade_mlb_picks_for_date(target_date: str | None = None) -> dict[str, int]:
         if pick.get("sport", "mlb") == "mlb"
         and _is_pending_pick(pick)
         and _pick_card_date(pick)
-        and (target_date is None or _pick_card_date(pick) == target_date)
+        and (normalized_target is None or _pick_card_date(pick) == normalized_target)
     }
     f5_games_by_date: dict[str, set[int]] = {}
+    game_ids_by_date: dict[str, set[int]] = {}
     errors: list[str] = []
     for pick in picks:
         if (
             pick.get("sport", "mlb") == "mlb"
             and _is_pending_pick(pick)
-            and _market_type_for_pick(pick) == "f5_moneyline"
-            and (target_date is None or _pick_card_date(pick) == target_date)
+            and (normalized_target is None or _pick_card_date(pick) == normalized_target)
         ):
-            game_id = pick.get("game_pk", pick.get("game_id"))
-            if isinstance(game_id, int):
-                f5_games_by_date.setdefault(str(_pick_card_date(pick)), set()).add(game_id)
+            pick_date = str(_pick_card_date(pick))
+            game_id = _coerce_game_pk(pick.get("game_pk", pick.get("game_id")))
+            if game_id:
+                game_ids_by_date.setdefault(pick_date, set()).add(game_id)
+                if _market_type_for_pick(pick) == "f5_moneyline":
+                    f5_games_by_date.setdefault(pick_date, set()).add(game_id)
+            for leg in pick.get("legs", []) if isinstance(pick.get("legs"), list) else []:
+                if not isinstance(leg, dict):
+                    continue
+                leg_game_id = _coerce_game_pk(leg.get("game_pk", leg.get("game_id")))
+                if leg_game_id:
+                    game_ids_by_date.setdefault(pick_date, set()).add(leg_game_id)
+                    if _market_type_for_pick(leg) == "f5_moneyline":
+                        f5_games_by_date.setdefault(pick_date, set()).add(leg_game_id)
     finals_by_date = {}
     for game_date in pending_dates:
+        finals_by_date[game_date] = {}
         try:
             finals_by_date[game_date] = _fetch_final_games(
                 game_date, f5_games_by_date.get(game_date, set())
             )
         except ResultsTrackerError as error:
             errors.append(str(error))
-            finals_by_date[game_date] = {}
+        # Exact game_pk fetch is the safety net for saved official picks. Run it
+        # even if the date schedule endpoint failed.
+        finals_by_date[game_date].update(
+            _fetch_final_games_by_pk(
+                game_ids_by_date.get(game_date, set()),
+                f5_games_by_date.get(game_date, set()),
+            )
+        )
     newly_graded = 0
     missing_metadata = 0
     for pick in picks:
         # This guard prevents any previously settled pick from being counted twice.
         if pick.get("sport", "mlb") != "mlb" or not _is_pending_pick(pick):
             continue
-        if target_date is not None and _pick_card_date(pick) != target_date:
+        if normalized_target is not None and _pick_card_date(pick) != normalized_target:
             continue
         pick["market_type"] = _market_type_for_pick(pick)
         _normalize_saved_pick(pick)
@@ -1568,14 +1800,14 @@ def grade_mlb_picks_for_date(target_date: str | None = None) -> dict[str, int]:
     scoped_picks = [
         pick for pick in picks
         if pick.get("sport", "mlb") == "mlb"
-        and (target_date is None or _pick_card_date(pick) == target_date)
+        and (normalized_target is None or _pick_card_date(pick) == normalized_target)
     ]
     pending_count = sum(_is_pending_pick(pick) for pick in scoped_picks)
     graded_count = sum(
         pick.get("result") in FINAL_RESULTS for pick in scoped_picks
     )
     if errors:
-        _write_json(BASE_DIR / "grading_errors.json", {
+        _write_json(data_file("grading_errors.json"), {
             "updated_at": _now_iso(),
             "errors": errors[-20:],
         })

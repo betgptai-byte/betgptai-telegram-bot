@@ -19,6 +19,11 @@ from fangraphs_data import merge_fangraphs_data
 from highlightly_data import merge_highlightly_data
 from model_engines import enrich_slate_with_internal_models
 from savant_data import merge_savant_data
+from thesportsdb_data import (
+    get_baseball_events,
+    merge_baseball_metadata,
+    thesportsdb_api_key,
+)
 from weather_data import merge_weather_data
 from game_time import game_sort_key
 
@@ -285,6 +290,40 @@ def _attach_unavailable_odds(slate: list[dict[str, Any]]) -> list[dict[str, Any]
     return slate
 
 
+def _sportsdb_baseball_schedule(selected_date: str) -> list[dict[str, Any]]:
+    """Normalize optional TheSportsDB baseball schedule backup rows."""
+    events = get_baseball_events(selected_date, thesportsdb_api_key())
+    games: list[dict[str, Any]] = []
+    for event in events:
+        home = event.get("strHomeTeam")
+        away = event.get("strAwayTeam")
+        if not home or not away:
+            continue
+        games.append({
+            "game_id": event.get("idEvent"),
+            "game_time": event.get("strTimestamp")
+            or f"{event.get('dateEvent', selected_date)}T{event.get('strTime') or '00:00:00'}Z",
+            "status": event.get("strStatus") or "Scheduled",
+            "away_team": away,
+            "home_team": home,
+            "away_team_id": event.get("idAwayTeam"),
+            "home_team_id": event.get("idHomeTeam"),
+            "away_pitcher": "TBD",
+            "home_pitcher": "TBD",
+            "away_pitcher_id": None,
+            "home_pitcher_id": None,
+            "venue": event.get("strVenue"),
+            "thesportsdb_metadata": {
+                "event_id": event.get("idEvent"),
+                "league": event.get("strLeague"),
+                "league_id": event.get("idLeague"),
+                "event_thumb": event.get("strThumb"),
+                "venue": event.get("strVenue"),
+            },
+        })
+    return games
+
+
 def get_combined_slate(
     odds_api_key: str, game_date: str | None = None, highlightly_api_key: str = ""
 ) -> list[dict[str, Any]]:
@@ -312,6 +351,13 @@ def get_combined_slate(
             primary_mlb_schedule = False
         except Exception:
             logging.warning("API-Sports Baseball schedule backup unavailable", exc_info=True)
+            slate = []
+    if not slate and mlb_stats_failed:
+        try:
+            slate = _sportsdb_baseball_schedule(selected_date)
+            primary_mlb_schedule = False
+        except Exception:
+            logging.debug("TheSportsDB baseball schedule backup unavailable; continuing", exc_info=True)
             slate = []
     if not slate:
         return []
@@ -345,6 +391,13 @@ def get_combined_slate(
         logging.debug("FanGraphs enrichment unavailable; continuing", exc_info=True)
         for game in slate:
             game.setdefault("fangraphs", UNAVAILABLE)
+
+    try:
+        slate = merge_baseball_metadata(slate, selected_date, thesportsdb_api_key())
+    except Exception:
+        logging.debug("TheSportsDB baseball metadata unavailable; continuing", exc_info=True)
+        for game in slate:
+            game.setdefault("thesportsdb_metadata", UNAVAILABLE)
 
     try:
         slate = merge_highlightly_data(slate, highlightly_api_key, selected_date)

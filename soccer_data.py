@@ -21,6 +21,12 @@ from fbref_data import fbref_available, merge_fbref_data
 from game_time import game_sort_key
 from soccer_master_engines import enrich_soccer_master_system
 from statsbomb_data import merge_statsbomb_data, statsbomb_available
+from thesportsdb_data import (
+    check_thesportsdb_connection,
+    get_soccer_events,
+    thesportsdb_enabled,
+)
+from worldcup_schedule import get_world_cup_fallback_matches, world_cup_mode_enabled
 
 
 FOOTBALL_DATA_URL = "https://api.football-data.org/v4/matches"
@@ -114,8 +120,10 @@ def _sportsdb_request(
     api_key: str, endpoint: str, params: dict[str, Any] | None = None
 ) -> Any:
     """Call one optional TheSportsDB endpoint without exposing its key."""
+    if not thesportsdb_enabled():
+        raise ValueError("TheSportsDB is disabled.")
     if not api_key:
-        raise ValueError("THE_SPORTS_DB_API_KEY is not configured.")
+        raise ValueError("THESPORTSDB_API_KEY is not configured.")
     return _request_json(
         f"{SPORTS_DB_BASE_URL}/{api_key}/{endpoint}", params=params
     )
@@ -123,11 +131,7 @@ def _sportsdb_request(
 
 def check_thesportsdb(api_key: str) -> bool:
     """Return whether TheSportsDB responds for the private /status panel."""
-    try:
-        payload = _sportsdb_request(api_key, "all_leagues.php")
-        return isinstance(payload, dict) and isinstance(payload.get("leagues"), list)
-    except Exception:
-        return False
+    return check_thesportsdb_connection(api_key)
 
 
 def check_clubelo() -> bool:
@@ -155,11 +159,7 @@ def check_serpapi(api_key: str) -> bool:
 
 def get_thesportsdb_events(api_key: str, game_date: str) -> list[dict[str, Any]]:
     """Fetch the worldwide soccer schedule used for backup and enrichment."""
-    payload = _sportsdb_request(
-        api_key, "eventsday.php", {"d": game_date, "s": "Soccer"}
-    )
-    events = payload.get("events", []) if isinstance(payload, dict) else []
-    return [event for event in events or [] if isinstance(event, dict)]
+    return get_soccer_events(game_date, api_key)
 
 
 def _sportsdb_kickoff(event: dict[str, Any]) -> str | None:
@@ -682,14 +682,25 @@ def get_soccer_slate(
         "dates_checked": [],
         "football_data_matches": 0,
         "thesportsdb_matches": 0,
+        "world_cup_fallback_matches": 0,
         "matches_after_filter": 0,
         "candidate_rejections": [],
     }
 
+    world_cup_matches = get_world_cup_fallback_matches(base_day.isoformat())
+    if world_cup_matches:
+        fixtures = world_cup_matches
+        selected_day = base_day
+        debug_context["world_cup_fallback_matches"] = len(world_cup_matches)
+        debug_context["matches_after_filter"] = len(fixtures)
+        debug_context["candidate_rejections"].append(
+            "World Cup fallback schedule active; odds/xG/provider matches not required."
+        )
+
     # Emergency fallback: if today's board is empty, check tomorrow before
     # returning no-card. This catches tournament boards whose lines/schedules
     # populate on the next sports day.
-    for current_day in (base_day, base_day + timedelta(days=1)):
+    for current_day in (() if fixtures else (base_day, base_day + timedelta(days=1))):
         current_text = current_day.isoformat()
         debug_context["dates_checked"].append(current_text)
         all_matches: list[dict[str, Any]] = []
@@ -736,6 +747,22 @@ def get_soccer_slate(
             "candidate_rejections": ["Zero scheduled matches across all enabled sources."],
         }
         return []
+
+    if world_cup_mode_enabled() and debug_context.get("world_cup_fallback_matches"):
+        slate = [
+            {
+                **match,
+                "football_data_context": UNAVAILABLE,
+                "sportsdb_context": UNAVAILABLE,
+            }
+            for match in fixtures
+        ]
+        finalized = _finalize_soccer_slate(
+            slate, selected_day.isoformat(), sports_db_api_key, serpapi_key,
+            debug_context=debug_context,
+        )
+        LAST_SOCCER_DEBUG = finalized[0].get("soccer_debug_context", debug_context) if finalized else debug_context
+        return finalized
 
     history_start = (selected_day - timedelta(days=10)).isoformat()
     history_end = (selected_day - timedelta(days=1)).isoformat()
@@ -888,6 +915,20 @@ def get_soccer_schedule(
     api_football_key: str = "",
 ) -> list[dict[str, Any]]:
     """Return lightweight kickoff data with the same primary/backup rules."""
+    fallback = get_world_cup_fallback_matches(game_date)
+    if fallback:
+        schedule = [
+            {
+                "match_id": match.get("match_id"),
+                "kickoff": match.get("kickoff"),
+                "status": match.get("status"),
+                "home_team": match.get("home_team"),
+                "away_team": match.get("away_team"),
+            }
+            for match in fallback
+        ]
+        schedule.sort(key=lambda game: game_sort_key(game, "kickoff"))
+        return schedule
     try:
         matches = get_football_matches(football_api_key, game_date, game_date)
     except SoccerDataError:

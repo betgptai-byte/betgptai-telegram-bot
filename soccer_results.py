@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
 from card_format import RECOMMENDATION_FOOTER
+from storage import data_file
 
 
-RESULTS_FILE = Path(__file__).resolve().parent / "soccer_results.json"
+RESULTS_FILE = data_file("soccer_results.json")
 CATEGORIES = (
     ("overall", "Overall"),
     ("moneyline", "Moneyline / 1X2"),

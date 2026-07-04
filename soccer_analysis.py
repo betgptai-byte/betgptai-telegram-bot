@@ -304,19 +304,23 @@ def _tournament_card(slate: list[dict[str, Any]]) -> str:
     sections = ["⚽ BETGPTAI SOCCER CARD\n\n🌍 WORLD CUP MODE"]
     for game in games:
         primary, secondary = _choices_for_game(game)
-        block = soccer_game_block(game).splitlines()
-        match_line = block[0].replace("🆚 ", "") if block else f"{game.get('away_team')} vs {game.get('home_team')}"
-        time_line = block[1] if len(block) > 1 else "🕒 Game Time ET: Time unavailable"
+        match_line = f"{game.get('home_team', 'Home Team')} vs {game.get('away_team', 'Away Team')}"
+        game_time = game.get("game_time_et")
+        if not game_time:
+            block = soccer_game_block(game).splitlines()
+            game_time = block[1].replace("🕒 ", "") if len(block) > 1 else "Time unavailable ET"
         sections.append(
             f"{DIVIDER}\n\n"
-            f"⚽ {match_line}\n"
-            f"{time_line}\n\n"
+            "Match:\n"
+            f"{match_line}\n\n"
+            "Game Time ET:\n"
+            f"{game_time}\n\n"
             "Primary Pick:\n"
             f"{_market_label(primary['market'], game)}\n\n"
             "Secondary Pick:\n"
             f"{_market_label(secondary['market'], game)}\n\n"
             f"Confidence Grade: {_confidence_from_choice(primary)}/10\n\n"
-            "Reason:\n"
+            "Short Reason:\n"
             f"{_clean(primary.get('reason') or 'Safer matchup profile with market-priority support.')}"
         )
     sections.append(
@@ -657,10 +661,15 @@ def soccer_debug_report(
         "🧪 BETGPTAI SOCCER DEBUG\n\n"
         f"Football-Data matches: {summary.get('football_data_matches', summary.get('football_data_games', 0))}\n"
         f"TheSportsDB matches: {summary.get('thesportsdb_matches', summary.get('thesportsdb_games', 0))}\n"
+        f"Fallback matches: {summary.get('world_cup_fallback_matches', 0)}\n"
+        f"World Cup fallback matches: {summary.get('world_cup_fallback_matches', 0)}\n"
         f"StatsBomb enriched matches: {summary.get('statsbomb_games', 0)}\n"
         f"Weather matches: {summary.get('weather_games', 0)}\n"
+        f"Filtered matches: {summary.get('matches_after_filter', len(slate))}\n"
         f"Matches after filtering: {summary.get('matches_after_filter', len(slate))}\n"
+        f"Odds matches: {odds_markets}\n"
         f"Odds markets found: {odds_markets}\n"
+        f"Qualified plays: {len(choices)}\n"
         f"Candidate plays created: {len(choices)}\n\n"
         "Why candidates were rejected:\n"
         f"{rejected_text}\n\n"

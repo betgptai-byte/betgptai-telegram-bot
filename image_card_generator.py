@@ -19,10 +19,12 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
+from storage import data_file
+
 
 BASE_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE_DIR / "generated_cards"
-DAILY_CARD_FILE = BASE_DIR / "daily_card.json"
+OUTPUT_DIR = data_file("generated_cards")
+DAILY_CARD_FILE = data_file("daily_card.json")
 WIDTH, HEIGHT = 1080, 1920
 
 NEON_YELLOW = (255, 235, 58)
@@ -640,7 +642,7 @@ def generate_test_mlb_card(output_path: str | Path | None = None) -> Path:
     return generate_card_image(
         "test_mlb",
         payload=sample_mlb_card_payload(),
-        output_path=output_path or (BASE_DIR / "test_mlb_card.png"),
+        output_path=output_path or (data_file("generated_cards") / "test_mlb_card.png"),
     )
 
 def generate_mlb_card_slides(card_data: dict) -> list[str]:

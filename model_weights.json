@@ -1,0 +1,23 @@
+{
+  "weights": {
+    "starting_pitcher_edge": 0.5,
+    "bullpen_edge": 0.5,
+    "lineup_confirmation": 0.5,
+    "weather_edge": 0.5,
+    "park_factor": 0.5,
+    "recent_form": 0.5,
+    "statcast_contact": 0.5,
+    "pitch_type_matchup": 0.5,
+    "bvp": 0.25,
+    "travel_rest": 0.35,
+    "market_value": 0.5,
+    "team_offense_vs_handedness": 0.5,
+    "bullpen_fatigue": 0.5,
+    "player_streaks": 0.45,
+    "player_lineup_spot": 0.5,
+    "player_team_verification": 0.7
+  },
+  "updated_at": "2026-07-03T01:23:09-04:00",
+  "auto_apply": false,
+  "history": []
+}

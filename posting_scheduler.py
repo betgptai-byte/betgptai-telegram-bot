@@ -1,8 +1,12 @@
-"""Game-aware Telegram channel scheduler for BETGPTAI.
+"""Pregame/results Telegram channel scheduler for BETGPTAI.
 
-The scheduler polls official schedules instead of relying on fixed clock times.
-Successful and intentionally skipped jobs are persisted so restarts do not
-duplicate posts.
+BETGPTAI is a pregame analysis platform, not a live score bot. This scheduler
+does not post live scores, inning updates, score notifications, in-game
+Telegram edits, or game-progress messages.
+
+It performs two automated jobs:
+1. Generate owner-approval previews 45 minutes before the first scheduled game.
+2. After all saved official games are final, grade picks and post results.
 """
 
 from __future__ import annotations
@@ -17,13 +21,19 @@ from typing import Any
 
 import requests
 
-from ai_analysis import (
-    analyze_mlb_slate,
-    analyze_specialized_mlb_slate,
-    get_last_analysis_metadata,
-)
+from ai_analysis import analyze_mlb_slate, get_last_analysis_metadata
+from ai_learning_engine import render_learning_report, run_learning_review
 from card_time import EASTERN, official_sports_date
+from daily_workflow import (
+    generate_cards_job,
+    post_cards_job,
+    pregame_verify_job,
+    schedule_times,
+    time_debug_payload,
+    workflow_status,
+)
 from game_time import parse_game_time
+from mlb_auto_image import prepare_mlb_auto_image
 from mlb_data import get_combined_slate, get_mlb_schedule
 from model_report import save_model_report
 from results_tracker import (
@@ -35,18 +45,22 @@ from results_tracker import (
 )
 from soccer_analysis import analyze_soccer_slate
 from soccer_data import get_soccer_schedule, get_soccer_slate
+from storage import data_file
+from thesportsdb_data import thesportsdb_api_key
+from time_utils import get_app_timezone, now_et
 
 
-POSTING_LOG_FILE = Path(__file__).with_name("posting_log.json")
+POSTING_LOG_FILE = data_file("posting_log.json")
 DIVIDER = "━━━━━━━━━━━━"
 _CARD_CACHE: dict[str, dict[str, Any]] = {}
 AUTO_RESULTS_ENABLED_KEY = "auto_results_enabled"
-RESULTS_POST_DESTINATIONS = ("FREE_CHANNEL_ID", "COMMUNITY_GROUP_ID")
+RESULTS_POST_DESTINATIONS = ("FREE_CHANNEL_ID", "VIP_CHANNEL_ID")
 OFFICIAL_RESULTS_SOURCES = {
     "today",
     "mlb_auto",
     "generate_today",
     "tap_menu_mlb_card",
+    "scheduled_generate",
 }
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
 REQUEST_TIMEOUT = 20
@@ -147,15 +161,6 @@ async def _send_long(bot: Any, chat_id: int | str, text: str) -> None:
         await bot.send_message(chat_id=chat_id, text=chunk)
 
 
-def _section(card: str, heading: str) -> str:
-    """Extract one premium section from a generated MLB card."""
-    start = card.find(heading)
-    if start < 0:
-        return f"{heading}\n\nNo qualified edge is available right now."
-    end = card.find(DIVIDER, start)
-    return card[start:end if end >= 0 else len(card)].strip()
-
-
 async def _mlb_card(day: str) -> tuple[str, list[dict[str, Any]]]:
     """Generate one consistent daily MLB card and reuse it for every channel."""
     cached = _CARD_CACHE.get(day, {})
@@ -197,7 +202,7 @@ async def _soccer_card(day: str) -> str:
         os.getenv("FOOTBALL_DATA_API_KEY", ""),
         os.getenv("ODDS_API_KEY", ""),
         game_date=day,
-        sports_db_api_key=os.getenv("THE_SPORTS_DB_API_KEY", ""),
+        sports_db_api_key=thesportsdb_api_key(),
         serpapi_key=os.getenv("SERPAPI_KEY", ""),
         api_football_key=os.getenv("API_FOOTBALL_KEY", ""),
     )
@@ -221,24 +226,7 @@ async def _content_for(job_type: str, day: str) -> str:
         await asyncio.to_thread(grade_mlb_picks_for_date, day)
         return await asyncio.to_thread(build_daily_results_dashboard, day)
 
-    card, slate = await _mlb_card(day)
-    if job_type == "play":
-        return _section(card, "🔥 PLAY OF THE DAY")
-    if job_type == "f5":
-        return await analyze_specialized_mlb_slate(
-            slate, os.getenv("OPENAI_API_KEY", ""), "f5",
-            os.getenv("ANTHROPIC_API_KEY", ""),
-        )
-    if job_type == "team_totals":
-        return await analyze_specialized_mlb_slate(
-            slate, os.getenv("OPENAI_API_KEY", ""), "teamtotals",
-            os.getenv("ANTHROPIC_API_KEY", ""),
-        )
-    if job_type == "nrfi":
-        return await analyze_specialized_mlb_slate(
-            slate, os.getenv("OPENAI_API_KEY", ""), "nrfi",
-            os.getenv("ANTHROPIC_API_KEY", ""),
-        )
+    card, _slate = await _mlb_card(day)
     title = "🔥 FULL MLB CARD" if job_type == "full_mlb" else "⚾ FREE MLB CARD"
     return f"{title}\n\n{card}"
 
@@ -251,38 +239,65 @@ def _is_final(game: dict[str, Any]) -> bool:
 def _timed_jobs(
     first_mlb: datetime | None, first_soccer: datetime | None
 ) -> list[dict[str, Any]]:
-    """Create the requested channel plan relative to actual first starts."""
+    """Create the pregame-only channel plan relative to actual first starts."""
     jobs: list[dict[str, Any]] = []
 
-    def add(destination: str, name: str, job_type: str, due: datetime) -> None:
-        jobs.append({
-            "id": f"{destination}_{name}", "destination": destination,
-            "type": job_type, "due": due,
-        })
+    def add(
+        destination: str,
+        name: str,
+        job_type: str,
+        due: datetime,
+        first_start: datetime,
+    ) -> None:
+        jobs.append(
+            {
+                "id": f"{destination}_{name}",
+                "destination": destination,
+                "type": job_type,
+                "due": due,
+                "first_start": first_start,
+            }
+        )
 
     if first_mlb:
-        add("FREE_CHANNEL_ID", "play", "play", first_mlb - timedelta(hours=2))
-        add("FREE_CHANNEL_ID", "mlb", "free_mlb", first_mlb - timedelta(minutes=90))
-        add("VIP_CHANNEL_ID", "full_mlb", "full_mlb", first_mlb - timedelta(hours=2))
-        add("VIP_CHANNEL_ID", "f5", "f5", first_mlb - timedelta(minutes=105))
-        add("VIP_CHANNEL_ID", "team_totals", "team_totals", first_mlb - timedelta(minutes=90))
-        add("VIP_CHANNEL_ID", "nrfi", "nrfi", first_mlb - timedelta(minutes=75))
-        add("COMMUNITY_GROUP_ID", "play", "play", first_mlb - timedelta(hours=2))
-        add("COMMUNITY_GROUP_ID", "mlb", "free_mlb", first_mlb - timedelta(minutes=90))
+        due = first_mlb - timedelta(minutes=45)
+        add("MY_TELEGRAM_ID", "mlb_pregame_owner_preview", "full_mlb", due, first_mlb)
     if first_soccer:
-        add("FREE_CHANNEL_ID", "soccer", "soccer", first_soccer - timedelta(minutes=60))
-        add("COMMUNITY_GROUP_ID", "soccer", "soccer", first_soccer - timedelta(minutes=60))
+        due = first_soccer - timedelta(minutes=45)
+        add("MY_TELEGRAM_ID", "soccer_pregame_owner_preview", "soccer", due, first_soccer)
     return jobs
 
 
 async def _post_job(bot: Any, log: dict[str, Any], day: str, job: dict[str, Any]) -> None:
     """Send one due job and record success only after Telegram accepts it."""
     try:
+        chat_id = _destination(job["destination"])
         content = await _content_for(job["type"], day)
-        # Anime Vault image generation is disabled until real generated artwork
-        # matches the uploaded reference. Scheduled posts remain text-only so
-        # placeholder graphics never reach public channels.
-        await _send_long(bot, _destination(job["destination"]), content)
+        await _send_long(
+            bot,
+            chat_id,
+            "🧪 BETGPTAI OWNER PREGAME PREVIEW\n\n"
+            "Review and approve before public posting.\n\n"
+            f"{content}",
+        )
+        if job["type"] in {"free_mlb", "full_mlb"}:
+            card, _slate = await _mlb_card(day)
+            image_result = await asyncio.to_thread(prepare_mlb_auto_image, card, day)
+            image_path = image_result.get("image_path")
+            if image_path and Path(str(image_path)).exists():
+                with Path(str(image_path)).open("rb") as image_file:
+                    await bot.send_photo(
+                        chat_id=chat_id,
+                        photo=image_file,
+                        caption="🖼 MLB Anime Card Preview — owner approval only.",
+                    )
+            elif image_result.get("prompt"):
+                await _send_long(
+                    bot,
+                    chat_id,
+                    "🖼 MLB Anime Card Prompt — owner approval only.\n\n"
+                    f"{image_result.get('prompt')}",
+                )
         _record_job(log, day, job["id"], "sent")
         logging.info("Sent scheduled post %s for %s", job["id"], day)
     except Exception as error:
@@ -543,6 +558,17 @@ async def post_daily_results_if_ready(
         return {"posted": False, **readiness}
 
     await asyncio.to_thread(grade_mlb_picks_for_date, day)
+    try:
+        learning_report = await asyncio.to_thread(run_learning_review, day)
+        admin_id = os.getenv("MY_TELEGRAM_ID", "").strip()
+        if admin_id:
+            await _send_long(
+                bot,
+                int(admin_id),
+                render_learning_report(learning_report),
+            )
+    except Exception:
+        logging.exception("AI Learning review failed after automatic grading")
     card = await asyncio.to_thread(_build_auto_results_card, day)
     sent_to: list[str] = []
     for environment_name in RESULTS_POST_DESTINATIONS:
@@ -584,73 +610,122 @@ def results_auto_status_text(day: str | None = None) -> str:
     )
 
 
-async def process_game_aware_posts(bot: Any, now: datetime | None = None) -> None:
-    """Evaluate and deliver every currently due post exactly once."""
-    current = (now or datetime.now(EASTERN)).astimezone(EASTERN)
-    day = official_sports_date(current).isoformat()
-    log = _read_log()
-    mlb_result, soccer_result = await asyncio.gather(
-        asyncio.to_thread(get_mlb_schedule, day),
-        asyncio.to_thread(
-            get_soccer_schedule,
-            os.getenv("FOOTBALL_DATA_API_KEY", ""),
-            os.getenv("THE_SPORTS_DB_API_KEY", ""),
-            day,
-            os.getenv("API_FOOTBALL_KEY", ""),
-        ),
-        return_exceptions=True,
+def time_debug_text(day: str | None = None) -> str:
+    """Owner-facing timezone/scheduler diagnostics."""
+    payload = time_debug_payload(day)
+    return (
+        "🕒 BETGPTAI TIME DEBUG\n\n"
+        f"UTC now: {payload.get('utc_now')}\n"
+        f"ET now: {payload.get('et_now')}\n"
+        f"Server TZ env: {payload.get('server_tz_env')}\n"
+        f"APP_TIMEZONE: {payload.get('app_timezone')}\n\n"
+        f"First MLB game ET: {payload.get('first_pitch_et')}\n"
+        f"T-50 verify time: {payload.get('verify_time_et')}\n"
+        f"T-45 generate time: {payload.get('generate_time_et')}\n"
+        f"T-43 post time: {payload.get('post_time_et')}\n\n"
+        f"Scheduler running: {'✅ Yes' if payload.get('scheduler_running') else '❌ No'}\n"
+        f"Jobs registered: {', '.join(payload.get('jobs_registered') or [])}\n"
+        f"Seconds until next job: {payload.get('seconds_until_next_job')}"
     )
-    if isinstance(mlb_result, Exception):
-        logging.warning("MLB schedule unavailable to posting scheduler: %s", mlb_result)
-        mlb_schedule: list[dict[str, Any]] = []
-    else:
-        mlb_schedule = mlb_result
-    if isinstance(soccer_result, Exception):
-        logging.warning("Soccer schedule unavailable to posting scheduler: %s", soccer_result)
-        soccer_schedule: list[dict[str, Any]] = []
-    else:
-        soccer_schedule = soccer_result
 
-    # Cancelled and postponed games should not hold the day's results job open.
-    mlb_schedule = [
-        game for game in mlb_schedule
-        if not any(
-            value in str(game.get("status", "")).lower()
-            for value in ("cancelled", "canceled", "postponed")
-        )
-    ]
-    if not mlb_schedule and not soccer_schedule:
-        await post_daily_results_if_ready(bot, now=current)
+
+def scheduler_status_text(day: str | None = None) -> str:
+    """Owner-facing status for the 3-step pregame workflow."""
+    payload = workflow_status(day)
+    verification = payload.get("verification") if isinstance(payload.get("verification"), dict) else {}
+    generation = payload.get("generation") if isinstance(payload.get("generation"), dict) else {}
+    posting = payload.get("posting") if isinstance(payload.get("posting"), dict) else {}
+    times = payload.get("times") if isinstance(payload.get("times"), dict) else {}
+    return (
+        "📡 BETGPTAI SCHEDULER STATUS\n\n"
+        f"Date: {display_date(str(payload.get('card_date')))}\n"
+        f"Today’s first pitch: {times.get('first_pitch_et')}\n"
+        f"T-50 Verification: {verification.get('ready_for_image_generation', 'Not run')}\n"
+        f"T-45 Generation: {generation.get('generated', 'Not run')}\n"
+        f"T-43 Posting: {posting.get('status', 'Not run')}\n"
+        f"Approval required: {'✅ Yes' if payload.get('approval_required') else '❌ No'}\n"
+        f"Last scheduler error: {payload.get('last_scheduler_error', 'None')}"
+    )
+
+
+async def _process_three_step_pregame_workflow(bot: Any, day: str, current: datetime) -> None:
+    """Run T-50/T-45/T-43 jobs exactly once when due."""
+    times = schedule_times(day)
+    first_pitch = times.get("first_pitch_et")
+    if first_pitch is None:
         return
+    log = _read_log()
+    log.setdefault("scheduler", {})["last_checked_at"] = current.isoformat()
+    log["scheduler_initialized"] = True
+    app_timezone = get_app_timezone()
+    log["timezone_used"] = str(app_timezone)
+    log["first_pitch_et"] = first_pitch.isoformat()
+    logging.info("Scheduler initialized")
+    logging.info("Timezone used: %s", app_timezone)
+    logging.info("First pitch ET: %s", first_pitch.isoformat())
 
-    mlb_times = [
-        parsed for game in mlb_schedule
-        if (parsed := parse_game_time(game.get("game_time"))) is not None
+    jobs = [
+        ("pregame_verify", "Verification scheduled", times.get("verify_time"), pregame_verify_job),
+        ("generate_cards", "Generation scheduled", times.get("generate_time"), generate_cards_job),
+        ("post_cards", "Posting scheduled", times.get("post_time"), post_cards_job),
     ]
-    soccer_times = [
-        parsed for match in soccer_schedule
-        if (parsed := parse_game_time(match.get("kickoff"))) is not None
-    ]
-    first_mlb = min(mlb_times) if mlb_times else None
-    first_soccer = min(soccer_times) if soccer_times else None
-    all_mlb_final = bool(mlb_schedule) and all(_is_final(game) for game in mlb_schedule)
-
-    for job in _timed_jobs(first_mlb, first_soccer):
-        if _job_done(log, day, job["id"]) or current < job["due"]:
+    for job_id, label, due_time, function in jobs:
+        if due_time is None:
             continue
-        if all_mlb_final and job["type"] != "soccer":
-            _record_job(log, day, job["id"], "skipped", "Games already final")
+        logging.info("%s: %s", label, due_time.isoformat())
+        entry = log.get(day, {}).get(job_id, {})
+        if isinstance(entry, dict) and entry.get("status") in {"sent", "skipped", "blocked"}:
             continue
-        await _post_job(bot, log, day, job)
+        if (
+            isinstance(entry, dict)
+            and entry.get("status") == "waiting_for_approval"
+            and os.getenv("AUTO_POST_APPROVED", "false").strip().lower() not in {"1", "true", "yes", "on"}
+        ):
+            continue
+        if current < due_time:
+            continue
+        # Never post before T-43; this guard is deliberately explicit.
+        if job_id == "post_cards" and current < times["post_time"]:
+            continue
+        try:
+            result = await function(bot, day)
+            status = (
+                "waiting_for_approval"
+                if isinstance(result, dict) and result.get("reason") == "approval_required"
+                else "blocked"
+                if isinstance(result, dict) and result.get("posted") is False and job_id == "post_cards"
+                else "sent"
+            )
+            log = _read_log()
+            log.setdefault(day, {})[job_id] = {
+                "status": status,
+                "recorded_at": now_et().isoformat(),
+                "detail": result,
+            }
+            _write_log(log)
+        except Exception as error:
+            logging.exception("Scheduler job %s failed", job_id)
+            log = _read_log()
+            log["last_scheduler_error"] = f"{job_id}: {error}"
+            log.setdefault(day, {})[job_id] = {
+                "status": "failed",
+                "recorded_at": now_et().isoformat(),
+                "detail": str(error),
+            }
+            _write_log(log)
 
-    # Pregame posting and end-of-day results are separate. Results use saved
-    # official picks as source of truth and only post once all related game_pks
-    # are final.
+
+async def process_game_aware_posts(bot: Any, now: datetime | None = None) -> None:
+    """Evaluate due pregame cards and end-of-day results exactly once."""
+    current = (now or now_et()).astimezone(get_app_timezone())
+    day = official_sports_date(current).isoformat()
+    await _process_three_step_pregame_workflow(bot, day, current)
+    # End-of-day results remain separate from the pregame workflow.
     await post_daily_results_if_ready(bot, now=current)
 
 
 async def run_game_aware_scheduler(application: Any) -> None:
-    """Continuously refresh the plan; errors never stop Telegram polling."""
+    """Run the pregame/results scheduler; errors never stop Telegram polling."""
     try:
         poll_seconds = max(30, int(os.getenv("SCHEDULER_POLL_SECONDS", "120")))
     except ValueError:

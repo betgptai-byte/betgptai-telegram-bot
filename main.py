@@ -49,6 +49,7 @@ from ai_learning_engine import (
     render_weight_suggestions,
     run_learning_review,
 )
+from elite_quant_engine import build_elite_quant_slate
 from anime_magazine_generator import (
     generate_daily_magazine_prompts,
     save_magazine_prompts,
@@ -272,7 +273,7 @@ def _deployed_at() -> str:
 
 def _app_version() -> str:
     """Return the public app version label."""
-    return os.getenv("APP_VERSION", "BETGPTAI v2.0")
+    return os.getenv("APP_VERSION", "BETGPTAI ELITE QUANT ENGINE v20.0")
 
 
 def _version_text() -> str:
@@ -2183,13 +2184,16 @@ async def _mission_control_health_text() -> str:
     learning_ready = learning_reports.exists()
     results_ready = storage_payload.get("results_database_healthy")
     weather_ready = any(isinstance(game.get("weather"), dict) for game in slate)
-    ready_to_publish = bool(slate and results_ready and weather_ready)
+    quant_payload = build_elite_quant_slate(slate, include_market=bool(os.getenv("ODDS_API_KEY", "")))
+    ready_to_publish = bool(slate and results_ready and weather_ready and quant_payload)
+    ready_games = sum(1 for item in quant_payload if item.get("game_status") == "ready")
     return (
         "🧠 BETGPTAI MISSION CONTROL\n\n"
         f"System Health: {'✅ Healthy' if storage_payload.get('writable') else '❌ Needs attention'}\n"
         f"Storage: {'✅ Healthy' if storage_payload.get('results_database_healthy') else '❌ Failed'}\n"
         "API Status: Use /status for full provider detail\n"
         f"Today's Games: {len(slate)}\n"
+        f"Quant Engine: {ready_games}/{len(quant_payload)} ready\n"
         f"Images Ready: {'✅ Yes' if images_ready else '➖ Not yet'}\n"
         f"Results Ready: {'✅ Yes' if results_ready else '❌ No'}\n"
         f"AI Learning: {'✅ Available' if learning_ready else '➖ No report yet'}\n"

@@ -21,6 +21,7 @@ from typing import Any
 from ai_analysis import analyze_mlb_slate, get_last_analysis_metadata, upcoming_mlb_slate
 from best_hit_prop_image import prepare_best_hit_prop_image
 from card_time import official_sports_date
+from elite_quant_engine import build_elite_quant_slate
 from mlb_auto_image import prepare_mlb_auto_image
 from mlb_data import get_combined_slate, get_mlb_schedule
 from model_report import save_model_report
@@ -31,7 +32,7 @@ from storage import data_file, storage_status
 from time_utils import format_et, now_et, to_et
 
 
-WORKFLOW_VERSION = "pregame_v1"
+WORKFLOW_VERSION = "elite_quant_v20"
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -190,6 +191,7 @@ async def pregame_verify_job(bot: Any, card_date: str | None = None) -> dict[str
     errors: list[str] = []
     schedule: list[dict[str, Any]] = []
     slate: list[dict[str, Any]] = []
+    quant_payload: list[dict[str, Any]] = []
     try:
         schedule = await asyncio.to_thread(get_mlb_schedule, selected)
     except Exception as error:
@@ -202,6 +204,7 @@ async def pregame_verify_job(bot: Any, card_date: str | None = None) -> dict[str
             highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
         )
         slate = upcoming_mlb_slate(slate)
+        quant_payload = await asyncio.to_thread(build_elite_quant_slate, slate, include_market=bool(os.getenv("ODDS_API_KEY", "")))
     except Exception as error:
         errors.append(f"Combined slate failed: {error}")
     storage = await asyncio.to_thread(storage_status)
@@ -235,6 +238,7 @@ async def pregame_verify_job(bot: Any, card_date: str | None = None) -> dict[str
         "storage_healthy": bool(storage.get("results_database_healthy")),
         "ready_for_image_generation": ready,
         "critical_failures": errors,
+        "elite_quant_slate": quant_payload,
     }
     _write_json(workflow_file(selected, "pregame_verification.json"), report)
     await _notify_admin(

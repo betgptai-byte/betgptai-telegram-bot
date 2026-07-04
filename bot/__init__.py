@@ -7,4 +7,4 @@ out of the legacy top-level files over time.
 
 __all__ = ["__version__"]
 
-__version__ = "BETGPTAI v3.0"
+__version__ = "BETGPTAI ELITE QUANT ENGINE v20.0"

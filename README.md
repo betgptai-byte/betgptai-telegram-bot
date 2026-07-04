@@ -1,5 +1,54 @@
 # BETGPTAI Telegram Bot
 
+## BETGPTAI v3.0 modular architecture
+
+The project now includes a modular `bot/` package designed for scalable growth
+without changing current user-facing behavior.
+
+```text
+bot/
+├── app.py
+├── config.py
+├── constants.py
+├── startup.py
+├── handlers/
+├── callbacks/
+├── services/
+├── api/
+├── models/
+├── menus/
+├── utils/
+├── diagnostics/
+└── data/
+```
+
+### Compatibility phase
+
+`main.py` remains the Railway-safe runtime entrypoint for now. The new v3
+modules wrap the existing battle-tested implementation so commands, menus,
+scheduler behavior, image generation, results, AI learning, Mission Control,
+MLB War Room, and Player Props continue to behave the same.
+
+Callback registration has moved to:
+
+```text
+bot/callbacks/router.py
+```
+
+`main.py` now calls that router instead of registering `CallbackQueryHandler`
+directly. This keeps callback registration centralized while preserving all
+existing inline menu behavior.
+
+### Refactor rules going forward
+
+- New code should read environment values from `bot/config.py`.
+- New callback registration belongs only in `bot/callbacks/router.py`.
+- New command modules belong in `bot/handlers/`.
+- New business logic belongs in `bot/services/`.
+- New inline keyboards belong in `bot/menus/`.
+- Legacy top-level files are compatibility adapters until their logic is moved
+  safely module-by-module.
+
 ## Safe local → GitHub → Railway workflow
 
 BETGPTAI uses a simple production-safety workflow:

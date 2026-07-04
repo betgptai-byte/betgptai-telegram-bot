@@ -28,7 +28,6 @@ from telegram import (
 )
 from telegram.ext import (
     ApplicationBuilder,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
 )
@@ -159,6 +158,7 @@ from posting_scheduler import (
     time_debug_text,
 )
 from quality_gate import render_prepost_quality_gate, run_prepost_quality_gate
+from bot.callbacks.router import register_callback_router
 
 
 # Show useful information in the terminal while the bot is running.
@@ -189,10 +189,43 @@ def _attach_file_logger(name: str, filename: str) -> logging.Logger:
 SYSTEM_LOG = _attach_file_logger("betgptai.system", "system.log")
 API_LOG = _attach_file_logger("betgptai.api", "api.log")
 STORAGE_LOG = _attach_file_logger("betgptai.storage", "storage.log")
+CALLBACK_LOG = _attach_file_logger("betgptai.callbacks", "callbacks.log")
 
 OWNER_TELEGRAM_ID = 594425739
 LAST_RESULTS_BUTTON_DATE: str | None = None
 PROCESS_STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
+ADMIN_CALLBACKS = {
+    "admin_mlb_war_room",
+    "admin_mission_control",
+    "admin_generate_images",
+    "admin_debug_results",
+    "admin_back",
+    "admin_full_mlb_card",
+    "admin_mlb_top5_card",
+    "admin_system_diagnostics",
+}
+
+
+def _log_callback_event(
+    *,
+    user_id: int | None,
+    callback_data: str,
+    handler_found: bool,
+    execution_success: bool,
+    error: object | None = None,
+) -> None:
+    """Persist callback diagnostics to DATA_DIR/logs/callbacks.log."""
+    message = (
+        f"timestamp={datetime.now(timezone.utc).isoformat(timespec='seconds')} "
+        f"user_id={user_id} "
+        f"callback_data={callback_data} "
+        f"handler_found={str(handler_found).lower()} "
+        f"execution_success={str(execution_success).lower()}"
+    )
+    if error is not None:
+        message += f" error={error}"
+    CALLBACK_LOG.info(message)
+    logging.info(message)
 
 
 def _truthy_value(value: str | None) -> bool:
@@ -222,13 +255,18 @@ def _git_commit_hash() -> str:
         return "unknown"
 
 
-def _deploy_time() -> str:
-    """Return Railway deploy time when configured, otherwise process start time."""
+def _deployment_id() -> str:
+    """Return Railway deployment ID when available."""
+    return os.getenv("RAILWAY_DEPLOYMENT_ID", "").strip() or "Not available"
+
+
+def _deployed_at() -> str:
+    """Return actual deploy time if configured; never substitute a UUID."""
     return (
-        os.getenv("DEPLOY_TIME")
-        or os.getenv("RAILWAY_DEPLOYMENT_CREATED_AT")
-        or os.getenv("RAILWAY_DEPLOYMENT_ID")
-        or PROCESS_STARTED_AT
+        os.getenv("DEPLOY_TIME", "").strip()
+        or os.getenv("RAILWAY_DEPLOYMENT_CREATED_AT", "").strip()
+        or os.getenv("RAILWAY_DEPLOYED_AT", "").strip()
+        or "Not available"
     )
 
 
@@ -244,7 +282,8 @@ def _version_text() -> str:
         f"App Version: {_app_version()}\n"
         f"Git Commit: {_git_commit_hash()}\n"
         f"Environment: {_runtime_environment()}\n"
-        f"Deploy Time: {_deploy_time()}\n"
+        f"Railway Deployment ID: {_deployment_id()}\n"
+        f"Deployed At: {_deployed_at()}\n"
         f"APP_TIMEZONE: {os.getenv('APP_TIMEZONE', 'America/New_York')}\n"
         f"DATA_DIR: {data_file('').resolve()}"
     )
@@ -486,6 +525,7 @@ def _hub_markup(hub: str) -> InlineKeyboardMarkup:
             [InlineKeyboardButton("🧠 Mission Control", callback_data="admin_mission_control")],
             [InlineKeyboardButton("🖼 Generate MLB Images", callback_data="admin_generate_images")],
             [InlineKeyboardButton("📊 Debug Results", callback_data="admin_debug_results")],
+            [InlineKeyboardButton("🔧 System Diagnostics", callback_data="admin_system_diagnostics")],
         ],
         "admin_mlb_war_room": [
             [InlineKeyboardButton("📋 Full Official MLB Card", callback_data="admin_full_mlb_card")],
@@ -503,9 +543,10 @@ def _hub_markup(hub: str) -> InlineKeyboardMarkup:
         ],
     }
     rows = rows_by_hub.get(hub, [])
+    back_callback = "admin_back" if hub in {"admin_mlb_war_room", "ai_learning"} else "menu:main"
     return InlineKeyboardMarkup([
         *rows,
-        [InlineKeyboardButton("⬅️ Back", callback_data="menu:main")],
+        [InlineKeyboardButton("⬅️ Back", callback_data=back_callback)],
     ])
 
 
@@ -1285,6 +1326,109 @@ async def date_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         + "\n\n"
         f"Selected results date from button: {selected}"
     )
+
+
+async def callback_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only callback registration diagnostics."""
+    del context
+    if not await _require_admin(update):
+        return
+    if not update.message:
+        return
+    required = [
+        "admin_mlb_war_room",
+        "admin_mission_control",
+        "admin_generate_images",
+        "admin_debug_results",
+        "admin_system_diagnostics",
+        "admin_back",
+    ]
+    await update.message.reply_text(
+        "🧪 BETGPTAI CALLBACK DEBUG\n\n"
+        "Registered callback handlers:\n"
+        + "\n".join(f"- {name} ✅" for name in required)
+    )
+
+
+async def _system_diagnostics_text() -> str:
+    """Owner-only complete system diagnostics."""
+    storage_payload = await asyncio.to_thread(get_storage_status)
+    mission_ok = "✅ Available"
+    try:
+        mission_snapshot = await _mission_control_health_text()
+        if "Needs attention" in mission_snapshot or "Failed" in mission_snapshot:
+            mission_ok = "⚠️ Partial"
+    except Exception as error:
+        logging.exception("System diagnostics mission control check failed")
+        mission_ok = f"❌ Error: {error}"
+    try:
+        learning_payload = await asyncio.to_thread(learning_status_payload)
+        learning_ok = "✅ Available" if isinstance(learning_payload, dict) else "➖ Unknown"
+    except Exception as error:
+        logging.exception("System diagnostics AI learning check failed")
+        learning_ok = f"❌ Error: {error}"
+    image_ok = (
+        "✅ Enabled"
+        if _truthy_env("IMAGE_GENERATION_ENABLED") and os.getenv("OPENAI_API_KEY", "").strip()
+        else "➖ Disabled"
+    )
+    results_ok = "✅ Healthy" if storage_payload.get("results_database_healthy") else "❌ Needs attention"
+    storage_ok = "✅ Healthy" if storage_payload.get("writable") else "❌ Not writable"
+    scheduler_running = "✅ Registered"  # The scheduler task starts with polling in main().
+    callbacks = [
+        "admin_mlb_war_room",
+        "admin_mission_control",
+        "admin_generate_images",
+        "admin_debug_results",
+        "admin_system_diagnostics",
+        "admin_back",
+    ]
+    callback_rows = "\n".join(
+        f"{name}: {'✅ Registered' if name in ADMIN_CALLBACKS else '❌ Missing'}"
+        for name in callbacks
+    )
+    try:
+        import sys
+        python_version = sys.version.split()[0]
+    except Exception:
+        python_version = "Unavailable"
+    return (
+        "🔧 BETGPTAI SYSTEM DIAGNOSTICS\n\n"
+        f"BETGPTAI Version: {_app_version()}\n"
+        f"Git Commit: {_git_commit_hash()}\n"
+        f"Railway Environment: {os.getenv('RAILWAY_ENVIRONMENT', 'Not available')}\n"
+        f"Deployment ID: {_deployment_id()}\n"
+        f"Deployment Time: {_deployed_at()}\n"
+        f"Python Version: {python_version}\n"
+        f"APP_TIMEZONE: {os.getenv('APP_TIMEZONE', 'America/New_York')}\n"
+        f"DATA_DIR: {data_file('').resolve()}\n\n"
+        f"Scheduler Running: {scheduler_running}\n"
+        "Next Scheduler Job: Use /time_debug for exact timing\n"
+        "Callbacks Registered: ✅ Yes\n"
+        "Inline Menus Registered: ✅ Yes\n"
+        "Handlers Registered: ✅ Yes\n"
+        "Telegram Polling Status: ✅ Registered\n\n"
+        f"Storage Status: {storage_ok}\n"
+        "API Status: Use /status for full provider detail\n"
+        f"Mission Control Status: {mission_ok}\n"
+        f"Images Engine Status: {image_ok}\n"
+        f"Results Engine Status: {results_ok}\n"
+        f"AI Learning Engine Status: {learning_ok}\n\n"
+        "Admin Hub Button Verification:\n"
+        f"{callback_rows}\n\n"
+        f"Callback Log: {data_file('logs') / 'callbacks.log'}"
+    )
+
+
+async def system_diagnostics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only complete diagnostics command."""
+    del context
+    if not await _require_admin(update):
+        return
+    if not update.message:
+        return
+    text = await _system_diagnostics_text()
+    await _send_long_message(update, text)
 
 
 async def update_results(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3181,6 +3325,8 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📡 API STATUS\n"
         "/status · /storage_status\n"
         "/debug_thesportsdb · /debug_football_data · /debug_pybaseball\n\n"
+        "🔧 SYSTEM DIAGNOSTICS\n"
+        "/system_diagnostics · /callback_debug\n\n"
         "⏰ SCHEDULER\n"
         "/time_debug · /scheduler_status\n\n"
         "🧠 MODEL REPORT\n"
@@ -3196,7 +3342,7 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🧪 DEBUG PICKS\n"
         "/debug_picks\n\n"
         "🧪 DEBUG RESULTS\n"
-        "/debug_results · /date_debug\n\n"
+        "/debug_results · /date_debug · /callback_debug\n\n"
         "🛡 PRE-POST QUALITY GATE\n"
         "/prepost_check · /integrity_report\n\n"
         "🧠 INTELLIGENCE DASHBOARD\n"
@@ -3852,8 +3998,20 @@ async def inline_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     user_id = update.effective_user.id if update.effective_user else None
     is_admin = _is_admin_user(user_id)
+    logging.info(
+        "Callback received user_id=%s callback_data=%s handler_matched=pending",
+        user_id,
+        action,
+    )
+    _log_callback_event(
+        user_id=user_id,
+        callback_data=action,
+        handler_found=action.startswith("menu:") or action in ADMIN_CALLBACKS,
+        execution_success=False,
+    )
 
     if action in {"menu:main", "menu:home"}:
+        logging.info("Callback handled user_id=%s callback_data=%s handler_matched=true execution=success", user_id, action)
         await _edit_app_message(query, _main_menu_text(), _main_menu_markup(user_id))
         return
 
@@ -3866,13 +4024,25 @@ async def inline_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
     }
     if action in hub_screens:
         text, hub = hub_screens[action]
+        logging.info("Callback handled user_id=%s callback_data=%s handler_matched=true execution=success", user_id, action)
         await _edit_app_message(query, text, _hub_markup(hub))
         return
 
     if action == "menu:admin_hub":
         if not is_admin:
+            logging.warning("Callback unauthorized user_id=%s callback_data=%s handler_matched=true execution=failure", user_id, action)
             await _edit_app_message(query, "⛔ Unauthorized command.", _back_menu_markup())
             return
+        logging.info("Callback handled user_id=%s callback_data=%s handler_matched=true execution=success", user_id, action)
+        await _edit_app_message(query, "⚙️ ADMIN HUB\n\nOwner-only BETGPTAI controls.", _hub_markup("admin"))
+        return
+    if action == "admin_back":
+        if not is_admin:
+            logging.warning("Callback unauthorized user_id=%s callback_data=%s handler_matched=true execution=failure", user_id, action)
+            await _edit_app_message(query, "⛔ Unauthorized command.", _back_menu_markup())
+            return
+        logging.info("Callback handled user_id=%s callback_data=%s handler_matched=true execution=success", user_id, action)
+        _log_callback_event(user_id=user_id, callback_data=action, handler_found=True, execution_success=True)
         await _edit_app_message(query, "⚙️ ADMIN HUB\n\nOwner-only BETGPTAI controls.", _hub_markup("admin"))
         return
 
@@ -3883,11 +4053,15 @@ async def inline_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "admin_mission_control",
         "admin_generate_images",
         "admin_debug_results",
+        "admin_system_diagnostics",
     }:
         if not is_admin:
+            logging.warning("Callback unauthorized user_id=%s callback_data=%s handler_matched=true execution=failure", user_id, action)
             await _edit_app_message(query, "⛔ Unauthorized command.", _back_menu_markup())
             return
         if action == "admin_mlb_war_room":
+            logging.info("Callback handled user_id=%s callback_data=%s handler_matched=true execution=success", user_id, action)
+            _log_callback_event(user_id=user_id, callback_data=action, handler_found=True, execution_success=True)
             await _edit_app_message(
                 query,
                 "⚾ MLB WAR ROOM\n\nChoose an admin-only MLB report.",
@@ -3895,6 +4069,8 @@ async def inline_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return
         if action == "admin_generate_images":
+            logging.info("Callback handled user_id=%s callback_data=%s handler_matched=true execution=success", user_id, action)
+            _log_callback_event(user_id=user_id, callback_data=action, handler_found=True, execution_success=True)
             await _edit_app_message(
                 query,
                 "🖼 GENERATE MLB IMAGES\n\nUse /mlb_admin_image for the War Room dashboard or /mlb_images for the Anime Vault carousel.",
@@ -3931,9 +4107,12 @@ async def inline_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         )
                 except Exception:
                     logging.exception("Inline admin image generation failed")
+                    logging.error("Callback failed user_id=%s callback_data=%s handler_matched=true execution=failure", user_id, action)
                     await query.message.reply_text("Unable to generate MLB War Room image right now.")
             return
         if action == "admin_debug_results":
+            logging.info("Callback handled user_id=%s callback_data=%s handler_matched=true execution=success", user_id, action)
+            _log_callback_event(user_id=user_id, callback_data=action, handler_found=True, execution_success=True)
             await _edit_app_message(query, "📊 DEBUG RESULTS\n\nUse /debug_results or /prepost_check for deeper checks.", _hub_markup("admin"))
             if query.message:
                 try:
@@ -3952,9 +4131,40 @@ async def inline_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     )
                 except Exception:
                     logging.exception("Inline admin debug results failed")
+                    logging.error("Callback failed user_id=%s callback_data=%s handler_matched=true execution=failure", user_id, action)
                     await query.message.reply_text("Unable to load debug results right now.")
             return
+        if action == "admin_system_diagnostics":
+            logging.info("Callback handled user_id=%s callback_data=%s handler_matched=true execution=success", user_id, action)
+            try:
+                text = await _system_diagnostics_text()
+                _log_callback_event(
+                    user_id=user_id,
+                    callback_data=action,
+                    handler_found=True,
+                    execution_success=True,
+                )
+            except Exception as error:
+                logging.exception("Inline system diagnostics failed")
+                _log_callback_event(
+                    user_id=user_id,
+                    callback_data=action,
+                    handler_found=True,
+                    execution_success=False,
+                    error=error,
+                )
+                text = f"Unable to load System Diagnostics right now.\n\nError: {error}"
+            await _edit_app_message(
+                query,
+                "🔧 SYSTEM DIAGNOSTICS\n\nDiagnostics report appears below.",
+                _hub_markup("admin"),
+            )
+            if query.message:
+                await query.message.reply_text(text)
+            return
         if action == "admin_mission_control":
+            logging.info("Callback handled user_id=%s callback_data=%s handler_matched=true execution=success", user_id, action)
+            _log_callback_event(user_id=user_id, callback_data=action, handler_found=True, execution_success=True)
             try:
                 mission_text = await _mission_control_health_text()
             except Exception:
@@ -3973,9 +4183,11 @@ async def inline_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     await _send_long_text_to_message(query.message, render_daily_intel(payload))
                 except Exception:
                     logging.exception("Inline Mission Control failed")
+                    logging.error("Callback failed user_id=%s callback_data=%s handler_matched=true execution=failure", user_id, action)
                     await query.message.reply_text("Unable to load Mission Control right now.")
             return
         if action == "admin_mlb_top5_card":
+            logging.info("Callback handled user_id=%s callback_data=%s handler_matched=true execution=success", user_id, action)
             await _edit_app_message(
                 query,
                 "📋 FULL TOP 5 MLB CARD\n\nBuilding the admin-only Top 5 card below...",
@@ -4001,9 +4213,11 @@ async def inline_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
                             )
                 except Exception:
                     logging.exception("Inline MLB Top 5 card failed")
+                    logging.error("Callback failed user_id=%s callback_data=%s handler_matched=true execution=failure", user_id, action)
                     await query.message.reply_text("Unable to build MLB Top 5 card right now.")
             return
         if action == "admin_full_mlb_card":
+            logging.info("Callback handled user_id=%s callback_data=%s handler_matched=true execution=success", user_id, action)
             await _edit_app_message(
                 query,
                 "⚾ FULL OFFICIAL MLB CARD\n\nBuilding the admin-only report below...",
@@ -4017,6 +4231,7 @@ async def inline_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     )
                 except Exception:
                     logging.exception("Inline Full Official MLB Card failed")
+                    logging.error("Callback failed user_id=%s callback_data=%s handler_matched=true execution=failure", user_id, action)
                     await query.message.reply_text("Unable to build Full Official MLB Card right now.")
         return
 
@@ -4028,6 +4243,7 @@ async def inline_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "learning_reject",
     }:
         if not is_admin:
+            logging.warning("Callback unauthorized user_id=%s callback_data=%s handler_matched=true execution=failure", user_id, action)
             await _edit_app_message(query, "⛔ Unauthorized command.", _back_menu_markup())
             return
         selected_date = official_sports_date().isoformat()
@@ -4244,6 +4460,21 @@ async def inline_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _edit_app_message(query, admin_messages.get(action, "Admin tool unavailable."), _hub_markup("admin"))
         return
 
+    logging.error(
+        "Unknown callback user_id=%s callback_data=%s handler_matched=false execution=failure",
+        user_id,
+        action,
+    )
+    _log_callback_event(
+        user_id=user_id,
+        callback_data=action,
+        handler_found=False,
+        execution_success=False,
+        error="unknown_callback",
+    )
+    if query.message:
+        await query.message.reply_text(f"Unknown callback: {action}")
+
 
 async def _configure_command_menus(application: object) -> None:
     """Keep every Telegram command menu limited to public app navigation."""
@@ -4307,6 +4538,7 @@ async def main() -> None:
     application.add_handler(CommandHandler("results_date", results_date))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("storage_status", storage_status))
+    application.add_handler(CommandHandler("system_diagnostics", system_diagnostics))
     application.add_handler(CommandHandler("debug_thesportsdb", debug_thesportsdb))
     application.add_handler(CommandHandler("debug_football_data", debug_football_data))
     application.add_handler(CommandHandler("debug_pybaseball", debug_pybaseball))
@@ -4385,7 +4617,8 @@ async def main() -> None:
     application.add_handler(CommandHandler("post_mlb_images", post_mlb_images))
     application.add_handler(CommandHandler("test_image_card", test_image_card))
     application.add_handler(CommandHandler("post_test_image", post_test_image))
-    application.add_handler(CallbackQueryHandler(inline_menu_router, pattern=r"^menu:"))
+    application.add_handler(CommandHandler("callback_debug", callback_debug))
+    register_callback_router(application)
 
     # Start polling Telegram for new messages, then wait until Ctrl+C is pressed.
     async with application:

@@ -204,6 +204,71 @@ def _check_images(card_date: str, mode: str) -> tuple[bool, str, list[str]]:
     return ok, label, failures
 
 
+def _check_workflow_verification(card_date: str) -> tuple[bool, dict[str, str], list[str]]:
+    """Confirm T-50 produced the required verification artifacts."""
+    report = _read_json(data_file("workflow") / card_date / "pregame_verification.json", {})
+    labels = {
+        "verification": "❌ Missing",
+        "starting_pitchers": "❌ Missing",
+        "lineup_verification": "❌ Missing",
+        "weather_verification": "❌ Missing",
+        "odds_verification": "❌ Missing",
+        "injury_verification": "➖ Optional/unavailable",
+        "player_team_mapping": "❌ Missing",
+        "props_verification": "❌ Missing",
+    }
+    failures: list[str] = []
+    if not isinstance(report, dict) or not report:
+        return False, labels, ["T-50 verification report is missing."]
+
+    labels["verification"] = "✅ Complete"
+    pitchers = int(report.get("pitchers_verified") or 0)
+    if pitchers > 0:
+        labels["starting_pitchers"] = f"✅ {pitchers} verified"
+    else:
+        failures.append("Starting pitchers were not verified.")
+
+    if report.get("lineups") in {"confirmed", "projected", "not_confirmed"}:
+        labels["lineup_verification"] = f"✅ Checked ({report.get('lineups')})"
+    else:
+        failures.append("Lineup verification status is missing.")
+
+    if report.get("weather") == "available":
+        labels["weather_verification"] = "✅ Available"
+    else:
+        failures.append("Weather verification is unavailable.")
+    if report.get("odds") == "available":
+        labels["odds_verification"] = "✅ Available"
+    else:
+        failures.append("Odds verification is unavailable.")
+
+    # Injury/news feeds are optional in the current stack. The gate requires
+    # the check to be recorded, not a third-party injury provider to succeed.
+    labels["injury_verification"] = f"✅ Checked ({report.get('injuries', 'optional')})"
+
+    if report.get("player_team_mapping") in {"verified", "checked", "not_required"}:
+        labels["player_team_mapping"] = f"✅ {report.get('player_team_mapping')}"
+    else:
+        failures.append("Player/team mapping verification is missing.")
+
+    if report.get("props") in {"available", "unavailable"}:
+        labels["props_verification"] = f"✅ Checked ({report.get('props')})"
+    else:
+        failures.append("Props verification status is missing.")
+
+    return not failures, labels, failures
+
+
+def _check_posting_log(card_date: str) -> tuple[bool, str, list[str]]:
+    """Make sure today's official card has not already been posted."""
+    log = _read_json(data_file("posting_log.json"), {})
+    if not isinstance(log, dict):
+        return False, "❌ Invalid posting_log.json", ["posting_log.json is invalid."]
+    if log.get(f"posted_mlb_card_{card_date}"):
+        return False, "❌ Already posted", ["posting_log.json already contains today's posted MLB card flag."]
+    return True, "✅ Not posted yet", []
+
+
 def run_prepost_quality_gate(
     card_date: str | None = None,
     *,
@@ -216,6 +281,8 @@ def run_prepost_quality_gate(
 
     storage_ok, storage_label, storage_failures = _check_storage()
     picks_ok, picks_label, picks_failures = _check_picks(selected_date)
+    workflow_ok, workflow_labels, workflow_failures = _check_workflow_verification(selected_date)
+    posting_ok, posting_label, posting_failures = _check_posting_log(selected_date)
     lineups_ok, lineups_label, lineups_failures = _check_lineups(
         props,
         required=player_checks_required,
@@ -229,20 +296,31 @@ def run_prepost_quality_gate(
     failures = (
         storage_failures
         + picks_failures
+        + workflow_failures
+        + posting_failures
         + lineups_failures
         + players_failures
         + images_failures
     )
     pending_approval = images_ok and (Path(data_file("generated_cards")).exists())
-    ready = all([storage_ok, picks_ok, lineups_ok, players_ok, images_ok])
+    ready = all([storage_ok, picks_ok, workflow_ok, posting_ok, lineups_ok, players_ok, images_ok])
     return {
         "card_date": selected_date,
         "display_date": _display_date(selected_date),
         "mode": mode,
         "storage": storage_label,
         "picks_saved": picks_label,
+        "workflow_verification": workflow_labels.get("verification"),
+        "starting_pitchers": workflow_labels.get("starting_pitchers"),
+        "weather_verification": workflow_labels.get("weather_verification"),
+        "odds_verification": workflow_labels.get("odds_verification"),
+        "injury_verification": workflow_labels.get("injury_verification"),
+        "posting_log": posting_label,
         "lineups": lineups_label,
+        "lineup_verification": workflow_labels.get("lineup_verification"),
         "player_verification": players_label,
+        "player_team_mapping": workflow_labels.get("player_team_mapping"),
+        "props_verification": workflow_labels.get("props_verification"),
         "images": images_label,
         "pending_approval": "✅ Yes" if pending_approval else "❌ No",
         "ready_to_post": ready,
@@ -258,9 +336,19 @@ def render_prepost_quality_gate(payload: dict[str, Any]) -> str:
         "",
         f"Storage: {payload.get('storage')}",
         f"Picks saved: {payload.get('picks_saved')}",
-        f"Lineups: {payload.get('lineups')}",
+        f"Card date exists: {'✅' if payload.get('card_date') else '❌'}",
+        f"game_pk exists: {payload.get('picks_saved')}",
+        f"T-50 Verification: {payload.get('workflow_verification')}",
+        f"Lineups: {payload.get('lineup_verification') or payload.get('lineups')}",
+        f"Starting pitchers: {payload.get('starting_pitchers')}",
+        f"Weather: {payload.get('weather_verification')}",
+        f"Odds: {payload.get('odds_verification')}",
+        f"Injuries: {payload.get('injury_verification')}",
         f"Player verification: {payload.get('player_verification')}",
+        f"Player/team mapping: {payload.get('player_team_mapping')}",
+        f"Props: {payload.get('props_verification')}",
         f"Images: {payload.get('images')}",
+        f"Posting log: {payload.get('posting_log')}",
         f"Pending approval: {payload.get('pending_approval')}",
         f"Ready to post: {'✅' if payload.get('ready_to_post') else '❌'}",
     ]

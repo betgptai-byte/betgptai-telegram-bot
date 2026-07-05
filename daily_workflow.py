@@ -22,12 +22,19 @@ from ai_analysis import analyze_mlb_slate, get_last_analysis_metadata, upcoming_
 from best_hit_prop_image import prepare_best_hit_prop_image
 from card_time import official_sports_date
 from elite_quant_engine import build_elite_quant_slate
+from lineup_verification import invalidate_scratched_props, summarize_lineups
 from mlb_auto_image import prepare_mlb_auto_image
 from mlb_data import get_combined_slate, get_mlb_schedule
 from model_report import save_model_report
 from player_props_engine import build_player_props_lab
 from quality_gate import run_prepost_quality_gate
 from results_tracker import save_official_picks
+from safe_parlay_formatter import render_safe_parlay
+from premium_card_formatter import (
+    render_category_card,
+    render_mlb_premium_card,
+    render_play_of_day_card,
+)
 from storage import data_file, storage_status
 from time_utils import format_et, now_et, to_et
 
@@ -136,13 +143,20 @@ def workflow_status(card_date: str | None = None) -> dict[str, Any]:
         "verification": verification,
         "generation": generation,
         "posting": posting,
-        "approval_required": not _auto_post_approved(),
+        "auto_post_enabled": _auto_post_enabled(),
+        "approval_required": False,
         "last_scheduler_error": log.get("last_scheduler_error", "None"),
     }
 
 
+def _auto_post_enabled() -> bool:
+    """Master kill switch for automatic T-43 channel posting."""
+    return os.getenv("AUTO_POST_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _auto_post_approved() -> bool:
-    return os.getenv("AUTO_POST_APPROVED", "false").strip().lower() in {"1", "true", "yes", "on"}
+    """Backward-compatible alias; AUTO_POST_ENABLED is now source of truth."""
+    return _auto_post_enabled()
 
 
 def _clear_stale_image_cache(card_date: str) -> int:
@@ -189,6 +203,7 @@ async def pregame_verify_job(bot: Any, card_date: str | None = None) -> dict[str
     """T-50 verification job."""
     selected = card_date or official_sports_date(now_et()).isoformat()
     errors: list[str] = []
+    noncritical_errors: list[str] = []
     schedule: list[dict[str, Any]] = []
     slate: list[dict[str, Any]] = []
     quant_payload: list[dict[str, Any]] = []
@@ -213,7 +228,7 @@ async def pregame_verify_job(bot: Any, card_date: str | None = None) -> dict[str
         if slate:
             props_payload = await asyncio.to_thread(build_player_props_lab, slate, selected)
     except Exception as error:
-        errors.append(f"Props verification failed: {error}")
+        noncritical_errors.append(f"Props verification failed: {error}")
     stale_props = await asyncio.to_thread(_clear_stale_prop_cache, selected)
     stale_images = await asyncio.to_thread(_clear_stale_image_cache, selected)
     pitchers = sum(
@@ -221,23 +236,35 @@ async def pregame_verify_job(bot: Any, card_date: str | None = None) -> dict[str
         if game.get(key) and game.get(key) != "TBD"
     )
     weather_ok = any(isinstance(game.get("weather"), dict) for game in slate)
-    lineups_ok = any(game.get("lineups") not in (None, "", "unavailable", [], {}) for game in slate)
+    lineup_summary = await asyncio.to_thread(summarize_lineups, slate, selected) if slate else {}
+    confirmed_lineups = int(lineup_summary.get("confirmed_lineups") or 0)
+    projected_lineups = int(lineup_summary.get("projected_lineups") or 0)
+    waiting_lineups = int(lineup_summary.get("games_waiting") or 0)
     props_ok = bool(props_payload.get("all_props")) if isinstance(props_payload, dict) else False
-    ready = bool(schedule and pitchers and weather_ok and storage.get("results_database_healthy") and not errors)
+    player_team_mapping = "checked" if props_payload else "not_required"
+    odds_ok = any(game.get("best_available_prices") not in (None, "", "unavailable", [], {}) for game in slate)
+    ready = bool(schedule and pitchers and weather_ok and odds_ok and storage.get("results_database_healthy") and not errors)
     report = {
         "version": WORKFLOW_VERSION,
         "card_date": selected,
         "created_at": now_et().isoformat(timespec="seconds"),
         "schedule_games": len(schedule),
-        "lineups": "confirmed" if lineups_ok else "not_confirmed",
+        "lineups": "confirmed" if confirmed_lineups else "projected" if projected_lineups else "not_confirmed",
+        "confirmed_lineups": confirmed_lineups,
+        "projected_lineups": projected_lineups,
+        "games_waiting_for_lineups": waiting_lineups,
         "pitchers_verified": pitchers,
         "weather": "available" if weather_ok else "unavailable",
+        "odds": "available" if odds_ok else "unavailable",
+        "injuries": "optional",
+        "player_team_mapping": player_team_mapping,
         "props": "available" if props_ok else "unavailable",
         "stale_props_cleared": stale_props,
         "stale_images_removed": stale_images,
         "storage_healthy": bool(storage.get("results_database_healthy")),
         "ready_for_image_generation": ready,
         "critical_failures": errors,
+        "noncritical_failures": noncritical_errors,
         "elite_quant_slate": quant_payload,
     }
     _write_json(workflow_file(selected, "pregame_verification.json"), report)
@@ -247,9 +274,11 @@ async def pregame_verify_job(bot: Any, card_date: str | None = None) -> dict[str
         f"Lineups: {report['lineups']}\n"
         f"Pitchers: {pitchers}\n"
         f"Weather: {report['weather']}\n"
+        f"Odds: {report['odds']}\n"
         f"Props: {report['props']}\n"
         f"Ready for image generation: {'YES' if ready else 'NO'}\n\n"
-        f"Critical failures: {', '.join(errors) if errors else 'None'}",
+        f"Critical failures: {', '.join(errors) if errors else 'None'}\n"
+        f"Non-critical: {', '.join(noncritical_errors) if noncritical_errors else 'None'}",
     )
     return report
 
@@ -296,6 +325,15 @@ async def generate_cards_job(bot: Any, card_date: str | None = None) -> dict[str
             image_generation_enabled=os.getenv("IMAGE_GENERATION_ENABLED", "").lower() in {"1", "true", "yes", "on"},
         )
         best_hit_image = best_hit_result.get("image_path") or best_hit_result.get("prompt_path")
+        scratched = await asyncio.to_thread(invalidate_scratched_props, selected, slate)
+        if scratched.get("invalidated"):
+            await _notify_admin(
+                bot,
+                "⚠️ Scratched prop detected after generation.\n\n"
+                f"Invalidated: {scratched.get('invalidated')}\n"
+                f"Players: {', '.join(scratched.get('scratched') or [])}\n\n"
+                "Best Hit Prop image should be regenerated before posting if this affected the selected prop.",
+            )
     except Exception as error:
         logging.exception("T-45 generation failed")
         errors.append(str(error))
@@ -320,7 +358,7 @@ async def generate_cards_job(bot: Any, card_date: str | None = None) -> dict[str
         f"Picks saved: {saved_picks}\n"
         f"MLB image/prompt: {image_path or 'Unavailable'}\n"
         f"Best hit image/prompt: {best_hit_image or 'Unavailable'}\n"
-        f"Auto-post approved: {'YES' if _auto_post_approved() else 'NO — waiting for owner approval'}\n"
+        f"Auto-post enabled: {'YES' if _auto_post_enabled() else 'NO — AUTO_POST_ENABLED=false'}\n"
         f"Errors: {', '.join(errors) if errors else 'None'}",
     )
     return status
@@ -333,16 +371,26 @@ async def post_cards_job(bot: Any, card_date: str | None = None) -> dict[str, An
     posted_key = f"posted_mlb_card_{selected}"
     if log.get(posted_key):
         return {"posted": False, "reason": "already_posted"}
-    if not _auto_post_approved():
+    if not _auto_post_enabled():
         log.setdefault(selected, {})["mlb_pregame_post"] = {
-            "status": "waiting_for_approval",
+            "status": "disabled",
             "recorded_at": now_et().isoformat(timespec="seconds"),
+            "reason": "AUTO_POST_ENABLED=false",
         }
         _save_posting_log(log)
-        await _notify_admin(bot, "⏸ T-43 Posting paused. AUTO_POST_APPROVED=false; waiting for owner approval.")
-        return {"posted": False, "reason": "approval_required"}
+        await _notify_admin(bot, "⏸ T-43 Posting skipped. AUTO_POST_ENABLED=false.")
+        return {"posted": False, "reason": "auto_post_disabled"}
     verification = _read_json(workflow_file(selected, "pregame_verification.json"), {})
     generation = _read_json(workflow_file(selected, "generation_status.json"), {})
+    if not generation.get("generated"):
+        log.setdefault(selected, {})["mlb_pregame_post"] = {
+            "status": "blocked",
+            "recorded_at": now_et().isoformat(timespec="seconds"),
+            "reason": "generation_not_completed",
+        }
+        _save_posting_log(log)
+        await _notify_admin(bot, "❌ T-43 Posting blocked: T-45 generation is not complete.")
+        return {"posted": False, "reason": "generation_not_completed", "generation": generation}
     if not verification.get("ready_for_image_generation"):
         log.setdefault(selected, {})["mlb_pregame_post"] = {
             "status": "blocked",
@@ -352,7 +400,7 @@ async def post_cards_job(bot: Any, card_date: str | None = None) -> dict[str, An
         _save_posting_log(log)
         await _notify_admin(bot, "❌ T-43 Posting blocked: critical pregame verification did not pass. Manual override required.")
         return {"posted": False, "reason": "critical_verification_failed", "verification": verification}
-    gate = await asyncio.to_thread(run_prepost_quality_gate)
+    gate = await asyncio.to_thread(run_prepost_quality_gate, selected)
     if not gate.get("ready_to_post"):
         log.setdefault(selected, {})["mlb_pregame_post"] = {
             "status": "blocked",
@@ -360,7 +408,12 @@ async def post_cards_job(bot: Any, card_date: str | None = None) -> dict[str, An
             "reason": "prepost_check_failed",
         }
         _save_posting_log(log)
-        await _notify_admin(bot, "❌ T-43 Posting blocked by prepost_check. Manual override required.")
+        failures = gate.get("failures") or []
+        await _notify_admin(
+            bot,
+            "❌ T-43 Posting blocked by PrePost Check.\n\n"
+            + ("\n".join(f"• {failure}" for failure in failures[:25]) if failures else "No detailed failures returned.")
+        )
         return {"posted": False, "reason": "prepost_check_failed", "gate": gate}
     card_path = data_file("generated_cards") / selected / "mlb_card.txt"
     card = card_path.read_text(encoding="utf-8") if card_path.exists() else ""
@@ -369,7 +422,7 @@ async def post_cards_job(bot: Any, card_date: str | None = None) -> dict[str, An
         return {"posted": False, "reason": "missing_card"}
     posts = [
         ("FREE_CHANNEL_ID", _free_channel_posts(card, selected)),
-        ("VIP_CHANNEL_ID", _vip_channel_posts(card)),
+        ("VIP_CHANNEL_ID", _vip_channel_posts(card, selected)),
     ]
     sent = []
     for env_name, messages in posts:
@@ -383,6 +436,15 @@ async def post_cards_job(bot: Any, card_date: str | None = None) -> dict[str, An
         except Exception as error:
             logging.exception("T-43 post failed for %s", env_name)
             await _notify_admin(bot, f"❌ T-43 post failed for {env_name}: {error}")
+    if not sent:
+        log.setdefault(selected, {})["mlb_pregame_post"] = {
+            "status": "blocked",
+            "recorded_at": now_et().isoformat(timespec="seconds"),
+            "reason": "no_destinations_sent",
+        }
+        _save_posting_log(log)
+        await _notify_admin(bot, "❌ T-43 Posting blocked: no FREE_CHANNEL_ID or VIP_CHANNEL_ID destination accepted posts.")
+        return {"posted": False, "reason": "no_destinations_sent"}
     log[posted_key] = True
     log.setdefault(selected, {})["mlb_pregame_post"] = {
         "status": "sent",
@@ -401,11 +463,11 @@ def _section(card: str, heading: str) -> str:
     end = len(card)
     for marker in (
         "🔥 PLAY OF THE DAY",
-        "🏆 TOP 2 MONEYLINE",
-        "🔥 TOP 2 F5 MONEYLINE",
-        "📈 TOP 2 RUNLINE/SPREAD",
-        "🎯 TOP 2 OVER/UNDER TOTAL RUNS",
-        "💰 TOP 2 TEAM TOTALS",
+        "🏆 TOP 5 MONEYLINE",
+        "🔥 TOP 5 F5",
+        "📈 TOP 5 RUN LINE",
+        "🎯 TOP 5 GAME TOTALS",
+        "💰 TOP 5 TEAM TOTALS",
         "🧩 2-LEG SAFE PARLAY",
         "💎 WANT THE FULL BETGPTAI",
     ):
@@ -485,13 +547,31 @@ def _best_hit_text(card_date: str) -> str:
     )
 
 
+def _safe_parlay_text(card_date: str) -> str:
+    """Render the saved official parlay legs in the premium shared format."""
+    picks = _read_json(data_file("picks.json"), [])
+    if not isinstance(picks, list):
+        return "No Safe 2-Leg Parlay qualified today."
+    parlay = next(
+        (
+            pick for pick in reversed(picks)
+            if isinstance(pick, dict)
+            and str(pick.get("card_date") or pick.get("date") or "") == card_date
+            and pick.get("category") == "parlay"
+        ),
+        None,
+    )
+    legs = parlay.get("legs") if isinstance(parlay, dict) else []
+    return render_safe_parlay(legs if isinstance(legs, list) else [], card_date=card_date)
+
+
 def _top_mlb_plays(card: str) -> str:
     sections = [
-        _section(card, "🏆 TOP 2 MONEYLINE"),
-        _section(card, "🔥 TOP 2 F5 MONEYLINE"),
-        _section(card, "📈 TOP 2 RUNLINE/SPREAD"),
-        _section(card, "🎯 TOP 2 OVER/UNDER TOTAL RUNS"),
-        _section(card, "💰 TOP 2 TEAM TOTALS"),
+        _section(card, "🏆 TOP 5 MONEYLINE"),
+        _section(card, "🔥 TOP 5 F5"),
+        _section(card, "📈 TOP 5 RUN LINE"),
+        _section(card, "🎯 TOP 5 GAME TOTALS"),
+        _section(card, "💰 TOP 5 TEAM TOTALS"),
     ]
     body = "\n\n━━━━━━━━━━━━\n\n".join(
         _clean_channel_section(section) for section in sections if section
@@ -500,29 +580,26 @@ def _top_mlb_plays(card: str) -> str:
 
 
 def _free_channel_posts(card: str, card_date: str) -> list[str]:
-    play = _clean_channel_section(_section(card, "🔥 PLAY OF THE DAY")) or "🔥 PLAY OF THE DAY\n\nPending."
-    parlay = _clean_channel_section(_section(card, "🧩 2-LEG SAFE PARLAY")) or "🧩 SAFE PARLAY\n\nPending."
+    best_hit = _best_hit_text(card_date)
+    parlay = _safe_parlay_text(card_date)
     return [
-        f"{play}\n\n━━━━━━━━━━━━\n\n{_footer()}",
-        (
-            "⚾ TOP MLB PLAYS\n\n"
-            f"{_best_hit_text(card_date)}\n\n"
-            "━━━━━━━━━━━━\n\n"
-            f"{parlay}\n\n"
-            "Tap /vip for the full BETGPTAI card.\n\n"
-            "━━━━━━━━━━━━\n\n"
-            f"{_footer()}"
-        ),
+        render_play_of_day_card(card_date),
+        render_mlb_premium_card(card_date),
+        f"{best_hit}\n\n━━━━━━━━━━━━\n\n{_footer()}",
+        f"{parlay}\n\nTap /vip for the full BETGPTAI card.",
     ]
 
 
-def _vip_channel_posts(card: str) -> list[str]:
-    play = _clean_channel_section(_section(card, "🔥 PLAY OF THE DAY")) or "🔥 PLAY OF THE DAY\n\nPending."
-    top_plays = _top_mlb_plays(card)
-    vault = _clean_channel_section(_section(card, "🧩 2-LEG SAFE PARLAY")) or "VIP Vault is pending."
+def _vip_channel_posts(card: str, card_date: str) -> list[str]:
+    vault = _safe_parlay_text(card_date)
     return [
-        f"{play}\n\n━━━━━━━━━━━━\n\n{_footer()}",
-        f"⚾ TOP MLB PLAYS\n\n{top_plays}\n\n━━━━━━━━━━━━\n\n{_footer()}",
+        render_mlb_premium_card(card_date),
+        render_category_card(card_date, "🏆 TOP 5 MONEYLINE", "moneyline"),
+        render_category_card(card_date, "📈 TOP 5 RUNLINE", "runline"),
+        render_category_card(card_date, "🔥 TOP 5 F5 MONEYLINE", "f5_moneyline"),
+        render_category_card(card_date, "🎯 TOP 5 TOTALS", "total"),
+        render_category_card(card_date, "💰 TOP 5 TEAM TOTALS", "team_total"),
+        f"⚾ FULL PROP CARD\n\n{_best_hit_text(card_date)}\n\nMore verified props pending admin approval.\n\n━━━━━━━━━━━━\n\n{_footer()}",
         f"🔥 BETGPTAI VIP VAULT\n\n{vault}\n\n━━━━━━━━━━━━\n\n{_footer()}",
     ]
 

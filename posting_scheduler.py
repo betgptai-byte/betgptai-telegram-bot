@@ -33,6 +33,8 @@ from daily_workflow import (
     workflow_status,
 )
 from game_time import parse_game_time
+from lineup_verification import invalidate_scratched_props, summarize_lineups
+from best_hit_prop_image import prepare_best_hit_prop_image
 from mlb_auto_image import prepare_mlb_auto_image
 from mlb_data import get_combined_slate, get_mlb_schedule
 from model_report import save_model_report
@@ -643,8 +645,34 @@ def scheduler_status_text(day: str | None = None) -> str:
         f"T-50 Verification: {verification.get('ready_for_image_generation', 'Not run')}\n"
         f"T-45 Generation: {generation.get('generated', 'Not run')}\n"
         f"T-43 Posting: {posting.get('status', 'Not run')}\n"
-        f"Approval required: {'✅ Yes' if payload.get('approval_required') else '❌ No'}\n"
+        f"Auto Posting: {'✅ Enabled' if payload.get('auto_post_enabled') else '❌ Disabled'}\n"
         f"Last scheduler error: {payload.get('last_scheduler_error', 'None')}"
+    )
+
+
+def post_status_text(day: str | None = None) -> str:
+    """Owner-facing status for automatic T-43 channel posting."""
+    selected_day = day or official_sports_date().isoformat()
+    payload = workflow_status(selected_day)
+    verification = payload.get("verification") if isinstance(payload.get("verification"), dict) else {}
+    generation = payload.get("generation") if isinstance(payload.get("generation"), dict) else {}
+    posting = payload.get("posting") if isinstance(payload.get("posting"), dict) else {}
+    times = payload.get("times") if isinstance(payload.get("times"), dict) else {}
+    log = _read_log()
+    posted_today = bool(log.get(f"posted_mlb_card_{selected_day}"))
+    images_ready = bool(generation.get("mlb_image") or generation.get("best_hit_image"))
+    scheduler_payload = log.get("scheduler", {}) if isinstance(log.get("scheduler"), dict) else {}
+    return (
+        "📡 BETGPTAI POST STATUS\n\n"
+        f"Auto Posting:\n{'Enabled ✅' if payload.get('auto_post_enabled') else 'Disabled ❌'}\n\n"
+        f"Verification:\n{'Passed ✅' if verification.get('ready_for_image_generation') else 'Failed/Pending ❌'}\n\n"
+        f"Generation:\n{'Completed ✅' if generation.get('generated') else 'Pending'}\n\n"
+        f"Images:\n{'Ready ✅' if images_ready else 'Pending'}\n\n"
+        f"Posted Today:\n{'Yes ✅' if posted_today else 'No ❌'}\n\n"
+        f"Next Scheduled Post:\n{times.get('post_time_et') or 'Unavailable'}\n\n"
+        f"Timezone:\n{get_app_timezone()}\n\n"
+        f"Scheduler Running:\n{'Yes ✅' if scheduler_payload.get('last_checked_at') else 'Unknown'}\n\n"
+        f"Last Posting Status:\n{posting.get('status', 'Not run')}"
     )
 
 
@@ -678,8 +706,8 @@ async def _process_three_step_pregame_workflow(bot: Any, day: str, current: date
             continue
         if (
             isinstance(entry, dict)
-            and entry.get("status") == "waiting_for_approval"
-            and os.getenv("AUTO_POST_APPROVED", "false").strip().lower() not in {"1", "true", "yes", "on"}
+            and entry.get("status") == "disabled"
+            and os.getenv("AUTO_POST_ENABLED", "false").strip().lower() not in {"1", "true", "yes", "on"}
         ):
             continue
         if current < due_time:
@@ -690,8 +718,8 @@ async def _process_three_step_pregame_workflow(bot: Any, day: str, current: date
         try:
             result = await function(bot, day)
             status = (
-                "waiting_for_approval"
-                if isinstance(result, dict) and result.get("reason") == "approval_required"
+                "disabled"
+                if isinstance(result, dict) and result.get("reason") == "auto_post_disabled"
                 else "blocked"
                 if isinstance(result, dict) and result.get("posted") is False and job_id == "post_cards"
                 else "sent"
@@ -715,10 +743,71 @@ async def _process_three_step_pregame_workflow(bot: Any, day: str, current: date
             _write_log(log)
 
 
+async def _refresh_lineup_states(bot: Any, day: str, current: datetime) -> None:
+    """Refresh lineup states every 5 minutes beginning 90 minutes pregame."""
+    times = schedule_times(day)
+    first_pitch = times.get("first_pitch_et")
+    if first_pitch is None or current < first_pitch - timedelta(minutes=90):
+        return
+    log = _read_log()
+    refresh_entry = log.get(day, {}).get("lineup_refresh", {})
+    if isinstance(refresh_entry, dict):
+        last = parse_game_time(refresh_entry.get("recorded_at"))
+        if last and (current - last).total_seconds() < 300:
+            return
+    try:
+        slate = await asyncio.to_thread(
+            get_combined_slate,
+            os.getenv("ODDS_API_KEY", ""),
+            game_date=day,
+            highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+        )
+        payload = await asyncio.to_thread(summarize_lineups, slate, day)
+        scratched = await asyncio.to_thread(invalidate_scratched_props, day, slate)
+        log = _read_log()
+        log.setdefault(day, {})["lineup_refresh"] = {
+            "status": "sent",
+            "recorded_at": current.isoformat(),
+            "confirmed_lineups": payload.get("confirmed_lineups", 0),
+            "projected_lineups": payload.get("projected_lineups", 0),
+            "games_waiting": payload.get("games_waiting", 0),
+            "scratched_invalidated": scratched.get("invalidated", 0),
+        }
+        _write_log(log)
+        if scratched.get("invalidated"):
+            image_result = await asyncio.to_thread(
+                prepare_best_hit_prop_image,
+                slate,
+                day,
+                image_generation_enabled=os.getenv("IMAGE_GENERATION_ENABLED", "").lower() in {"1", "true", "yes", "on"},
+            )
+            admin_id = os.getenv("MY_TELEGRAM_ID", "").strip()
+            if admin_id:
+                await _send_long(
+                    bot,
+                    int(admin_id),
+                    "⚠️ BETGPTAI PROP SCRATCH ALERT\n\n"
+                    f"Invalidated props: {scratched.get('invalidated')}\n"
+                    f"Players: {', '.join(scratched.get('scratched') or [])}\n\n"
+                    f"Best Hit Prop regenerated: {image_result.get('image_path') or image_result.get('prompt_path') or image_result.get('status')}",
+                )
+    except Exception as error:
+        logging.exception("Lineup refresh failed")
+        log = _read_log()
+        log["last_scheduler_error"] = f"lineup_refresh: {error}"
+        log.setdefault(day, {})["lineup_refresh"] = {
+            "status": "failed",
+            "recorded_at": current.isoformat(),
+            "detail": str(error),
+        }
+        _write_log(log)
+
+
 async def process_game_aware_posts(bot: Any, now: datetime | None = None) -> None:
     """Evaluate due pregame cards and end-of-day results exactly once."""
     current = (now or now_et()).astimezone(get_app_timezone())
     day = official_sports_date(current).isoformat()
+    await _refresh_lineup_states(bot, day, current)
     await _process_three_step_pregame_workflow(bot, day, current)
     # End-of-day results remain separate from the pregame workflow.
     await post_daily_results_if_ready(bot, now=current)

@@ -181,7 +181,7 @@ def select_best_hit_prop(
                 "verified": True,
                 "status": check.get("lineup_status"),
                 "lineup_spot": check.get("lineup_spot"),
-                "reason": "Confirmed by MLB Stats API boxscore.",
+                "reason": check.get("reason") or "Lineup context verified.",
             }
             return prop, rejections
         rejections.append(f"{prop.get('player_name')}: {check.get('reason')}")
@@ -230,7 +230,7 @@ def _approved_verified_prop(card_date: str, slate: list[dict[str, Any]]) -> tupl
                 "verified": True,
                 "status": check.get("lineup_status"),
                 "lineup_spot": check.get("lineup_spot"),
-                "reason": "Confirmed by MLB Stats API boxscore.",
+                "reason": check.get("reason") or "Lineup context verified.",
             }
             return prop, rejections
         rejections.append(f"{prop.get('player_name')}: {check.get('reason')}")

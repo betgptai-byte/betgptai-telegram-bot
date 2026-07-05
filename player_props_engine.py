@@ -21,7 +21,9 @@ from zoneinfo import ZoneInfo
 import requests
 
 from hitting_streaks import get_hitting_streak, hitting_streak_score_adjustment
+from lineup_verification import verify_prop_lineup_state
 from player_verification import verify_player_team
+from premium_card_formatter import render_prop_block
 from storage import data_file
 
 
@@ -208,13 +210,15 @@ def _team_side(game: dict[str, Any], side: str) -> dict[str, Any]:
     matchups = _dict(savant.get("pitch_type_matchups"))
     away_team = game.get("away_team")
     home_team = game.get("home_team")
+    team_name = game.get(f"{side}_team") or game.get(f"{side}_team_name") or (away_team if side == "away" else home_team)
+    opponent_name = game.get(f"{opponent}_team") or game.get(f"{opponent}_team_name") or (home_team if side == "away" else away_team)
     game_matchup = f"{away_team} @ {home_team}" if away_team and home_team else "Matchup unavailable"
     return {
         "side": side,
-        "team": game.get(f"{side}_team"),
-        "team_name": game.get(f"{side}_team"),
-        "opponent": game.get(f"{opponent}_team"),
-        "opponent_name": game.get(f"{opponent}_team"),
+        "team": team_name,
+        "team_name": team_name,
+        "opponent": opponent_name,
+        "opponent_name": opponent_name,
         "game_matchup": game_matchup,
         "game_pk": game.get("game_pk") or game.get("game_id"),
         "game_time": game.get("game_time"),
@@ -390,6 +394,7 @@ def _base_prop(
             "lineups_available": context.get("lineups_available"),
             "opposing_pitcher": context.get("opposing_pitcher"),
         },
+        "projected_batting_position": None,
     }
 
 
@@ -461,6 +466,7 @@ def _build_hitter_props(context: dict[str, Any]) -> tuple[list[dict[str, Any]], 
                 reason=reason or "Batter profile supports contact upside.",
             )
             if prop:
+                prop["projected_batting_position"] = lineup_index
                 prop["hitting_streak"] = streak
                 prop["hitting_streak_adjustment"] = streak_adjustment
                 prop["savant_verification"] = {
@@ -477,7 +483,8 @@ def _build_hitter_props(context: dict[str, Any]) -> tuple[list[dict[str, Any]], 
                 }
                 prop["lineup_verification"] = {
                     "verified": True,
-                    "status": "projected_lineup",
+                    "state": "Projected",
+                    "status": "projected",
                     "lineup_spot": lineup_index,
                     "reason": (
                         "Confirmed lineup data available."
@@ -511,6 +518,7 @@ def _build_hitter_props(context: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             score=hr_score, reason=hr_reason or "Power indicators create a HR watch spot.",
         )
         if prop:
+            prop["projected_batting_position"] = lineup_index
             prop["hitting_streak"] = streak
             prop["hitting_streak_adjustment"] = streak_adjustment
             prop["savant_verification"] = {
@@ -527,7 +535,8 @@ def _build_hitter_props(context: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             }
             prop["lineup_verification"] = {
                 "verified": True,
-                "status": "projected_lineup",
+                "state": "Projected",
+                "status": "projected",
                 "lineup_spot": lineup_index,
                 "reason": (
                     "Confirmed lineup data available."
@@ -546,6 +555,7 @@ def _build_hitter_props(context: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             reason="Speed/OBP proxy creates a stolen-base watch, but lineup and catcher data should be confirmed.",
         )
         if prop:
+            prop["projected_batting_position"] = lineup_index
             prop["hitting_streak"] = streak
             prop["hitting_streak_adjustment"] = streak_adjustment
             created.append(prop)
@@ -640,6 +650,19 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
             if verification.get("current_team"):
                 prop["team_name"] = verification.get("current_team")
                 prop["team"] = verification.get("current_team")
+            if prop.get("prop_type") in {"hits", "2_plus_hits", "home_runs", "rbis", "runs", "total_bases", "walks", "stolen_bases"}:
+                lineup_state = verify_prop_lineup_state(prop, slate)
+                prop["lineup_verification"] = lineup_state
+                if lineup_state.get("state") == "Scratched":
+                    verification_issues.append(
+                        f"{prop.get('player_name')} removed from {prop.get('prop_type')}: scratched/not in confirmed lineup."
+                    )
+                    continue
+                if not lineup_state.get("verified"):
+                    verification_issues.append(
+                        f"{prop.get('player_name')} removed from {prop.get('prop_type')}: {lineup_state.get('reason')}"
+                    )
+                    continue
             verified_props.append(prop)
         else:
             verification_issues.append(
@@ -887,23 +910,9 @@ def _format_prop(item: dict[str, Any] | None, label: str, player_label: str = "P
         )
     item = _ensure_prop_display_fields(item) or item
     del player_label
-    streak_lines = _hitting_streak_lines(item)
-    streak_block = ("\n".join(streak_lines) + "\n\n") if streak_lines else ""
-    return (
-        f"{label}\n"
-        "\n"
-        f"👤 {item.get('player_name')}\n"
-        f"🧢 {item.get('team_name')}\n"
-        f"🆚 {item.get('opponent_name')}\n"
-        f"🕒 {item.get('game_time_et')}\n\n"
-        "🎯 Prop:\n"
-        f"{_prop_display(item)}\n\n"
-        f"{streak_block}"
-        "⭐ Confidence:\n"
-        f"{item.get('confidence_grade')}\n\n"
-        "📈 Why:\n"
-        f"{item.get('reason')}"
-    )
+    display = dict(item)
+    display["pick_text"] = f"{display.get('player_name')} — {_prop_display(display)}"
+    return render_prop_block(display, label=label)
 
 
 def render_props_admin_card(payload: dict[str, Any]) -> str:
@@ -947,28 +956,9 @@ def render_prop_type_card(payload: dict[str, Any], prop_type: str) -> str:
     ]
     for index, item in enumerate(items[:7], start=1):
         item = _ensure_prop_display_fields(item) or item
-        streak_lines = _hitting_streak_lines(item)
-        entry_lines = [
-            f"{index}.",
-            f"👤 {item.get('player_name')}",
-            f"🧢 {item.get('team_name')}",
-            f"🆚 {item.get('opponent_name')}",
-            f"🕒 {item.get('game_time_et')}",
-            "",
-            "🎯 Prop:",
-            _prop_display(item),
-            "",
-            "⭐ Confidence:",
-            str(item.get("confidence_grade")),
-            "",
-            "📈 Why:",
-            str(item.get("reason")),
-            f"Prop ID: {item.get('prop_id')}",
-            "",
-        ]
-        if streak_lines:
-            entry_lines[9:9] = [*streak_lines, ""]
-        lines.extend(entry_lines)
+        display = dict(item)
+        display["pick_text"] = f"{display.get('player_name')} — {_prop_display(display)}"
+        lines.append(render_prop_block(display, label=f"PROP ID: {item.get('prop_id')}", rank=index))
     if not items:
         lines.append("No qualified candidates available from current data.")
     lines.extend(["━━━━━━━━━━━━", "", "⚠️ Admin-only test card. Not posted to members."])

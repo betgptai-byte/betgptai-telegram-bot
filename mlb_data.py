@@ -18,6 +18,7 @@ from api_sports_baseball import (
 from fangraphs_data import merge_fangraphs_data
 from highlightly_data import merge_highlightly_data
 from model_engines import enrich_slate_with_internal_models
+from quant_engine import enrich_slate_with_quant_scores
 from savant_data import merge_savant_data
 from thesportsdb_data import (
     get_baseball_events,
@@ -432,4 +433,11 @@ def get_combined_slate(
         slate = enrich_slate_with_internal_models(slate)
     except Exception:
         logging.warning("Internal model engines unavailable; continuing", exc_info=True)
+    try:
+        # BETGPTAI v20 is the official deterministic quant layer. It scores the
+        # verified API slate before AI sees it, so AI can rank/explain but never
+        # invent missing stats.
+        slate = enrich_slate_with_quant_scores(slate, selected_date)
+    except Exception:
+        logging.warning("BETGPTAI v20 quant engine unavailable; continuing", exc_info=True)
     return slate

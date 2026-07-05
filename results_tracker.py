@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 from game_time import parse_game_time
+from quant_engine import enrich_slate_with_quant_scores
 from storage import data_file
 
 
@@ -27,6 +28,10 @@ DIVIDER = "━━━━━━━━━━━━"
 VALID_MARKET_TYPES = {
     "moneyline", "f5_moneyline", "runline", "total", "team_total", "parlay"
 }
+V20_SCORE_FIELDS = (
+    "sp_score", "offense_score", "bullpen_score", "defense_score",
+    "weather_park_score", "market_value_score", "situational_score",
+)
 FINAL_RESULTS = {"win", "loss", "push"}
 PENDING_RESULT = "pending"
 EASTERN = ZoneInfo("America/New_York")
@@ -235,6 +240,14 @@ def _normalize_saved_pick(
     pick.setdefault("units_risked", 1)
     pick.setdefault("created_at", _now_iso())
     pick.setdefault("graded_at", None)
+    pick.setdefault("model_version", "BETGPTAI v20.0")
+    pick.setdefault("component_scores", {})
+    for field in V20_SCORE_FIELDS:
+        pick.setdefault(field, None)
+    pick.setdefault("final_edge_score", None)
+    pick.setdefault("confidence", None)
+    pick.setdefault("risk_level", None)
+    pick.setdefault("data_quality_grade", None)
     pick.setdefault("pick_id", _official_pick_id(pick))
     return pick
 
@@ -277,7 +290,11 @@ def get_todays_hub_picks() -> dict[str, Any]:
         if len(legs) < 2 and isinstance(parlay.get("selection"), str):
             legs = [part.strip() for part in parlay["selection"].split(" + ")][:2]
 
-    return {"play_of_day": play, "parlay_legs": legs if len(legs) == 2 else []}
+    return {
+        "play_of_day": play,
+        "parlay_legs": legs if len(legs) == 2 else [],
+        "parlay_leg_details": leg_details if len(leg_details) == 2 else [],
+    }
 
 
 def get_most_recent_featured_picks(
@@ -490,6 +507,67 @@ def _market_key(pick_type: str) -> str:
     }[pick_type]
 
 
+def _quant_payload(resolved: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return the v20 engine payload attached to a resolved slate game."""
+    if not isinstance(resolved, dict):
+        return {}
+    payload = resolved.get("betgptai_quant_v20") or resolved.get("betgptai_internal")
+    if isinstance(payload, dict) and isinstance(payload.get("v20"), dict):
+        payload = payload["v20"]
+    return payload if isinstance(payload, dict) else {}
+
+
+def _average_quant_from_legs(legs: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """Build an auditable v20 summary for a parlay from its saved legs."""
+    if not legs:
+        return {}
+    numeric: dict[str, list[float]] = {field: [] for field in V20_SCORE_FIELDS}
+    numeric["final_edge_score"] = []
+    for leg in legs:
+        if not isinstance(leg, dict):
+            continue
+        for field in (*V20_SCORE_FIELDS, "final_edge_score"):
+            value = leg.get(field)
+            if isinstance(value, (int, float)):
+                numeric[field].append(float(value))
+    averaged = {
+        field: round(sum(values) / len(values), 2)
+        for field, values in numeric.items()
+        if values
+    }
+    if not averaged:
+        return {}
+    return {
+        "model_version": "BETGPTAI v20.0",
+        "component_scores": {
+            field: averaged.get(field)
+            for field in V20_SCORE_FIELDS
+            if field in averaged
+        },
+        **averaged,
+        "confidence": "Parlay",
+        "risk_level": "High",
+        "data_quality_grade": "Leg Average",
+    }
+
+
+def _apply_quant_fields(record: dict[str, Any], quant: dict[str, Any]) -> None:
+    """Persist the engine context required for grading and learning."""
+    components = quant.get("component_scores") if isinstance(quant.get("component_scores"), dict) else {}
+    record["model_version"] = quant.get("model_version") or "BETGPTAI v20.0"
+    record["component_scores"] = {
+        field: quant.get(field, components.get(field))
+        for field in V20_SCORE_FIELDS
+        if quant.get(field, components.get(field)) is not None
+    }
+    for field in V20_SCORE_FIELDS:
+        record[field] = quant.get(field, components.get(field))
+    record["final_edge_score"] = quant.get("final_edge_score")
+    record["confidence"] = quant.get("confidence")
+    record["risk_level"] = quant.get("risk_level")
+    record["data_quality_grade"] = quant.get("data_quality_grade")
+
+
 def _pick_record(
     *,
     selected_date: str,
@@ -526,6 +604,8 @@ def _pick_record(
         "game_time": resolved.get("game_time"),
         "game_time_et": _game_time_et(resolved.get("game_time")),
         "game_status": resolved.get("status"),
+        "venue": resolved.get("venue"),
+        "ballpark": resolved.get("venue"),
         "market_type": pick_type,
         "pick_type": pick_type,
         "source_command": source_command,
@@ -546,7 +626,11 @@ def _pick_record(
         "created_at": _now_iso(),
         "graded_at": None,
     }
+    _apply_quant_fields(record, _quant_payload(resolved))
     if legs:
+        parlay_quant = _average_quant_from_legs(legs)
+        if parlay_quant:
+            _apply_quant_fields(record, parlay_quant)
         record["legs"] = legs
         record["game_id"] = [leg.get("game_id") for leg in legs]
         record["game_pk"] = [leg.get("game_pk") or leg.get("game_id") for leg in legs]
@@ -594,8 +678,11 @@ def _resolve_pick(
             "home_team": game.get("home_team"),
             "game_time": game.get("game_time"),
             "status": game.get("status"),
+            "venue": game.get("venue"),
             "line": None,
             "odds": None,
+            "betgptai_quant_v20": game.get("betgptai_quant_v20"),
+            "betgptai_internal": game.get("betgptai_internal"),
         }
 
     for game in slate:
@@ -657,6 +744,28 @@ def _resolve_pick(
         if len(context_matches) == 1:
             candidates = context_matches
 
+    if len(candidates) != 1 and pick_type == "team_total" and team_total is not None:
+        matching_games = [
+            game for game in slate
+            if any(
+                _teams_match(str(game.get(key, "")), selected_team)
+                for key in ("away_team", "home_team")
+            )
+        ]
+        if len(matching_games) == 1:
+            game = matching_games[0]
+            return {
+                "game_id": game.get("game_id"),
+                "away_team": game.get("away_team"),
+                "home_team": game.get("home_team"),
+                "game_time": game.get("game_time"),
+                "status": game.get("status"),
+                "venue": game.get("venue"),
+                "line": team_total["line"],
+                "odds": displayed_odds,
+                "betgptai_quant_v20": game.get("betgptai_quant_v20"),
+                "betgptai_internal": game.get("betgptai_internal"),
+            }
     if len(candidates) != 1:
         return None
     game, wager = candidates[0]
@@ -666,8 +775,11 @@ def _resolve_pick(
         "home_team": game.get("home_team"),
         "game_time": game.get("game_time"),
         "status": game.get("status"),
+        "venue": game.get("venue"),
         "line": point,
         "odds": displayed_odds if displayed_odds is not None else wager.get("price"),
+        "betgptai_quant_v20": game.get("betgptai_quant_v20"),
+        "betgptai_internal": game.get("betgptai_internal"),
     }
 
 
@@ -763,11 +875,15 @@ def extract_official_picks(
         ("moneyline", "🏆 TOP 2 MONEYLINE", False),
         ("moneyline", "🏆 TOP 5 MONEYLINE", False),
         ("f5_moneyline", "🔥 TOP 2 F5 MONEYLINE", False),
+        ("f5_moneyline", "🔥 TOP 5 F5", False),
+        ("f5_moneyline", "🔥 TOP 5 F5 MONEYLINE", False),
         ("f5_moneyline", "🔥 F5 MONEYLINE LEAN", True),
         ("runline", "📈 TOP 2 RUNLINE/SPREAD", False),
         ("runline", "📈 TOP 5 RUNLINE/SPREAD", False),
+        ("runline", "📈 TOP 5 RUN LINE", False),
         ("total", "🎯 TOP 2 OVER/UNDER TOTAL RUNS", False),
         ("total", "🎯 TOP 5 OVER/UNDER TOTAL RUNS", False),
+        ("total", "🎯 TOP 5 GAME TOTALS", False),
         ("team_total", "💰 TOP 2 TEAM TOTALS", False),
         ("team_total", "💰 TEAM TOTAL ANGLE", True),
         ("team_total", "💰 TOP 5 TEAM TOTALS", False),
@@ -838,6 +954,11 @@ def save_official_picks(
 ) -> int:
     """Save a generated card immediately, regardless of scheduled game status."""
     existing = load_picks()
+    if slate and not any(game.get("betgptai_quant_v20") for game in slate):
+        try:
+            slate = enrich_slate_with_quant_scores(slate, pick_date)
+        except Exception:
+            logging.exception("BETGPTAI v20 scoring unavailable while saving picks")
     new_picks = extract_official_picks(analysis, slate, pick_date, source_command)
     if not new_picks:
         raise ResultsTrackerError(
@@ -848,6 +969,8 @@ def save_official_picks(
         "pick_id", "card_date", "display_date", "sport", "source_command",
         "game_pk", "home_team", "away_team", "market_type", "pick_text",
         "game_time_et", "status", "created_at", "graded_at",
+        "model_version", "component_scores", "final_edge_score", "confidence",
+        "risk_level", "data_quality_grade",
     }
     for pick in new_picks:
         pick["source_command"] = source_command

@@ -19,6 +19,7 @@ from game_time import format_game_clock
 from mlb_data import get_combined_slate
 from openai_image_generator import generate_image_from_prompt
 from player_props_engine import build_player_props_lab
+from premium_card_formatter import render_pick_block
 from results_tracker import load_picks, save_official_picks
 from storage import data_file
 
@@ -63,7 +64,10 @@ def _candidate_base(game: dict[str, Any], market_type: str, pick_text: str, *, l
         "away_team": game.get("away_team"),
         "home_team": game.get("home_team"),
         "game": f"{game.get('away_team')} @ {game.get('home_team')}",
+        "game_time": game.get("game_time"),
         "game_time_et": format_game_clock(game.get("game_time"), status=game.get("status")),
+        "game_status": game.get("status"),
+        "venue": game.get("venue"),
         "market_type": market_type,
         "pick_text": pick_text,
         "line": line,
@@ -109,6 +113,10 @@ def _ranked_market_candidates(slate: list[dict[str, Any]], market: str, limit: i
                 line = point
             candidate = _candidate_base(game, market_type, pick_text, line=line, odds=price)
             candidate["score"] = _implied_probability(price)
+            candidate["final_edge_score"] = round(candidate["score"] * 100)
+            candidate["confidence"] = "Admin Candidate"
+            candidate["risk_level"] = "Medium"
+            candidate["data_quality_grade"] = "Admin"
             rows.append(candidate)
     rows.sort(key=lambda row: (row.get("score") or 0), reverse=True)
     unique: list[dict[str, Any]] = []
@@ -132,6 +140,10 @@ def _top_f5_candidates(slate: list[dict[str, Any]], limit: int = 5) -> list[dict
         pick_text = f"{candidate['pick_text']} F5 ML"
         row = _candidate_base(game, "f5_moneyline", pick_text, line=None, odds=None)
         row["score"] = candidate.get("score", 0)
+        row["final_edge_score"] = round((row["score"] or 0.86) * 100)
+        row["confidence"] = "Admin Candidate"
+        row["risk_level"] = "Medium"
+        row["data_quality_grade"] = "Admin"
         rows.append(row)
     return rows[:limit]
 
@@ -167,6 +179,10 @@ def _inferred_team_totals(slate: list[dict[str, Any]], limit: int = 5) -> list[d
             odds=None,
         )
         row["score"] = _implied_probability(moneylines[0].get("price")) - (0.05 if direction == "Under" else 0)
+        row["final_edge_score"] = round(row["score"] * 100)
+        row["confidence"] = "Admin Candidate"
+        row["risk_level"] = "Medium"
+        row["data_quality_grade"] = "Admin"
         row["inferred_default"] = True
         inferred.append(row)
         if len(inferred) >= limit:
@@ -216,22 +232,6 @@ def build_mlb_top5_admin_card(
     return report
 
 
-def _render_top5_rows(rows: list[dict[str, Any]]) -> list[str]:
-    if not rows:
-        return [f"{idx}. Unavailable" for idx in range(1, 6)]
-    rendered: list[str] = []
-    for idx, row in enumerate(rows[:5], start=1):
-        rendered.append(
-            f"{idx}. {row.get('pick_text')}\n"
-            f"   🆚 {row.get('game')}\n"
-            f"   🕒 {row.get('game_time_et')}\n"
-            f"   Reason: {row.get('reason')}"
-        )
-    for idx in range(len(rows) + 1, 6):
-        rendered.append(f"{idx}. Unavailable")
-    return rendered
-
-
 def render_mlb_top5_admin_card(report: dict[str, Any]) -> str:
     """Render the admin-only MLB Top 5 card."""
     top5 = _dict(report.get("top5"))
@@ -253,7 +253,14 @@ def render_mlb_top5_admin_card(report: dict[str, Any]) -> str:
         lines.extend(["Build Notes:", *[f"- {item}" for item in errors[:5]], ""])
     for heading, key in sections:
         lines.append(heading)
-        lines.extend(_render_top5_rows(top5.get(key) if isinstance(top5.get(key), list) else []))
+        rows = top5.get(key) if isinstance(top5.get(key), list) else []
+        if not rows:
+            lines.append("No qualified plays available.")
+        else:
+            lines.extend(
+                render_pick_block(row, rank=index, show_data_quality=True)
+                for index, row in enumerate(rows[:5], start=1)
+            )
         lines.append("")
     lines.extend([
         "Rules: F5 is moneyline only. Sportsbook names hidden. Not saved to picks.json.",

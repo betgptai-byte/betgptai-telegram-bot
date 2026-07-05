@@ -28,11 +28,11 @@ NEGATIVE_STYLE = (
 
 SECTION_HEADINGS = {
     "play_of_day": "🔥 PLAY OF THE DAY",
-    "moneyline": "🏆 TOP 2 MONEYLINE",
-    "f5": "🔥 TOP 2 F5 MONEYLINE",
-    "runline": "📈 TOP 2 RUNLINE/SPREAD",
-    "totals": "🎯 TOP 2 OVER/UNDER TOTAL RUNS",
-    "team_totals": "💰 TOP 2 TEAM TOTALS",
+    "moneyline": "🏆 TOP 5 MONEYLINE",
+    "f5": "🔥 TOP 5 F5",
+    "runline": "📈 TOP 5 RUN LINE",
+    "totals": "🎯 TOP 5 GAME TOTALS",
+    "team_totals": "💰 TOP 5 TEAM TOTALS",
     "safe_parlay": "🧩 2-LEG SAFE PARLAY",
 }
 

@@ -21,6 +21,7 @@ from consensus_analysis import (
     public_confidence_summary,
 )
 from model_engines import slate_engine_summary, value_context_for_pick
+from quant_engine import enrich_slate_with_quant_scores
 
 
 DIVIDER = "━━━━━━━━━━━━"
@@ -36,7 +37,7 @@ Premium includes:
 ✅ Top 5 Runline plays
 ✅ Top 5 Totals
 ✅ Team totals
-✅ NRFI/F5 leans
+✅ F5 leans
 ✅ Weather + park factor edges
 ✅ SP vs SP matchup breakdown
 ✅ Bullpen + trend analysis
@@ -86,6 +87,8 @@ def _remember_analysis_metadata(
 
 SPECIALIZED_MLB_CARDS = {
     "f5": ("🔥 F5 MONEYLINE LEAN", "F5 moneyline only; never F5 totals or runlines"),
+    # Legacy/specialized path only. NRFI/YRFI are intentionally excluded from
+    # official v20 cards.
     "nrfi": ("⚾ NRFI LEAN", "NRFI only"),
     "teamtotals": ("💰 TEAM TOTAL ANGLE", "team total only"),
     "parlay": ("🧩 SAFE PARLAY OF THE DAY", "two or three safer standalone legs; no guarantees"),
@@ -308,11 +311,16 @@ def _fallback_candidates(
     """Build ranked fallback candidates from the precomputed best prices."""
     candidates: list[dict[str, Any]] = []
     for game in slate:
+        quant = game.get("betgptai_quant_v20")
+        if isinstance(quant, dict) and quant.get("engine_decision") == "PASS":
+            continue
         for wager in game.get("best_available_prices", []):
             price = wager.get("price")
             if wager.get("market") != market_key or not isinstance(
                 price, (int, float)
             ):
+                continue
+            if market_key == "h2h" and price <= -190:
                 continue
             candidates.append(
                 {
@@ -560,33 +568,33 @@ def build_fallback_card(slate: list[dict[str, Any]]) -> str:
 
 {DIVIDER}
 
-🏆 TOP 2 MONEYLINE
+🏆 TOP 5 MONEYLINE
 
-{_format_fallback_list(moneylines)}
-
-{DIVIDER}
-
-🔥 TOP 2 F5 MONEYLINE
-
-{_format_f5_moneyline_list(moneylines)}
+{_format_fallback_list(moneylines, 5)}
 
 {DIVIDER}
 
-📈 TOP 2 RUNLINE/SPREAD
+🔥 TOP 5 F5
 
-{_format_fallback_list(spreads)}
-
-{DIVIDER}
-
-🎯 TOP 2 OVER/UNDER TOTAL RUNS
-
-{_format_fallback_list(totals)}
+{_format_f5_moneyline_list(moneylines, 5)}
 
 {DIVIDER}
 
-💰 TOP 2 TEAM TOTALS
+📈 TOP 5 RUN LINE
 
-{_format_team_total_list(slate)}
+{_format_fallback_list(spreads, 5)}
+
+{DIVIDER}
+
+🎯 TOP 5 GAME TOTALS
+
+{_format_fallback_list(totals, 5)}
+
+{DIVIDER}
+
+💰 TOP 5 TEAM TOTALS
+
+{_format_team_total_list(slate, 5)}
 
 {DIVIDER}
 
@@ -629,9 +637,9 @@ def _game_for_selection(
 def _add_mlb_game_context(text: str, slate: list[dict[str, Any]]) -> str:
     """Insert deterministic matchup/time blocks beneath every displayed pick."""
     relevant_headings = {
-        "🔥 PLAY OF THE DAY", "🏆 TOP 2 MONEYLINE", "🔥 TOP 2 F5 MONEYLINE",
-        "📈 TOP 2 RUNLINE/SPREAD", "🎯 TOP 2 OVER/UNDER TOTAL RUNS",
-        "💰 TOP 2 TEAM TOTALS", "🧩 2-LEG SAFE PARLAY",
+        "🔥 PLAY OF THE DAY", "🏆 TOP 5 MONEYLINE", "🔥 TOP 5 F5",
+        "📈 TOP 5 RUN LINE", "🎯 TOP 5 GAME TOTALS",
+        "💰 TOP 5 TEAM TOTALS", "🧩 2-LEG SAFE PARLAY",
     }
     chunks = text.split(DIVIDER)
     decorated: list[str] = []
@@ -645,10 +653,10 @@ def _add_mlb_game_context(text: str, slate: list[dict[str, Any]]) -> str:
         for index, line in enumerate(lines):
             output.append(line)
             stripped = line.strip()
-            is_numbered = stripped.startswith(("⚾ ", "1️⃣ ", "2️⃣ ", "✅ "))
-            is_f5 = heading == "🔥 TOP 2 F5 MONEYLINE" and stripped.upper().endswith("F5 ML")
+            is_numbered = stripped.startswith(("⚾ ", "✅ ", *tuple(f"{emoji} " for emoji in NUMBER_EMOJIS)))
+            is_f5 = heading == "🔥 TOP 5 F5" and stripped.upper().endswith("F5 ML")
             is_team_total = (
-                heading == "💰 TOP 2 TEAM TOTALS"
+                heading == "💰 TOP 5 TEAM TOTALS"
                 and "team total" in stripped.lower()
                 and "unavailable" not in stripped.lower()
             )
@@ -668,9 +676,9 @@ def _sort_mlb_card_picks(text: str, slate: list[dict[str, Any]]) -> str:
     chunks = text.split(DIVIDER)
     sorted_chunks: list[str] = []
     list_headings = {
-        "🏆 TOP 2 MONEYLINE", "📈 TOP 2 RUNLINE/SPREAD",
-        "🎯 TOP 2 OVER/UNDER TOTAL RUNS", "🔥 TOP 2 F5 MONEYLINE",
-        "💰 TOP 2 TEAM TOTALS",
+        "🏆 TOP 5 MONEYLINE", "📈 TOP 5 RUN LINE",
+        "🎯 TOP 5 GAME TOTALS", "🔥 TOP 5 F5",
+        "💰 TOP 5 TEAM TOTALS",
     }
     for chunk in chunks:
         heading = next((value for value in list_headings if value in chunk), None)
@@ -678,25 +686,29 @@ def _sort_mlb_card_picks(text: str, slate: list[dict[str, Any]]) -> str:
         if heading:
             starts = [
                 index for index, line in enumerate(lines)
-                if line.strip().startswith(("1️⃣ ", "2️⃣ "))
+                if line.strip().startswith(NUMBER_EMOJIS)
             ]
-            if len(starts) == 2:
+            if len(starts) >= 2:
                 prefix = lines[:starts[0]]
-                suffix_start = len(lines)
                 blocks = [
-                    lines[starts[0]:starts[1]],
-                    lines[starts[1]:suffix_start],
+                    lines[start: starts[index + 1] if index + 1 < len(starts) else len(lines)]
+                    for index, start in enumerate(starts)
                 ]
                 blocks.sort(
                     key=lambda block: game_sort_key(
                         _game_for_selection(block[0], slate) or {}
                     )
                 )
+                rebuilt: list[str] = []
                 for number, block in enumerate(blocks, start=1):
-                    block[0] = re.sub(
-                        r"^(?:1️⃣|2️⃣)", NUMBER_EMOJIS[number - 1], block[0]
-                    )
-                lines = prefix + blocks[0] + blocks[1]
+                    if number <= len(NUMBER_EMOJIS):
+                        block[0] = re.sub(
+                            r"^(?:1️⃣|2️⃣|3️⃣|4️⃣|5️⃣)",
+                            NUMBER_EMOJIS[number - 1],
+                            block[0],
+                        )
+                    rebuilt.extend(block)
+                lines = prefix + rebuilt
         elif "🧩 2-LEG SAFE PARLAY" in chunk:
             indexes = [
                 index for index, line in enumerate(lines)
@@ -743,19 +755,30 @@ def _sanitize_telegram_output(text: str, slate: list[dict[str, Any]]) -> str:
     # Normalize plain headings if the model forgets their display emojis.
     heading_emojis = {
         "PLAY OF THE DAY": "🔥 PLAY OF THE DAY",
-        "TOP 2 MONEYLINE": "🏆 TOP 2 MONEYLINE",
-        "TOP 2 F5 MONEYLINE": "🔥 TOP 2 F5 MONEYLINE",
-        "F5 MONEYLINE LEAN": "🔥 TOP 2 F5 MONEYLINE",
-        "TOP 2 RUNLINE/SPREAD": "📈 TOP 2 RUNLINE/SPREAD",
-        "TOP 2 OVER/UNDER TOTAL RUNS": "🎯 TOP 2 OVER/UNDER TOTAL RUNS",
-        "TOP 2 TEAM TOTALS": "💰 TOP 2 TEAM TOTALS",
-        "TEAM TOTAL ANGLE": "💰 TOP 2 TEAM TOTALS",
+        "TOP 5 MONEYLINE": "🏆 TOP 5 MONEYLINE",
+        "TOP 5 F5": "🔥 TOP 5 F5",
+        "TOP 5 F5 MONEYLINE": "🔥 TOP 5 F5",
+        "TOP 5 RUN LINE": "📈 TOP 5 RUN LINE",
+        "TOP 5 RUNLINE/SPREAD": "📈 TOP 5 RUN LINE",
+        "TOP 5 GAME TOTALS": "🎯 TOP 5 GAME TOTALS",
+        "TOP 5 OVER/UNDER TOTAL RUNS": "🎯 TOP 5 GAME TOTALS",
+        "TOP 5 TEAM TOTALS": "💰 TOP 5 TEAM TOTALS",
+        "TOP 2 MONEYLINE": "🏆 TOP 5 MONEYLINE",
+        "TOP 2 F5 MONEYLINE": "🔥 TOP 5 F5",
+        "F5 MONEYLINE LEAN": "🔥 TOP 5 F5",
+        "TOP 2 RUNLINE/SPREAD": "📈 TOP 5 RUN LINE",
+        "TOP 2 OVER/UNDER TOTAL RUNS": "🎯 TOP 5 GAME TOTALS",
+        "TOP 2 TEAM TOTALS": "💰 TOP 5 TEAM TOTALS",
+        "TEAM TOTAL ANGLE": "💰 TOP 5 TEAM TOTALS",
         "2-LEG SAFE PARLAY": "🧩 2-LEG SAFE PARLAY",
     }
     for heading, decorated_heading in heading_emojis.items():
         cleaned = re.sub(
             rf"(?im)^{re.escape(heading)}$", decorated_heading, cleaned
         )
+    cleaned = re.sub(r"(?im)^🔥 TOP 5 F5 MONEYLINE$", "🔥 TOP 5 F5", cleaned)
+    cleaned = re.sub(r"(?im)^📈 TOP 5 RUNLINE/SPREAD$", "📈 TOP 5 RUN LINE", cleaned)
+    cleaned = re.sub(r"(?im)^🎯 TOP 5 OVER/UNDER TOTAL RUNS$", "🎯 TOP 5 GAME TOTALS", cleaned)
 
     # Member cards should not display American odds because prices vary by
     # sportsbook and state. Market numbers stay inside the pick text itself
@@ -847,7 +870,8 @@ async def _analyze_mlb_slate_with_openai(
     # The model can be changed in .env without editing this Python file.
     model = os.getenv("OPENAI_MODEL", "gpt-5.5")
     instructions = (
-        "You are a careful MLB slate analyst. Use only the supplied schedule, "
+        "You are a careful MLB slate analyst. Use only the supplied BETGPTAI "
+        "v20.0 engine outputs plus the verified schedule, "
         "probable-pitcher stats, Baseball Savant/Statcast metrics, recent form, "
         "optional FanGraphs/pybaseball metrics, weather, park labels, Highlightly "
         "news/injuries/lineups/previews/team stats, and multi-book odds. Never "
@@ -859,8 +883,9 @@ async def _analyze_mlb_slate_with_openai(
         "best price internally. Never reveal a sportsbook or bookmaker name. "
         "Never use the words guaranteed, lock, 99.9%, or sure win. Do not "
         "include Reason lines in the free card; reasons are reserved for VIP. "
-        "You may use betgptai_internal fields as hidden support, but never "
-        "mention internal scoring, formulas, engines, provider names, raw "
+        "The engine calculates; you evaluate and explain. You may use "
+        "betgptai_quant_v20 and betgptai_internal fields as hidden support, "
+        "but never mention internal scoring, formulas, engines, provider names, raw "
         "Savant statistics, or model disagreements to members."
     )
     prompt = f"""
@@ -872,11 +897,11 @@ Follow this exact Telegram layout, including emojis, blank lines, and divider
 lines. Use these section headings in this exact order:
 
 🔥 PLAY OF THE DAY
-🏆 TOP 2 MONEYLINE
-🔥 TOP 2 F5 MONEYLINE
-📈 TOP 2 RUNLINE/SPREAD
-🎯 TOP 2 OVER/UNDER TOTAL RUNS
-💰 TOP 2 TEAM TOTALS
+🏆 TOP 5 MONEYLINE
+🔥 TOP 5 F5
+📈 TOP 5 RUN LINE
+🎯 TOP 5 GAME TOTALS
+💰 TOP 5 TEAM TOTALS
 🧩 2-LEG SAFE PARLAY
 
 PLAY OF THE DAY is the highest-confidence edge, not a guaranteed win. Choose it
@@ -889,15 +914,15 @@ Format PLAY OF THE DAY like this:
 ⚾ [selection]
 Risk Grade: [1-10]
 
-Format each top-two pick like this, using only 1️⃣ and 2️⃣:
+Format each top-five pick like this, using 1️⃣ through 5️⃣:
 
 1️⃣ [selection, including spread or total point when applicable]
 Risk Grade: [1-10, where 10 means highest risk]
 
-For F5, output exactly two moneyline-only leans when available in this format
+For F5, output up to five moneyline-only leans when available in this format
 and no other F5 market:
 
-🔥 TOP 2 F5 MONEYLINE
+🔥 TOP 5 F5
 
 1️⃣ [Team] F5 ML
 Risk Grade: [number]/10
@@ -912,7 +937,7 @@ For every total, include its matchup in the selection so it can be tracked,
 for example: "Under 8.5 (Dodgers at Giants)". Do not add matchups that are not
 part of one of the two selected totals.
 
-For TOP 2 TEAM TOTALS, use official team_total markets when available. If the
+For TOP 5 TEAM TOTALS, use official team_total markets when available. If the
 official team-total market is missing but a team-total side can be inferred from
 the model edge, use the safe default display:
 Team Total Over 4.5 / Safer Alt: Over 3.5
@@ -921,7 +946,7 @@ Team Total Under 5.5 / Safer Alt: Under 6.5
 Only write "Team-total side unavailable from current feed." if no side can be
 inferred.
 
-When real team-total markets are available, output up to two picks in this exact
+When real team-total markets are available, output up to five picks in this exact
 numbered format:
 
 1️⃣ [Team] Team Total [Over/Under] [line]
@@ -943,7 +968,9 @@ chronological scheduled order. The application adds exact ET matchup/time lines.
 Format the parlay as exactly two lines beginning with ✅. Do not include a
 parlay note, disclaimer, or recommendation footer.
 
-Score every MLB game behind the scenes before choosing the free card. Prioritize:
+Use BETGPTAI v20.0 engine_decision as a hard gate. Only select official picks
+from games marked QUALIFIED. If a game is PASS, do not use it as an official
+pick. Score every MLB game behind the scenes before choosing the free card. Prioritize:
 starting-pitcher edge (ERA, WHIP, K-BB %, xERA, xBA/xSLG allowed, Barrel %,
 HardHit %, Whiff %, Chase %), team offense edge (OPS/xwOBA vs handedness, recent
 scoring form, lineup strength), bullpen edge (ERA, WHIP, rest/fatigue, recent
@@ -958,16 +985,20 @@ Market rules: moneyline should be the safest winner profile; runline requires
 team separation plus offensive advantage; totals require weather, SP contact
 quality, bullpen fatigue, and scoring environment; team totals require weak
 opposing SP/bullpen plus offense vs handedness; F5 is always moneyline-only and
-uses starting pitcher plus early offense matchup. FanGraphs fields, when
+uses starting pitcher plus early offense matchup. Moneyline -190 or worse is
+PASS. Moneyline -165 to -189 should usually become run line, F5, team total, or
+opponent +1.5 unless the engine output clearly supports otherwise. FanGraphs fields, when
 available, are internal support for xFIP, SIERA, K-BB %, wRC+, wOBA, ISO, OPS,
 Hard %, Pull %, WAR, and team pitching context. Keep each reason short and do
 not list unavailable fields inside individual pick reasons.
-The slate may include betgptai_internal scoring summaries. Use them only as
+The slate may include betgptai_quant_v20 and betgptai_internal scoring summaries. Use them only as
 behind-the-scenes support. Never show raw model scores, source/provider names,
 AI disagreements, engine names, formulas, or long model logic in Telegram.
 Do not use "guaranteed", "lock", "99.9%", or "sure win". Do not create a list
 merely to fill a quota: write "No additional qualified play" when evidence is
-insufficient. Do not include F5 totals, F5 runlines, NRFI sections, data limitations, extra matchups,
+insufficient. Official markets are only Play of the Day, Top 5 Moneyline, Top 5
+Run Line, Top 5 F5, Top 5 Game Totals, Top 5 Team Totals, and Safe 2-Leg Parlay.
+Do not include F5 totals, F5 runlines, NRFI/YRFI sections, data limitations, extra matchups,
 a full slate, a premium CTA, or a disclaimer. Stop immediately
 after the two-leg parlay note; the application adds the footer itself.
 """.strip()
@@ -984,22 +1015,20 @@ after the two-leg parlay note; the application adds the footer itself.
         raise AIAnalysisError("OpenAI returned an empty analysis.")
     cleaned = _sanitize_telegram_output(analysis, slate)
     required_headings = (
-        "🔥 PLAY OF THE DAY", "🏆 TOP 2 MONEYLINE",
-        "🔥 TOP 2 F5 MONEYLINE",
-        "📈 TOP 2 RUNLINE/SPREAD", "🎯 TOP 2 OVER/UNDER TOTAL RUNS",
-        "💰 TOP 2 TEAM TOTALS",
+        "🔥 PLAY OF THE DAY", "🏆 TOP 5 MONEYLINE",
+        "🔥 TOP 5 F5",
+        "📈 TOP 5 RUN LINE", "🎯 TOP 5 GAME TOTALS",
+        "💰 TOP 5 TEAM TOTALS",
         "🧩 2-LEG SAFE PARLAY",
     )
     if any(heading not in cleaned for heading in required_headings):
         raise AIAnalysisError("OpenAI returned an incomplete Telegram card.")
     forbidden_content = (
-        "TOP 5", "DATA LIMITATIONS", "NRFI", "F5 TOTAL", "F5 RUNLINE",
+        "DATA LIMITATIONS", "NRFI", "YRFI", "F5 TOTAL", "F5 RUNLINE",
         "WANT THE FULL BETGPTAI", "3-LEG",
     )
     if any(value in cleaned.upper() for value in forbidden_content):
         raise AIAnalysisError("OpenAI returned content outside the free card.")
-    if re.search(r"(?m)^(?:3️⃣|4️⃣|5️⃣|[3-9][.)]\s)", cleaned):
-        raise AIAnalysisError("OpenAI returned more than two free picks.")
     # The footer and disclaimer are controlled by code so they stay exact.
     cleaned = re.sub(
         r"Educational analysis only\.\s*Play responsibly\.",
@@ -1018,6 +1047,13 @@ async def analyze_mlb_slate(
 ) -> str:
     """Run both analysts independently and preserve an API-only final fallback."""
     slate = upcoming_mlb_slate(slate)
+    if slate and not any(game.get("betgptai_quant_v20") for game in slate):
+        try:
+            slate = enrich_slate_with_quant_scores(slate)
+        except Exception:
+            # Quant scoring is deterministic but non-blocking; the API-backed
+            # fallback card still works if one engine file has an issue.
+            pass
     if not slate:
         return "No upcoming MLB games are available for today’s free card."
 
@@ -1167,7 +1203,7 @@ def _claude_pick_text(pick: dict[str, Any], prefix: str = "⚾ ") -> str:
     )
 
 
-def _claude_list(data: dict[str, Any], key: str, limit: int = 2) -> str:
+def _claude_list(data: dict[str, Any], key: str, limit: int = 5) -> str:
     picks = data.get(key, [])
     if not isinstance(picks, list) or not picks:
         return "No additional qualified play."
@@ -1177,7 +1213,7 @@ def _claude_list(data: dict[str, Any], key: str, limit: int = 2) -> str:
     )
 
 
-def _claude_f5_list(data: dict[str, Any], limit: int = 2) -> str:
+def _claude_f5_list(data: dict[str, Any], limit: int = 5) -> str:
     """Render Claude F5 leans as moneyline-only picks with no displayed price."""
     picks = data.get("f5_moneyline", [])
     if not isinstance(picks, list) or not picks:
@@ -1202,7 +1238,7 @@ def _claude_f5_list(data: dict[str, Any], limit: int = 2) -> str:
 
 
 def _claude_team_total_list(
-    data: dict[str, Any], slate: list[dict[str, Any]] | None = None, limit: int = 2
+    data: dict[str, Any], slate: list[dict[str, Any]] | None = None, limit: int = 5
 ) -> str:
     """Render team totals with safer one-run alternates when Claude has them."""
     picks = data.get("team_totals", [])
@@ -1245,31 +1281,31 @@ def _build_claude_mlb_card(data: dict[str, Any], slate: list[dict[str, Any]]) ->
 
 {DIVIDER}
 
-🏆 TOP 2 MONEYLINE
+🏆 TOP 5 MONEYLINE
 
 {_claude_list(data, 'moneyline')}
 
 {DIVIDER}
 
-🔥 TOP 2 F5 MONEYLINE
+🔥 TOP 5 F5
 
 {_claude_f5_list(data)}
 
 {DIVIDER}
 
-📈 TOP 2 RUNLINE/SPREAD
+📈 TOP 5 RUN LINE
 
 {_claude_list(data, 'runline')}
 
 {DIVIDER}
 
-🎯 TOP 2 OVER/UNDER TOTAL RUNS
+🎯 TOP 5 GAME TOTALS
 
 {_claude_list(data, 'totals')}
 
 {DIVIDER}
 
-💰 TOP 2 TEAM TOTALS
+💰 TOP 5 TEAM TOTALS
 
 {_claude_team_total_list(data, slate)}
 

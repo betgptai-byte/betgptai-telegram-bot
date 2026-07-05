@@ -50,6 +50,7 @@ from ai_learning_engine import (
     run_learning_review,
 )
 from elite_quant_engine import build_elite_quant_slate
+from edge_database import MODEL_VERSION as QUANT_MODEL_VERSION, WEIGHTS as QUANT_WEIGHTS
 from anime_magazine_generator import (
     generate_daily_magazine_prompts,
     save_magazine_prompts,
@@ -72,6 +73,7 @@ from intelligence_dashboard import (
     render_model_review,
     render_morning_report,
 )
+from lineup_verification import render_lineup_status, summarize_lineups
 from mlb_data import MLBDataError, get_combined_slate
 from mlb_admin_report import (
     build_mlb_admin_report_async,
@@ -142,6 +144,12 @@ from results_tracker import (
     save_soccer_picks,
     update_results_from_mlb,
 )
+from safe_parlay_formatter import render_safe_parlay
+from premium_card_formatter import (
+    render_category_card,
+    render_mlb_premium_card,
+    render_play_of_day_card,
+)
 from today_pick_image import prepare_today_pick_image
 from thesportsdb_data import (
     thesportsdb_enabled,
@@ -151,6 +159,7 @@ from thesportsdb_data import (
     thesportsdb_status_label,
 )
 from posting_scheduler import (
+    post_status_text,
     post_daily_results_if_ready,
     results_auto_status_text,
     run_game_aware_scheduler,
@@ -632,7 +641,7 @@ def _vip_text() -> str:
         "⚾ Full MLB Cards\n"
         "⚾ F5 Plays\n"
         "⚾ Team Totals\n"
-        "⚾ NRFI Leans\n"
+        "⚾ Pregame market edges\n"
         "⚽ Soccer Cards\n"
         "📊 Results Tracking\n\n"
         "━━━━━━━━━━━━\n\n"
@@ -729,55 +738,20 @@ async def _build_today_card_text() -> str | None:
             "Type /mlb_auto to generate today’s card."
         )
 
-    risk_grade = featured.get("risk_grade")
-    risk_text = (
-        f"{risk_grade}/10"
-        if isinstance(risk_grade, (int, float)) and not isinstance(risk_grade, bool)
-        else "Unavailable"
-    )
-    play_game = featured.get("play_game", {})
-    play_context = (
-        mlb_game_block(play_game)
-        if isinstance(play_game, dict) and play_game.get("away_team")
-        else "🕒 Time unavailable ET"
-    )
     leg_details = featured.get("parlay_leg_details", [])
-
-    def parlay_leg(index: int) -> str:
-        """Format a saved parlay leg with its original matchup and ET time."""
-        detail = (
-            leg_details[index]
-            if isinstance(leg_details, list)
-            and index < len(leg_details)
-            and isinstance(leg_details[index], dict)
-            else {}
-        )
-        context_text = (
-            mlb_game_block(detail)
-            if detail.get("away_team")
-            else "🕒 Time unavailable ET"
-        )
-        return f"✅ {legs[index]}\n{context_text}"
-
+    parlay_text = render_safe_parlay(
+        leg_details if isinstance(leg_details, list) else [],
+        card_date=official_sports_date().isoformat(),
+    )
+    selected_date = official_sports_date().isoformat()
     return (
         "🎯 BETGPTAI TODAY\n\n"
-        f"{_card_date_header(official_sports_date().isoformat())}\n\n"
-        "━━━━━━━━━━━━\n\n"
-        "🔥 PLAY OF THE DAY\n\n"
-        f"⚾ {play}\n"
-        f"{play_context}\n"
-        f"🎯 Confidence Grade: {risk_text}\n\n"
-        "━━━━━━━━━━━━\n\n"
-        "🧩 SAFE PARLAY OF THE DAY\n\n"
-        f"{parlay_leg(0)}\n\n"
-        f"{parlay_leg(1)}\n\n"
-        f"{PARLAY_NOTE}\n\n"
-        "━━━━━━━━━━━━\n\n"
+        f"{render_play_of_day_card(selected_date)}\n\n"
+        f"{parlay_text}\n\n"
         "📋 Want the full free MLB card?\n"
         "Type /mlb_auto\n\n"
         "💎 Want premium full slate?\n"
-        "Type /vip\n\n"
-        f"{TIMED_CARD_FOOTER}"
+        "Type /vip"
     )
 
 
@@ -792,14 +766,12 @@ async def _build_safe_parlay_text() -> str:
         logging.exception("Could not load saved picks for safe parlay")
         featured = {}
     legs = featured.get("parlay_legs", [])
+    leg_details = featured.get("parlay_leg_details", [])
     if not isinstance(legs, list) or len(legs) < 2:
-        return "Today’s safe parlay is still being prepared. Type /mlb_auto to generate today’s card."
-    return (
-        "🧩 SAFE PARLAY OF THE DAY\n\n"
-        f"✅ {legs[0]}\n"
-        f"✅ {legs[1]}\n\n"
-        f"{PARLAY_NOTE}\n\n"
-        "Singles are recommended for better long-term results."
+        return "No Safe 2-Leg Parlay qualified today."
+    return render_safe_parlay(
+        leg_details if isinstance(leg_details, list) else [],
+        card_date=official_sports_date().isoformat(),
     )
 
 
@@ -973,7 +945,7 @@ async def mlb_auto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         # Delivery happens only after picks.json has been updated successfully.
-        await _send_long_message(update, _with_card_date(analysis, selected_date))
+        await _send_long_message(update, render_mlb_premium_card(selected_date))
         await update.message.reply_text(
             "Card notes and responsible-play info:",
             reply_markup=_card_disclaimer_markup(),
@@ -1150,7 +1122,7 @@ async def tomorrow(
             )
         except Exception:
             logging.exception("Could not save tomorrow's MLB picks")
-        await _send_long_message(update, _with_card_date(mlb_card, target_date))
+        await _send_long_message(update, render_mlb_premium_card(target_date))
     if _slate_has_lines(soccer_slate):
         soccer_card = await analyze_soccer_slate(
             soccer_slate,
@@ -1615,6 +1587,39 @@ async def scheduler_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except Exception as error:
         logging.exception("Unexpected /scheduler_status error")
         text = f"Unable to inspect scheduler status right now.\n\nError: {error}"
+    await update.message.reply_text(text)
+
+
+async def lineup_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only lineup state summary for today's MLB slate."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+    try:
+        slate = await asyncio.to_thread(
+            get_combined_slate,
+            os.getenv("ODDS_API_KEY", ""),
+            game_date=selected_date,
+            highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+        )
+        payload = await asyncio.to_thread(summarize_lineups, upcoming_mlb_slate(slate), selected_date)
+        await update.message.reply_text(render_lineup_status(payload))
+    except Exception as error:
+        logging.exception("Unexpected /lineup_status error")
+        await update.message.reply_text(f"Unable to inspect lineup status right now.\n\nError: {error}")
+
+
+async def post_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only automatic channel posting status."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    try:
+        text = await asyncio.to_thread(post_status_text)
+    except Exception as error:
+        logging.exception("Unexpected /post_status error")
+        text = f"Unable to inspect posting status right now.\n\nError: {error}"
     await update.message.reply_text(text)
 
 
@@ -2185,14 +2190,31 @@ async def _mission_control_health_text() -> str:
     results_ready = storage_payload.get("results_database_healthy")
     weather_ready = any(isinstance(game.get("weather"), dict) for game in slate)
     quant_payload = build_elite_quant_slate(slate, include_market=bool(os.getenv("ODDS_API_KEY", "")))
+    v20_games = [game.get("betgptai_quant_v20") for game in slate if isinstance(game.get("betgptai_quant_v20"), dict)]
+    v20_qualified = sum(1 for item in v20_games if item.get("engine_decision") == "QUALIFIED")
+    edge_db_path = data_file("edge_database") / f"{selected_date}.json"
     ready_to_publish = bool(slate and results_ready and weather_ready and quant_payload)
     ready_games = sum(1 for item in quant_payload if item.get("game_status") == "ready")
+    weights_text = (
+        f"SP {QUANT_WEIGHTS['sp_score']:.0%} / "
+        f"Offense {QUANT_WEIGHTS['offense_score']:.0%} / "
+        f"Bullpen {QUANT_WEIGHTS['bullpen_score']:.0%} / "
+        f"Defense {QUANT_WEIGHTS['defense_score']:.0%} / "
+        f"Weather/Park {QUANT_WEIGHTS['weather_park_score']:.0%} / "
+        f"Market {QUANT_WEIGHTS['market_value_score']:.0%} / "
+        f"Situational {QUANT_WEIGHTS['situational_score']:.0%}"
+    )
     return (
         "🧠 BETGPTAI MISSION CONTROL\n\n"
         f"System Health: {'✅ Healthy' if storage_payload.get('writable') else '❌ Needs attention'}\n"
         f"Storage: {'✅ Healthy' if storage_payload.get('results_database_healthy') else '❌ Failed'}\n"
         "API Status: Use /status for full provider detail\n"
         f"Today's Games: {len(slate)}\n"
+        f"v20 Engine: {'✅ Available' if v20_games else '➖ No slate scored yet'}\n"
+        f"v20 Model: {QUANT_MODEL_VERSION}\n"
+        f"v20 Qualified Edges: {v20_qualified}/{len(v20_games)}\n"
+        f"Edge Database: {'✅ Saved' if edge_db_path.exists() else '➖ Pending'}\n"
+        f"Current Weights: {weights_text}\n"
         f"Quant Engine: {ready_games}/{len(quant_payload)} ready\n"
         f"Images Ready: {'✅ Yes' if images_ready else '➖ Not yet'}\n"
         f"Results Ready: {'✅ Yes' if results_ready else '❌ No'}\n"
@@ -3332,7 +3354,9 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🔧 SYSTEM DIAGNOSTICS\n"
         "/system_diagnostics · /callback_debug\n\n"
         "⏰ SCHEDULER\n"
-        "/time_debug · /scheduler_status\n\n"
+        "/time_debug · /scheduler_status · /post_status\n\n"
+        "📋 LINEUPS\n"
+        "/lineup_status\n\n"
         "🧠 MODEL REPORT\n"
         "/model_report\n\n"
         "⚾ MLB ADMIN CARDS\n"
@@ -3529,7 +3553,7 @@ async def model_report(
         f"{report.get('total_games', 0)}\n"
         f"Consensus picks found: {report.get('consensus_picks_found', 0)}\n"
         f"Value engine count: {report.get('value_engine_count', 0)}\n"
-        f"NRFI candidates: {report.get('nrfi_candidates', 0)}\n"
+        f"Official v20 markets: ML, Run Line, F5, Game Totals, Team Totals\n"
         f"F5 candidates: {report.get('f5_candidates', 0)}\n"
         f"Team total candidates: {report.get('team_total_candidates', 0)}\n"
         f"Strikeout candidates: {report.get('strikeout_candidates', 0)}\n"
@@ -3605,11 +3629,11 @@ async def test_channels(
 
 MLB_IMAGE_HEADINGS = [
     "🔥 PLAY OF THE DAY",
-    "🏆 TOP 2 MONEYLINE",
-    "🔥 TOP 2 F5 MONEYLINE",
-    "📈 TOP 2 RUNLINE/SPREAD",
-    "🎯 TOP 2 OVER/UNDER TOTAL RUNS",
-    "💰 TOP 2 TEAM TOTALS",
+    "🏆 TOP 5 MONEYLINE",
+    "🔥 TOP 5 F5",
+    "📈 TOP 5 RUN LINE",
+    "🎯 TOP 5 GAME TOTALS",
+    "💰 TOP 5 TEAM TOTALS",
     "🧩 2-LEG SAFE PARLAY",
 ]
 
@@ -3680,11 +3704,11 @@ def _official_mlb_card_data(
 ) -> dict[str, object]:
     """Convert the official Telegram MLB card into image-carousel data."""
     play_section = _section_from_card(analysis, "🔥 PLAY OF THE DAY")
-    moneyline_section = _section_from_card(analysis, "🏆 TOP 2 MONEYLINE")
-    f5_section = _section_from_card(analysis, "🔥 TOP 2 F5 MONEYLINE")
-    runline_section = _section_from_card(analysis, "📈 TOP 2 RUNLINE/SPREAD")
-    totals_section = _section_from_card(analysis, "🎯 TOP 2 OVER/UNDER TOTAL RUNS")
-    team_totals_section = _section_from_card(analysis, "💰 TOP 2 TEAM TOTALS")
+    moneyline_section = _section_from_card(analysis, "🏆 TOP 5 MONEYLINE")
+    f5_section = _section_from_card(analysis, "🔥 TOP 5 F5")
+    runline_section = _section_from_card(analysis, "📈 TOP 5 RUN LINE")
+    totals_section = _section_from_card(analysis, "🎯 TOP 5 GAME TOTALS")
+    team_totals_section = _section_from_card(analysis, "💰 TOP 5 TEAM TOTALS")
     parlay_section = _section_from_card(analysis, "🧩 2-LEG SAFE PARLAY")
 
     play_candidates = _picks_from_section(play_section, 1)
@@ -3942,7 +3966,7 @@ async def _build_mlb_auto_card_for_menu() -> str:
             "The card was generated, but its picks could not be saved. "
             "No picks were sent. Check picks.json and try again."
         )
-    return _with_card_date(analysis, selected_date)
+    return render_mlb_premium_card(selected_date)
 
 
 async def _build_soccer_card_for_menu() -> str:
@@ -4555,6 +4579,8 @@ async def main() -> None:
     application.add_handler(CommandHandler("results_auto_status", results_auto_status))
     application.add_handler(CommandHandler("time_debug", time_debug))
     application.add_handler(CommandHandler("scheduler_status", scheduler_status))
+    application.add_handler(CommandHandler("lineup_status", lineup_status))
+    application.add_handler(CommandHandler("post_status", post_status))
     application.add_handler(CommandHandler("post_results_now", post_results_now))
     application.add_handler(CommandHandler("enable_auto_results", enable_auto_results))
     application.add_handler(CommandHandler("disable_auto_results", disable_auto_results))

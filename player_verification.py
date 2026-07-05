@@ -410,18 +410,32 @@ def verify_hit_prop_context(
     verified_game_pk = (selected_game or {}).get("game_pk") or (selected_game or {}).get("game_id") or game_pk
     lineup_check = _lineup_lookup(verified_game_pk, player_id)
 
+    prop_lineup = prop.get("lineup_verification") if isinstance(prop.get("lineup_verification"), dict) else {}
+    projected_spot = prop.get("projected_batting_position") or prop_lineup.get("lineup_spot")
+    try:
+        projected_spot_int = int(projected_spot)
+    except Exception:
+        projected_spot_int = None
+    lineup_status = str(lineup_check.get("lineup_status") or "")
+    projected_ok = (
+        lineup_status in {"lineup_unavailable", "player_not_in_boxscore", "missing_game_or_player"}
+        and projected_spot_int is not None
+        and 1 <= projected_spot_int <= 5
+        and bool(player_check.get("verified"))
+        and bool(player_check.get("active_roster"))
+    )
     valid = (
         bool(player_check.get("verified"))
         and bool(player_check.get("active_roster"))
         and bool(matchup_valid)
-        and bool(lineup_check.get("verified"))
+        and (bool(lineup_check.get("verified")) or projected_ok)
     )
     reasons = []
     if not player_check.get("verified"):
         reasons.append(str(player_check.get("reason")))
     if not matchup_valid:
         reasons.append("Today’s opponent/matchup could not be verified from MLB Stats API.")
-    if not lineup_check.get("verified"):
+    if not lineup_check.get("verified") and not projected_ok:
         reasons.append(str(lineup_check.get("reason")))
     return {
         "valid": valid,
@@ -435,10 +449,16 @@ def verify_hit_prop_context(
         "today_opponent": today_opponent,
         "expected_opponent": expected_opponent,
         "game_pk": verified_game_pk,
-        "lineup_spot": lineup_check.get("lineup_spot"),
-        "lineup_status": lineup_check.get("lineup_status"),
+        "lineup_spot": lineup_check.get("lineup_spot") or projected_spot_int,
+        "lineup_status": lineup_check.get("lineup_status") if lineup_check.get("verified") else ("projected" if projected_ok else lineup_check.get("lineup_status")),
         "status": "valid" if valid else "invalid",
-        "reason": "All Best Hit Prop checks passed." if valid else " ".join(reasons),
+        "reason": (
+            "All Best Hit Prop checks passed."
+            if valid and lineup_check.get("verified")
+            else "Projected top-five lineup accepted while official lineup is unavailable."
+            if valid and projected_ok
+            else " ".join(reasons)
+        ),
         "player_check": player_check,
         "lineup_check": lineup_check,
     }

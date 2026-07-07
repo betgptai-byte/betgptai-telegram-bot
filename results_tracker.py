@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import hashlib
+import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from storage import data_file
 
 PICKS_FILE = data_file("picks.json")
 RESULTS_FILE = data_file("results.json")
+PICKS_LOG_FILE = data_file("logs") / "picks.log"
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
 MLB_LINESCORE_URL = "https://statsapi.mlb.com/api/v1/game/{game_id}/linescore"
 MLB_GAME_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{game_id}/feed/live"
@@ -124,11 +126,14 @@ def _is_pending_pick(pick: dict[str, Any]) -> bool:
 
 def _official_dedupe_key(pick: dict[str, Any]) -> tuple[str, str, str, str, str]:
     """Unique official-pick key requested by BETGPTAI tracking rules."""
+    selected = str(pick.get("selected_team") or "")
+    if str(pick.get("market_type") or "") not in VALID_MARKET_TYPES:
+        selected = str(pick.get("player_id") or pick.get("player_name") or selected)
     return (
         str(pick.get("card_date") or pick.get("date") or ""),
         str(pick.get("game_pk") or pick.get("game_id") or ""),
         str(pick.get("market_type") or ""),
-        str(pick.get("selected_team") or ""),
+        selected,
         str(pick.get("line") or ""),
     )
 
@@ -136,6 +141,35 @@ def _official_dedupe_key(pick: dict[str, Any]) -> tuple[str, str, str, str, str]
 def _official_pick_id(pick: dict[str, Any]) -> str:
     """Create the public pick_id from the official dedupe key."""
     return _pick_identity(list(_official_dedupe_key(pick)))
+
+
+def _new_pick_uuid() -> str:
+    """Create a UUID for newly-saved official picks."""
+    return str(uuid.uuid4())
+
+
+def _append_picks_log(picks: list[dict[str, Any]]) -> None:
+    """Append one audit line per saved official pick."""
+    if not picks:
+        return
+    PICKS_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with PICKS_LOG_FILE.open("a", encoding="utf-8") as handle:
+        for pick in picks:
+            handle.write(
+                json.dumps(
+                    {
+                        "timestamp": _now_iso(),
+                        "pick_id": pick.get("pick_id"),
+                        "market": pick.get("market_type"),
+                        "team": pick.get("selected_team"),
+                        "game_pk": pick.get("game_pk"),
+                        "status": pick.get("status"),
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+                + "\n"
+            )
 
 
 def _game_time_et(value: Any) -> str | None:
@@ -242,9 +276,18 @@ def _normalize_saved_pick(
     pick.setdefault("graded_at", None)
     pick.setdefault("model_version", "BETGPTAI v20.0")
     pick.setdefault("component_scores", {})
+    pick.setdefault("league", "MLB" if str(pick.get("sport", "mlb")).lower() == "mlb" else "")
+    pick.setdefault("market_line", pick.get("line"))
+    pick.setdefault("units", pick.get("units_risked", 1))
+    pick.setdefault("reason", pick.get("reason") or "")
+    pick.setdefault("weights_snapshot", pick.get("weights_snapshot") or {})
+    pick.setdefault("starting_pitchers", pick.get("starting_pitchers") or {})
+    pick.setdefault("lineup_status", pick.get("lineup_status") or "unknown")
+    pick.setdefault("weather_summary", pick.get("weather_summary") or "")
     for field in V20_SCORE_FIELDS:
         pick.setdefault(field, None)
     pick.setdefault("final_edge_score", None)
+    pick.setdefault("edge_score", pick.get("final_edge_score"))
     pick.setdefault("confidence", None)
     pick.setdefault("risk_level", None)
     pick.setdefault("data_quality_grade", None)
@@ -566,6 +609,45 @@ def _apply_quant_fields(record: dict[str, Any], quant: dict[str, Any]) -> None:
     record["confidence"] = quant.get("confidence")
     record["risk_level"] = quant.get("risk_level")
     record["data_quality_grade"] = quant.get("data_quality_grade")
+    record["edge_score"] = quant.get("final_edge_score")
+    record["weights_snapshot"] = quant.get("weights_used") if isinstance(quant.get("weights_used"), dict) else {}
+
+
+def _weather_summary(weather: Any) -> str:
+    """Create a compact persisted weather summary."""
+    if not isinstance(weather, dict) or not weather:
+        return ""
+    parts = []
+    for label, key in (
+        ("Temp", "temperature"),
+        ("Wind", "wind_speed"),
+        ("Dir", "wind_direction"),
+        ("Precip", "precipitation_probability"),
+    ):
+        value = weather.get(key)
+        if value not in (None, "", "unavailable"):
+            parts.append(f"{label}: {value}")
+    return "; ".join(parts)
+
+
+def _lineup_status_from_game(game: dict[str, Any]) -> str:
+    lineups = game.get("lineups")
+    if lineups in (None, "", "unavailable", [], {}):
+        return "projected"
+    return "confirmed/projected"
+
+
+def _reason_from_context(context: str) -> str:
+    """Extract a short reason from the rendered analysis block when present."""
+    if not context:
+        return ""
+    match = re.search(r"(?is)\bReason:\s*(.+?)(?:\n\s*\n|$)", context)
+    if not match:
+        match = re.search(r"(?is)\bWhy:\s*(.+?)(?:\n\s*\n|$)", context)
+    if not match:
+        return ""
+    reason = " ".join(line.strip(" •") for line in match.group(1).splitlines() if line.strip())
+    return reason[:500]
 
 
 def _pick_record(
@@ -580,6 +662,7 @@ def _pick_record(
     risk_grade: int | float | None = None,
     legs: list[dict[str, Any]] | None = None,
     source_command: str = "unknown",
+    reason: str = "",
 ) -> dict[str, Any]:
     """Create the modern pick row while preserving old field aliases."""
     selected_team = None if pick_type in {"total", "parlay"} else _selected_team_for_pick({
@@ -596,6 +679,7 @@ def _pick_record(
         "card_date": selected_date,
         "display_date": display_date(selected_date),
         "sport": sport,
+        "league": "MLB" if sport == "mlb" else sport.upper(),
         "category": category,
         "game_id": resolved.get("game_id"),
         "game_pk": resolved.get("game_id"),
@@ -616,15 +700,21 @@ def _pick_record(
         "pick_text": pick_text,
         "selection": pick_text,
         "line": line,
+        "market_line": line,
         "odds": odds if odds is not None else resolved.get("odds"),
         "risk_grade": risk_grade,
+        "reason": reason,
         "status": PENDING_RESULT,
         "result": None,
         "profit_units": 0,
+        "units": 1,
         "units_risked": 1,
         "units_won": 0,
         "created_at": _now_iso(),
         "graded_at": None,
+        "starting_pitchers": resolved.get("starting_pitchers") or {},
+        "lineup_status": resolved.get("lineup_status") or "unknown",
+        "weather_summary": resolved.get("weather_summary") or "",
     }
     _apply_quant_fields(record, _quant_payload(resolved))
     if legs:
@@ -639,7 +729,10 @@ def _pick_record(
         record["game_time"] = [leg.get("game_time") for leg in legs]
         record["game_time_et"] = [leg.get("game_time_et") for leg in legs]
         record["game_status"] = [leg.get("game_status") for leg in legs]
-    record["pick_id"] = _official_pick_id(record)
+        record["starting_pitchers"] = [leg.get("starting_pitchers") for leg in legs]
+        record["lineup_status"] = [leg.get("lineup_status") for leg in legs]
+        record["weather_summary"] = [leg.get("weather_summary") for leg in legs]
+    record["pick_id"] = _new_pick_uuid()
     return record
 
 
@@ -659,6 +752,26 @@ def _resolve_pick(
     )
     market = _market_key(pick_type)
 
+    def resolved_game_payload(game: dict[str, Any], *, line: Any = None, odds: Any = None) -> dict[str, Any]:
+        return {
+            "game_id": game.get("game_id"),
+            "away_team": game.get("away_team"),
+            "home_team": game.get("home_team"),
+            "game_time": game.get("game_time"),
+            "status": game.get("status"),
+            "venue": game.get("venue"),
+            "line": line,
+            "odds": odds,
+            "betgptai_quant_v20": game.get("betgptai_quant_v20"),
+            "betgptai_internal": game.get("betgptai_internal"),
+            "starting_pitchers": {
+                "away": game.get("away_pitcher"),
+                "home": game.get("home_pitcher"),
+            },
+            "lineup_status": _lineup_status_from_game(game),
+            "weather_summary": _weather_summary(game.get("weather")),
+        }
+
     # F5 leans intentionally have no derived price. Match the selected team to
     # its scheduled game, but never substitute a full-game line for an F5 line.
     if pick_type == "f5_moneyline":
@@ -672,18 +785,7 @@ def _resolve_pick(
         if len(matching_games) != 1:
             return None
         game = matching_games[0]
-        return {
-            "game_id": game.get("game_id"),
-            "away_team": game.get("away_team"),
-            "home_team": game.get("home_team"),
-            "game_time": game.get("game_time"),
-            "status": game.get("status"),
-            "venue": game.get("venue"),
-            "line": None,
-            "odds": None,
-            "betgptai_quant_v20": game.get("betgptai_quant_v20"),
-            "betgptai_internal": game.get("betgptai_internal"),
-        }
+        return resolved_game_payload(game)
 
     for game in slate:
         if pick_type in {"moneyline", "f5_moneyline", "runline", "team_total"}:
@@ -754,33 +856,15 @@ def _resolve_pick(
         ]
         if len(matching_games) == 1:
             game = matching_games[0]
-            return {
-                "game_id": game.get("game_id"),
-                "away_team": game.get("away_team"),
-                "home_team": game.get("home_team"),
-                "game_time": game.get("game_time"),
-                "status": game.get("status"),
-                "venue": game.get("venue"),
-                "line": team_total["line"],
-                "odds": displayed_odds,
-                "betgptai_quant_v20": game.get("betgptai_quant_v20"),
-                "betgptai_internal": game.get("betgptai_internal"),
-            }
+            return resolved_game_payload(game, line=team_total["line"], odds=displayed_odds)
     if len(candidates) != 1:
         return None
     game, wager = candidates[0]
-    return {
-        "game_id": game.get("game_id"),
-        "away_team": game.get("away_team"),
-        "home_team": game.get("home_team"),
-        "game_time": game.get("game_time"),
-        "status": game.get("status"),
-        "venue": game.get("venue"),
-        "line": point,
-        "odds": displayed_odds if displayed_odds is not None else wager.get("price"),
-        "betgptai_quant_v20": game.get("betgptai_quant_v20"),
-        "betgptai_internal": game.get("betgptai_internal"),
-    }
+    return resolved_game_payload(
+        game,
+        line=point,
+        odds=displayed_odds if displayed_odds is not None else wager.get("price"),
+    )
 
 
 def _section(text: str, heading: str) -> str:
@@ -906,6 +990,7 @@ def extract_official_picks(
                 resolved=resolved,
                 odds=entry["odds"],
                 risk_grade=entry["risk_grade"],
+                reason=_reason_from_context(entry.get("context", "")),
                 source_command=source_command,
             ))
 
@@ -929,6 +1014,7 @@ def extract_official_picks(
                 pick_text=selection.strip(),
                 resolved=resolved,
                 odds=resolved.get("odds"),
+                reason=_reason_from_context(parlay_section),
                 source_command=source_command,
             ))
     if len(legs) == 2:
@@ -941,9 +1027,82 @@ def extract_official_picks(
             resolved={"line": None, "odds": _combined_parlay_odds(legs)},
             odds=_combined_parlay_odds(legs),
             legs=legs,
+            reason="Safe 2-leg parlay built from official standalone legs.",
             source_command=source_command,
         ))
     return picks
+
+
+def _approved_prop_records(card_date: str, source_command: str) -> list[dict[str, Any]]:
+    """Convert admin-approved props into official saved-pick rows."""
+    payload = _read_json(data_file("approved_props.json"), default={})
+    if not isinstance(payload, dict):
+        return []
+    records: list[dict[str, Any]] = []
+    for prop in payload.values():
+        if not isinstance(prop, dict):
+            continue
+        if str(prop.get("card_date") or "") != card_date:
+            continue
+        market_type = str(prop.get("market_type") or prop.get("prop_type") or "prop")
+        line = prop.get("line")
+        player = str(prop.get("player_name") or "Player")
+        prop_text = prop.get("pick_text") or prop.get("prop") or f"{player} {market_type} Over {line}"
+        game_time = prop.get("game_time") or prop.get("game_time_et")
+        record = {
+            "date": card_date,
+            "card_date": card_date,
+            "display_date": display_date(card_date),
+            "created_at": _now_iso(),
+            "sport": "mlb",
+            "league": "MLB",
+            "source_command": source_command,
+            "category": "approved_player_prop",
+            "game_id": prop.get("game_pk") or prop.get("game_id"),
+            "game_pk": prop.get("game_pk") or prop.get("game_id"),
+            "game_time": game_time,
+            "game_time_et": _game_time_et(game_time),
+            "home_team": prop.get("home_team"),
+            "away_team": prop.get("away_team"),
+            "selected_team": prop.get("team_name") or prop.get("team"),
+            "opponent": prop.get("opponent_name") or prop.get("opponent"),
+            "player_id": prop.get("player_id"),
+            "player_name": player,
+            "market_type": market_type,
+            "pick_type": market_type,
+            "pick_text": str(prop_text),
+            "selection": str(prop_text),
+            "line": line,
+            "market_line": line,
+            "odds": prop.get("odds"),
+            "confidence": prop.get("confidence_grade") or prop.get("confidence"),
+            "edge_score": prop.get("raw_score") or prop.get("edge"),
+            "final_edge_score": prop.get("raw_score") or prop.get("edge"),
+            "risk_level": prop.get("risk_level") or "Prop",
+            "data_quality_grade": prop.get("data_quality_grade") or "Admin Prop",
+            "reason": prop.get("reason") or "",
+            "status": PENDING_RESULT,
+            "result": None,
+            "profit_units": 0,
+            "units": 1,
+            "units_risked": 1,
+            "units_won": 0,
+            "graded_at": None,
+            "model_version": prop.get("model_version") or "BETGPTAI v20.0",
+            "component_scores": {},
+            "weights_snapshot": prop.get("weights_snapshot") or {},
+            "starting_pitchers": prop.get("starting_pitchers") or {},
+            "lineup_status": (
+                (prop.get("lineup_verification") or {}).get("status")
+                if isinstance(prop.get("lineup_verification"), dict)
+                else prop.get("lineup_status")
+            ) or "projected",
+            "weather_summary": prop.get("weather_summary") or "",
+            "approved_prop_id": prop.get("prop_id"),
+        }
+        record["pick_id"] = _new_pick_uuid()
+        records.append(record)
+    return records
 
 
 def save_official_picks(
@@ -959,7 +1118,9 @@ def save_official_picks(
             slate = enrich_slate_with_quant_scores(slate, pick_date)
         except Exception:
             logging.exception("BETGPTAI v20 scoring unavailable while saving picks")
-    new_picks = extract_official_picks(analysis, slate, pick_date, source_command)
+    selected_date = pick_date or date.today().isoformat()
+    new_picks = extract_official_picks(analysis, slate, selected_date, source_command)
+    new_picks.extend(_approved_prop_records(selected_date, source_command))
     if not new_picks:
         raise ResultsTrackerError(
             "The generated free card did not contain any trackable official picks."
@@ -970,12 +1131,15 @@ def save_official_picks(
         "game_pk", "home_team", "away_team", "market_type", "pick_text",
         "game_time_et", "status", "created_at", "graded_at",
         "model_version", "component_scores", "final_edge_score", "confidence",
-        "risk_level", "data_quality_grade",
+        "risk_level", "data_quality_grade", "league", "market_line", "odds",
+        "edge_score", "units", "weights_snapshot", "starting_pitchers",
+        "lineup_status", "weather_summary", "reason",
     }
     for pick in new_picks:
         pick["source_command"] = source_command
         _normalize_saved_pick(pick)
-        pick["pick_id"] = _official_pick_id(pick)
+        if not pick.get("pick_id"):
+            pick["pick_id"] = _new_pick_uuid()
         missing = required_fields.difference(pick)
         if missing:
             raise ResultsTrackerError(
@@ -987,6 +1151,7 @@ def save_official_picks(
         pick["status"] = PENDING_RESULT
         pick["profit_units"] = 0
         pick["units_risked"] = 1
+        pick["units"] = 1
         pick["units_won"] = 0
 
     # Do not duplicate official picks when the same card is generated from a
@@ -1002,7 +1167,57 @@ def save_official_picks(
         new_keys.add(key)
         saved_picks.append(pick)
     _write_json(PICKS_FILE, existing + saved_picks)
+    _append_picks_log(saved_picks)
     return len(saved_picks)
+
+
+def saved_picks_summary(card_date: str) -> dict[str, Any]:
+    """Return owner-facing summary of saved official picks for one date."""
+    picks = [
+        pick for pick in load_picks()
+        if isinstance(pick, dict)
+        and str(pick.get("card_date") or pick.get("date") or "") == card_date
+        and str(pick.get("sport") or "mlb").lower() == "mlb"
+        and pick.get("category") != "parlay_leg"
+    ]
+    markets: dict[str, int] = {}
+    last_saved = ""
+    for pick in picks:
+        market = str(pick.get("market_type") or "unknown")
+        markets[market] = markets.get(market, 0) + 1
+        created = str(pick.get("created_at") or "")
+        if created > last_saved:
+            last_saved = created
+    return {
+        "card_date": card_date,
+        "display_date": display_date(card_date),
+        "total": len(picks),
+        "markets": markets,
+        "file_path": str(PICKS_FILE),
+        "last_saved_time": last_saved or "Unavailable",
+    }
+
+
+def render_saved_picks_summary(card_date: str) -> str:
+    """Render /saved_picks_today."""
+    summary = saved_picks_summary(card_date)
+    markets = summary.get("markets") if isinstance(summary.get("markets"), dict) else {}
+    lines = [
+        "💾 BETGPTAI SAVED PICKS",
+        f"Date: {summary.get('display_date')}",
+        "",
+        f"Total picks saved: {summary.get('total', 0)}",
+        "Markets saved:",
+    ]
+    if markets:
+        lines.extend(f"- {market}: {count}" for market, count in sorted(markets.items()))
+    else:
+        lines.append("- None")
+    lines.extend([
+        f"File path: {summary.get('file_path')}",
+        f"Last saved time: {summary.get('last_saved_time')}",
+    ])
+    return "\n".join(lines).strip()
 
 
 def save_soccer_picks(

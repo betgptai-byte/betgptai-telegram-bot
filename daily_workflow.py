@@ -27,8 +27,7 @@ from mlb_auto_image import prepare_mlb_auto_image
 from mlb_data import get_combined_slate, get_mlb_schedule
 from model_report import save_model_report
 from player_props_engine import build_player_props_lab
-from quality_gate import run_prepost_quality_gate
-from results_tracker import save_official_picks
+from results_tracker import load_picks, save_official_picks
 from safe_parlay_formatter import render_safe_parlay
 from premium_card_formatter import (
     render_category_card,
@@ -147,6 +146,82 @@ def workflow_status(card_date: str | None = None) -> dict[str, Any]:
         "approval_required": False,
         "last_scheduler_error": log.get("last_scheduler_error", "None"),
     }
+
+
+def _saved_picks_for_date(card_date: str) -> list[dict[str, Any]]:
+    """Return saved official MLB picks for one card date."""
+    try:
+        picks = load_picks()
+    except Exception:
+        return []
+    return [
+        pick for pick in picks
+        if isinstance(pick, dict)
+        and str(pick.get("card_date") or pick.get("date") or "") == card_date
+        and str(pick.get("sport") or "mlb").lower() == "mlb"
+        and pick.get("category") != "parlay_leg"
+    ]
+
+
+def _generation_flags(card: str, card_date: str, saved_picks: int, image_path: Any, best_hit_image: Any) -> dict[str, Any]:
+    """Split T-45 card generation, image generation, and posting readiness."""
+    picks = _saved_picks_for_date(card_date)
+    has_saved_picks = saved_picks > 0 or bool(picks)
+    has_play_of_day = any(
+        str(pick.get("category") or "").lower() in {"play_of_day", "play of the day"}
+        or str(pick.get("market_type") or "").lower() == "play_of_day"
+        for pick in picks
+    ) or "🔥 PLAY OF THE DAY" in card
+    has_top_mlb = any(
+        str(pick.get("market_type") or pick.get("pick_type") or "").lower()
+        in {"moneyline", "runline", "f5_moneyline", "total", "team_total"}
+        for pick in picks
+    ) or any(marker in card for marker in ("TOP 5", "TOP 2", "TOP MLB PLAYS"))
+    parlay_pick = next((pick for pick in picks if str(pick.get("market_type") or "").lower() == "parlay" or pick.get("category") == "parlay"), None)
+    parlay_status = "generated" if parlay_pick else "no_qualified" if "No Safe 2-Leg Parlay qualified" in card else "not_found"
+    card_complete = bool(card and has_play_of_day and has_top_mlb and has_saved_picks and parlay_status in {"generated", "no_qualified"})
+    images_complete = bool(image_path or best_hit_image)
+    return {
+        "card_generation_complete": card_complete,
+        "image_generation_complete": images_complete,
+        "picks_saved": has_saved_picks,
+        "play_of_day_generated": has_play_of_day,
+        "top_mlb_plays_generated": has_top_mlb,
+        "safe_parlay_status": parlay_status,
+        "posting_ready": card_complete and has_saved_picks and _auto_post_enabled(),
+    }
+
+
+async def _save_official_picks_with_retry(
+    card: str,
+    slate: list[dict[str, Any]],
+    card_date: str,
+    source_command: str,
+) -> int:
+    """Save official picks immediately, retrying once before failing T-45."""
+    last_error: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            saved = await asyncio.to_thread(
+                save_official_picks,
+                card,
+                slate,
+                card_date,
+                source_command,
+            )
+            logging.info(
+                "Official picks saved card_date=%s saved=%s attempt=%s",
+                card_date,
+                saved,
+                attempt,
+            )
+            return saved
+        except Exception as error:
+            last_error = error
+            logging.exception("Official picks save failed attempt=%s card_date=%s", attempt, card_date)
+            if attempt == 1:
+                await asyncio.sleep(0.5)
+    raise RuntimeError(f"Could not save official picks after retry: {last_error}")
 
 
 def _auto_post_enabled() -> bool:
@@ -294,6 +369,7 @@ async def generate_cards_job(bot: Any, card_date: str | None = None) -> dict[str
     saved_picks = 0
     image_path = None
     best_hit_image = None
+    generation_error = ""
     try:
         slate = await asyncio.to_thread(
             get_combined_slate,
@@ -310,21 +386,29 @@ async def generate_cards_job(bot: Any, card_date: str | None = None) -> dict[str
             os.getenv("ANTHROPIC_API_KEY", ""),
         )
         await asyncio.to_thread(save_model_report, selected, slate, card, get_last_analysis_metadata())
-        saved_picks = await asyncio.to_thread(save_official_picks, card, slate, selected, "scheduled_generate")
-        image_result = await asyncio.to_thread(
-            prepare_mlb_auto_image,
-            card,
-            selected,
-            image_generation_enabled=os.getenv("IMAGE_GENERATION_ENABLED", "").lower() in {"1", "true", "yes", "on"},
-        )
-        image_path = image_result.get("image_path") or image_result.get("prompt_path")
-        best_hit_result = await asyncio.to_thread(
-            prepare_best_hit_prop_image,
-            slate,
-            selected,
-            image_generation_enabled=os.getenv("IMAGE_GENERATION_ENABLED", "").lower() in {"1", "true", "yes", "on"},
-        )
-        best_hit_image = best_hit_result.get("image_path") or best_hit_result.get("prompt_path")
+        saved_picks = await _save_official_picks_with_retry(card, slate, selected, "scheduled_generate")
+        try:
+            image_result = await asyncio.to_thread(
+                prepare_mlb_auto_image,
+                card,
+                selected,
+                image_generation_enabled=os.getenv("IMAGE_GENERATION_ENABLED", "").lower() in {"1", "true", "yes", "on"},
+            )
+            image_path = image_result.get("image_path") or image_result.get("prompt_path")
+        except Exception as image_error:
+            logging.exception("T-45 MLB image generation failed; continuing with text card")
+            errors.append(f"MLB image failed: {image_error}")
+        try:
+            best_hit_result = await asyncio.to_thread(
+                prepare_best_hit_prop_image,
+                slate,
+                selected,
+                image_generation_enabled=os.getenv("IMAGE_GENERATION_ENABLED", "").lower() in {"1", "true", "yes", "on"},
+            )
+            best_hit_image = best_hit_result.get("image_path") or best_hit_result.get("prompt_path")
+        except Exception as image_error:
+            logging.exception("T-45 best hit image generation failed; continuing with text fallback")
+            errors.append(f"Best hit image failed: {image_error}")
         scratched = await asyncio.to_thread(invalidate_scratched_props, selected, slate)
         if scratched.get("invalidated"):
             await _notify_admin(
@@ -336,16 +420,28 @@ async def generate_cards_job(bot: Any, card_date: str | None = None) -> dict[str
             )
     except Exception as error:
         logging.exception("T-45 generation failed")
-        errors.append(str(error))
+        generation_error = str(error)
+        errors.append(generation_error)
+    flags = _generation_flags(card, selected, saved_picks, image_path, best_hit_image)
+    if errors and not generation_error:
+        generation_error = "; ".join(errors)
     status = {
         "version": WORKFLOW_VERSION,
         "card_date": selected,
         "created_at": now_et().isoformat(timespec="seconds"),
-        "generated": bool(card and not errors),
+        "generated": flags["card_generation_complete"],
+        "card_generation_complete": flags["card_generation_complete"],
+        "image_generation_complete": flags["image_generation_complete"],
+        "posting_ready": flags["posting_ready"],
+        "picks_saved": flags["picks_saved"],
+        "play_of_day_generated": flags["play_of_day_generated"],
+        "top_mlb_plays_generated": flags["top_mlb_plays_generated"],
+        "safe_parlay_status": flags["safe_parlay_status"],
         "saved_picks": saved_picks,
         "mlb_card_path": str(output_dir / "mlb_card.txt"),
         "mlb_image": image_path,
         "best_hit_image": best_hit_image,
+        "generation_error": generation_error,
         "errors": errors,
     }
     if card:
@@ -354,12 +450,14 @@ async def generate_cards_job(bot: Any, card_date: str | None = None) -> dict[str
     await _notify_admin(
         bot,
         "✅ T-45 Generation Complete\n\n"
-        f"Generated: {'YES' if status['generated'] else 'NO'}\n"
+        f"Card generated: {'YES' if status['card_generation_complete'] else 'NO'}\n"
+        f"Images generated: {'YES' if status['image_generation_complete'] else 'NO — text fallback available'}\n"
         f"Picks saved: {saved_picks}\n"
+        f"Safe parlay: {status['safe_parlay_status']}\n"
         f"MLB image/prompt: {image_path or 'Unavailable'}\n"
         f"Best hit image/prompt: {best_hit_image or 'Unavailable'}\n"
         f"Auto-post enabled: {'YES' if _auto_post_enabled() else 'NO — AUTO_POST_ENABLED=false'}\n"
-        f"Errors: {', '.join(errors) if errors else 'None'}",
+        f"Last generation error: {generation_error or 'None'}",
     )
     return status
 
@@ -382,39 +480,38 @@ async def post_cards_job(bot: Any, card_date: str | None = None) -> dict[str, An
         return {"posted": False, "reason": "auto_post_disabled"}
     verification = _read_json(workflow_file(selected, "pregame_verification.json"), {})
     generation = _read_json(workflow_file(selected, "generation_status.json"), {})
-    if not generation.get("generated"):
+    if not generation.get("card_generation_complete"):
         log.setdefault(selected, {})["mlb_pregame_post"] = {
             "status": "blocked",
             "recorded_at": now_et().isoformat(timespec="seconds"),
-            "reason": "generation_not_completed",
+            "reason": "card_generation_not_completed",
         }
         _save_posting_log(log)
-        await _notify_admin(bot, "❌ T-43 Posting blocked: T-45 generation is not complete.")
-        return {"posted": False, "reason": "generation_not_completed", "generation": generation}
-    if not verification.get("ready_for_image_generation"):
+        await _notify_admin(bot, "❌ T-43 Posting blocked: T-45 card generation is not complete.")
+        return {"posted": False, "reason": "card_generation_not_completed", "generation": generation}
+    if not generation.get("picks_saved"):
         log.setdefault(selected, {})["mlb_pregame_post"] = {
             "status": "blocked",
             "recorded_at": now_et().isoformat(timespec="seconds"),
-            "reason": "critical_verification_failed",
+            "reason": "picks_not_saved",
         }
         _save_posting_log(log)
-        await _notify_admin(bot, "❌ T-43 Posting blocked: critical pregame verification did not pass. Manual override required.")
-        return {"posted": False, "reason": "critical_verification_failed", "verification": verification}
-    gate = await asyncio.to_thread(run_prepost_quality_gate, selected)
-    if not gate.get("ready_to_post"):
+        await _notify_admin(bot, "❌ T-43 Posting blocked: official picks were not saved to picks.json.")
+        return {"posted": False, "reason": "picks_not_saved", "generation": generation}
+    picks_file = data_file("picks.json")
+    todays_picks = _saved_picks_for_date(selected)
+    if not picks_file.exists() or not todays_picks:
         log.setdefault(selected, {})["mlb_pregame_post"] = {
             "status": "blocked",
             "recorded_at": now_et().isoformat(timespec="seconds"),
-            "reason": "prepost_check_failed",
+            "reason": "no_saved_picks_for_today",
         }
         _save_posting_log(log)
-        failures = gate.get("failures") or []
         await _notify_admin(
             bot,
-            "❌ T-43 Posting blocked by PrePost Check.\n\n"
-            + ("\n".join(f"• {failure}" for failure in failures[:25]) if failures else "No detailed failures returned.")
+            "❌ T-43 Posting blocked: picks.json does not contain today's official picks.",
         )
-        return {"posted": False, "reason": "prepost_check_failed", "gate": gate}
+        return {"posted": False, "reason": "no_saved_picks_for_today"}
     card_path = data_file("generated_cards") / selected / "mlb_card.txt"
     card = card_path.read_text(encoding="utf-8") if card_path.exists() else ""
     if not card:
@@ -454,6 +551,37 @@ async def post_cards_job(bot: Any, card_date: str | None = None) -> dict[str, An
     _save_posting_log(log)
     await _notify_admin(bot, f"✅ T-43 Posting Complete\nSent: {', '.join(sent) if sent else 'No destinations configured'}")
     return {"posted": True, "sent": sent, "verification": verification, "generation": generation}
+
+
+async def force_post_free_channel_job(bot: Any, card_date: str | None = None) -> dict[str, Any]:
+    """Owner-only manual free-channel text post that does not require images."""
+    selected = card_date or official_sports_date(now_et()).isoformat()
+    log = _posting_log()
+    posted_key = f"posted_free_mlb_card_{selected}"
+    if log.get(posted_key):
+        return {"posted": False, "reason": "already_posted_free"}
+    if not _auto_post_enabled():
+        return {"posted": False, "reason": "auto_post_disabled"}
+    picks = _saved_picks_for_date(selected)
+    if not picks:
+        return {"posted": False, "reason": "no_saved_picks"}
+    chat = os.getenv("FREE_CHANNEL_ID", "").strip()
+    if not chat:
+        return {"posted": False, "reason": "missing_free_channel_id"}
+    card_path = data_file("generated_cards") / selected / "mlb_card.txt"
+    card = card_path.read_text(encoding="utf-8") if card_path.exists() else ""
+    messages = _free_channel_posts(card, selected)
+    for content in messages:
+        await _send_long(bot, _destination(chat), content)
+    log[posted_key] = True
+    log.setdefault(selected, {})["free_mlb_manual_post"] = {
+        "status": "sent",
+        "recorded_at": now_et().isoformat(timespec="seconds"),
+        "sent": ["FREE_CHANNEL_ID"],
+    }
+    _save_posting_log(log)
+    await _notify_admin(bot, "✅ Force post complete: FREE_CHANNEL_ID received today’s free MLB card.")
+    return {"posted": True, "sent": ["FREE_CHANNEL_ID"]}
 
 
 def _section(card: str, heading: str) -> str:

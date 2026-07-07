@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Any
 
 from storage import data_file
+from model_weights import load_quant_engine_weights
 
 
 MODEL_VERSION = "BETGPTAI v20.0"
@@ -35,9 +36,18 @@ def clamp(value: Any, low: float = 0.0, high: float = 100.0) -> float:
     return max(low, min(high, number))
 
 
+def current_quant_weights() -> dict[str, float]:
+    """Load current v20 component weights from DATA_DIR/model_weights.json."""
+    try:
+        return load_quant_engine_weights()
+    except Exception:
+        return dict(WEIGHTS)
+
+
 def weighted_score(scores: dict[str, float]) -> float:
     """Calculate the v20 weighted final edge score."""
-    return round(sum(clamp(scores.get(key, 0)) * weight for key, weight in WEIGHTS.items()), 2)
+    weights = current_quant_weights()
+    return round(sum(clamp(scores.get(key, 0)) * weight for key, weight in weights.items()), 2)
 
 
 def confidence_from_score(score: float) -> str:

@@ -14,6 +14,7 @@ from edge_database import (
     MINIMUM_EDGE_SCORE,
     MODEL_VERSION,
     confidence_from_score,
+    current_quant_weights,
     data_quality_grade,
     risk_level,
     save_edge_snapshot,
@@ -42,6 +43,7 @@ def score_game(game: dict[str, Any]) -> dict[str, Any]:
         score, details = func(game)
         components[key] = score
         meta[key] = details
+    weights_used = current_quant_weights()
     final_score = weighted_score(components)
     available = sum(int(details.get("available_fields", 0)) for details in meta.values() if isinstance(details, dict))
     possible = sum(int(details.get("possible_fields", 0)) for details in meta.values() if isinstance(details, dict))
@@ -49,6 +51,7 @@ def score_game(game: dict[str, Any]) -> dict[str, Any]:
     return {
         "model_version": MODEL_VERSION,
         "component_scores": components,
+        "weights_used": weights_used,
         "sp_score": components["sp_score"],
         "offense_score": components["offense_score"],
         "bullpen_score": components["bullpen_score"],

@@ -43,14 +43,19 @@ from ai_learning_engine import (
     approve_weight_update as approve_learning_weight_update,
     learning_status_payload,
     reject_weight_update as reject_learning_weight_update,
+    render_learning_auto_status,
     render_learning_report,
     render_learning_status,
     render_loss_review,
+    render_weight_history_admin,
     render_weight_suggestions,
+    render_weights_admin,
     run_learning_review,
+    toggle_learning_auto_apply,
 )
 from elite_quant_engine import build_elite_quant_slate
-from edge_database import MODEL_VERSION as QUANT_MODEL_VERSION, WEIGHTS as QUANT_WEIGHTS
+from edge_database import MODEL_VERSION as QUANT_MODEL_VERSION, current_quant_weights
+from mission_control import ai_learning_auto_apply_line
 from anime_magazine_generator import (
     generate_daily_magazine_prompts,
     save_magazine_prompts,
@@ -69,6 +74,7 @@ from intelligence_dashboard import (
     build_intelligence_dashboard,
     intelligence_dashboard_available,
     render_daily_intel,
+    render_intel_debug,
     render_lineup_report,
     render_model_review,
     render_morning_report,
@@ -140,6 +146,7 @@ from results_tracker import (
     load_picks,
     missing_results_message,
     normalize_pick_date,
+    render_saved_picks_summary,
     save_official_picks,
     save_soccer_picks,
     update_results_from_mlb,
@@ -167,6 +174,7 @@ from posting_scheduler import (
     set_auto_results_enabled,
     time_debug_text,
 )
+from daily_workflow import force_post_free_channel_job, generate_cards_job
 from quality_gate import render_prepost_quality_gate, run_prepost_quality_gate
 from bot.callbacks.router import register_callback_router
 
@@ -1623,6 +1631,113 @@ async def post_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(text)
 
 
+async def force_generate_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only manual T-45 generation run."""
+    if not await _require_admin(update) or not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+    await update.message.reply_text("⏳ Running T-45 generation now...")
+    try:
+        status = await generate_cards_job(context.bot, selected_date)
+        await update.message.reply_text(
+            "✅ FORCE GENERATE TODAY COMPLETE\n\n"
+            f"Card Generated: {'YES' if status.get('card_generation_complete') else 'NO'}\n"
+            f"Images Generated: {'YES' if status.get('image_generation_complete') else 'NO — text fallback OK'}\n"
+            f"Picks Saved: {'YES' if status.get('picks_saved') else 'NO'}\n"
+            f"Posting Ready: {'YES' if status.get('posting_ready') else 'NO'}\n"
+            f"Last Generation Error: {status.get('generation_error') or 'None'}"
+        )
+    except Exception as error:
+        logging.exception("Unexpected /force_generate_today error")
+        await update.message.reply_text(f"Unable to force-generate today.\n\nError: {error}")
+
+
+async def force_post_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only manual free-channel post using text fallback if needed."""
+    if not await _require_admin(update) or not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+    await update.message.reply_text("⏳ Attempting force post to FREE_CHANNEL_ID...")
+    try:
+        result = await force_post_free_channel_job(context.bot, selected_date)
+        if result.get("posted"):
+            await update.message.reply_text("✅ Force post complete. FREE_CHANNEL_ID received today’s free card.")
+        else:
+            await update.message.reply_text(
+                "❌ Force post did not run.\n\n"
+                f"Reason: {result.get('reason', 'unknown')}"
+            )
+    except Exception as error:
+        logging.exception("Unexpected /force_post_today error")
+        await update.message.reply_text(f"Unable to force-post today.\n\nError: {error}")
+
+
+async def save_today_picks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only force-save from today's generated T-45 card text."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+    card_path = data_file("generated_cards") / selected_date / "mlb_card.txt"
+    if not card_path.exists():
+        await update.message.reply_text(
+            "No generated MLB card text found for today. Run /force_generate_today first."
+        )
+        return
+    await update.message.reply_text("⏳ Saving today's generated official picks...")
+    try:
+        card = card_path.read_text(encoding="utf-8")
+        slate = await asyncio.to_thread(
+            get_combined_slate,
+            os.getenv("ODDS_API_KEY", ""),
+            game_date=selected_date,
+            highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+        )
+        last_error: Exception | None = None
+        saved = 0
+        for attempt in (1, 2):
+            try:
+                saved = await asyncio.to_thread(
+                    save_official_picks,
+                    card,
+                    upcoming_mlb_slate(slate),
+                    selected_date,
+                    "save_today_picks",
+                )
+                last_error = None
+                break
+            except Exception as error:
+                last_error = error
+                logging.exception("/save_today_picks failed attempt=%s", attempt)
+                if attempt == 1:
+                    await asyncio.sleep(0.5)
+        if last_error:
+            raise last_error
+        await update.message.reply_text(
+            f"✅ Saved {saved} new official picks for {display_date(selected_date)}.\n\n"
+            + render_saved_picks_summary(selected_date)
+        )
+    except Exception as error:
+        logging.exception("Unexpected /save_today_picks error")
+        await update.message.reply_text(
+            f"❌ Save failed after retry. Posting should not continue.\n\nError: {error}"
+        )
+
+
+async def saved_picks_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only summary of today's saved official picks."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+    try:
+        text = await asyncio.to_thread(render_saved_picks_summary, selected_date)
+    except Exception as error:
+        logging.exception("Unexpected /saved_picks_today error")
+        text = f"Unable to inspect saved picks right now.\n\nError: {error}"
+    await update.message.reply_text(text)
+
+
 async def post_results_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner-only manual run of the automatic results poster."""
     if not await _require_admin(update) or not update.message:
@@ -2195,14 +2310,15 @@ async def _mission_control_health_text() -> str:
     edge_db_path = data_file("edge_database") / f"{selected_date}.json"
     ready_to_publish = bool(slate and results_ready and weather_ready and quant_payload)
     ready_games = sum(1 for item in quant_payload if item.get("game_status") == "ready")
+    quant_weights = await asyncio.to_thread(current_quant_weights)
     weights_text = (
-        f"SP {QUANT_WEIGHTS['sp_score']:.0%} / "
-        f"Offense {QUANT_WEIGHTS['offense_score']:.0%} / "
-        f"Bullpen {QUANT_WEIGHTS['bullpen_score']:.0%} / "
-        f"Defense {QUANT_WEIGHTS['defense_score']:.0%} / "
-        f"Weather/Park {QUANT_WEIGHTS['weather_park_score']:.0%} / "
-        f"Market {QUANT_WEIGHTS['market_value_score']:.0%} / "
-        f"Situational {QUANT_WEIGHTS['situational_score']:.0%}"
+        f"SP {quant_weights['sp_score']:.0%} / "
+        f"Offense {quant_weights['offense_score']:.0%} / "
+        f"Bullpen {quant_weights['bullpen_score']:.0%} / "
+        f"Defense {quant_weights['defense_score']:.0%} / "
+        f"Weather/Park {quant_weights['weather_park_score']:.0%} / "
+        f"Market {quant_weights['market_value_score']:.0%} / "
+        f"Situational {quant_weights['situational_score']:.0%}"
     )
     return (
         "🧠 BETGPTAI MISSION CONTROL\n\n"
@@ -2219,6 +2335,7 @@ async def _mission_control_health_text() -> str:
         f"Images Ready: {'✅ Yes' if images_ready else '➖ Not yet'}\n"
         f"Results Ready: {'✅ Yes' if results_ready else '❌ No'}\n"
         f"AI Learning: {'✅ Available' if learning_ready else '➖ No report yet'}\n"
+        f"{ai_learning_auto_apply_line()}\n"
         f"Ready To Publish: {'YES ✅' if ready_to_publish else 'NO ❌'}"
     )
 
@@ -3007,6 +3124,28 @@ async def model_review_admin(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await _send_intelligence_dashboard(update, "review")
 
 
+async def intel_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only Intelligence Dashboard debug report."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    await update.message.reply_text("⏳ Building BETGPTAI Intelligence debug report...")
+    selected_date = official_sports_date().isoformat()
+    try:
+        payload = await asyncio.to_thread(
+            build_intelligence_dashboard,
+            selected_date,
+            odds_api_key=os.getenv("ODDS_API_KEY", ""),
+            highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+        )
+        await _send_long_message(update, render_intel_debug(payload))
+    except Exception:
+        logging.exception("Unexpected /intel_debug error")
+        await update.message.reply_text(
+            "Unable to build the Intelligence debug report right now. Check terminal logs."
+        )
+
+
 async def _send_learning_view(update: Update, mode: str) -> None:
     """Build/send one owner-only AI Learning Engine view."""
     if not await _require_admin(update) or not update.message:
@@ -3053,6 +3192,46 @@ async def learning_status(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """Owner-only AI Learning Engine status."""
     del context
     await _send_learning_view(update, "status")
+
+
+async def learning_auto_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only AI Learning auto-apply status."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    text = await asyncio.to_thread(render_learning_auto_status)
+    await update.message.reply_text(text)
+
+
+async def toggle_learning_auto_apply_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only toggle for safe AI Learning auto-apply."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    payload = await asyncio.to_thread(toggle_learning_auto_apply)
+    await update.message.reply_text(
+        "🧠 AI Learning Auto Apply Updated\n\n"
+        f"Status: {'ON' if payload.get('enabled') else 'OFF'}\n"
+        f"Updated At: {payload.get('updated_at')}"
+    )
+
+
+async def weights_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only current model weights."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    text = await asyncio.to_thread(render_weights_admin)
+    await _send_long_message(update, text)
+
+
+async def weight_history_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only model-weight history."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    text = await asyncio.to_thread(render_weight_history_admin)
+    await _send_long_message(update, text)
 
 
 async def approve_weight_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3354,7 +3533,10 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🔧 SYSTEM DIAGNOSTICS\n"
         "/system_diagnostics · /callback_debug\n\n"
         "⏰ SCHEDULER\n"
-        "/time_debug · /scheduler_status · /post_status\n\n"
+        "/time_debug · /scheduler_status · /post_status\n"
+        "/force_generate_today · /force_post_today\n\n"
+        "💾 PICK PERSISTENCE\n"
+        "/save_today_picks · /saved_picks_today\n\n"
         "📋 LINEUPS\n"
         "/lineup_status\n\n"
         "🧠 MODEL REPORT\n"
@@ -3375,10 +3557,12 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/prepost_check · /integrity_report\n\n"
         "🧠 INTELLIGENCE DASHBOARD\n"
         "/daily_intel_admin · /morning_report_admin\n"
-        "/lineup_report_admin · /model_review_admin\n\n"
+        "/lineup_report_admin · /model_review_admin · /intel_debug\n\n"
         "🧠 AI LEARNING\n"
         "/learning_report_admin · /loss_review_admin\n"
         "/weight_suggestions_admin · /learning_status\n"
+        "/learning_auto_status · /toggle_learning_auto_apply\n"
+        "/weights_admin · /weight_history_admin\n"
         "/approve_weight_update · /reject_weight_update\n\n"
         "⚾ PLAYER PROP LAB\n"
         "/props_admin · /hits_admin · /hr_admin · /strikeouts_admin\n"
@@ -4581,6 +4765,10 @@ async def main() -> None:
     application.add_handler(CommandHandler("scheduler_status", scheduler_status))
     application.add_handler(CommandHandler("lineup_status", lineup_status))
     application.add_handler(CommandHandler("post_status", post_status))
+    application.add_handler(CommandHandler("force_generate_today", force_generate_today))
+    application.add_handler(CommandHandler("force_post_today", force_post_today))
+    application.add_handler(CommandHandler("save_today_picks", save_today_picks))
+    application.add_handler(CommandHandler("saved_picks_today", saved_picks_today))
     application.add_handler(CommandHandler("post_results_now", post_results_now))
     application.add_handler(CommandHandler("enable_auto_results", enable_auto_results))
     application.add_handler(CommandHandler("disable_auto_results", disable_auto_results))
@@ -4607,12 +4795,17 @@ async def main() -> None:
     application.add_handler(CommandHandler("morning_report_admin", morning_report_admin))
     application.add_handler(CommandHandler("lineup_report_admin", lineup_report_admin))
     application.add_handler(CommandHandler("model_review_admin", model_review_admin))
+    application.add_handler(CommandHandler("intel_debug", intel_debug))
     application.add_handler(CommandHandler("learning_report_admin", learning_report_admin))
     application.add_handler(CommandHandler("loss_review_admin", loss_review_admin))
     application.add_handler(CommandHandler("weight_suggestions_admin", weight_suggestions_admin))
     application.add_handler(CommandHandler("approve_weight_update", approve_weight_update))
     application.add_handler(CommandHandler("reject_weight_update", reject_weight_update))
     application.add_handler(CommandHandler("learning_status", learning_status))
+    application.add_handler(CommandHandler("learning_auto_status", learning_auto_status))
+    application.add_handler(CommandHandler("toggle_learning_auto_apply", toggle_learning_auto_apply_command))
+    application.add_handler(CommandHandler("weights_admin", weights_admin))
+    application.add_handler(CommandHandler("weight_history_admin", weight_history_admin))
     application.add_handler(CommandHandler("hr_admin", hr_admin))
     application.add_handler(CommandHandler("strikeouts_admin", strikeouts_admin))
     application.add_handler(CommandHandler("props_images_admin", props_images_admin))

@@ -1,10 +1,11 @@
 """BETGPTAI AI Learning Engine Phase 6.
 
-Learning-review mode only:
+Learning-review + safety-gated apply mode:
 - Reviews wins/losses after grading.
 - Classifies losing picks.
 - Saves small suggested weight changes.
-- Never applies suggestions until the owner approves them.
+- Applies automatically only when AI_LEARNING_AUTO_APPLY is enabled and every
+  safety limit passes; otherwise the owner approval workflow remains active.
 """
 
 from __future__ import annotations
@@ -22,13 +23,18 @@ from model_report import load_model_report
 from model_weights import (
     LEARNING_REPORTS_DIR,
     MODEL_WEIGHTS_FILE,
-    PENDING_WEIGHT_UPDATES_FILE,
+    ai_learning_auto_apply_enabled,
     approve_pending_weight_updates,
     clear_pending_weight_updates,
     ensure_model_weights,
+    latest_weight_history,
     learning_reports_count,
+    load_model_weights,
     load_pending_weight_updates,
+    maybe_auto_apply_weight_updates,
     save_pending_weight_updates,
+    toggle_ai_learning_auto_apply,
+    weight_history_files,
 )
 from results_tracker import load_picks
 from storage import data_file
@@ -176,6 +182,7 @@ def run_learning_review(card_date: str) -> dict[str, Any]:
             props_context=props_context,
         )
         tags = classification["loss_reason_tags"]
+        loss_reason_confidence = 50 if tags == ["unknown_variance"] else 75
         tag_counter.update(tags)
         suggestions = suggested_weight_changes_from_tags(tags)
         suggestion_parts.append(suggestions)
@@ -189,6 +196,7 @@ def run_learning_review(card_date: str) -> dict[str, Any]:
                 "selected_team_player": pick.get("selected_team") or pick.get("player_name"),
                 "result": pick.get("result"),
                 "loss_reason_tags": tags,
+                "loss_reason_confidence": loss_reason_confidence,
                 "confidence_before": pick.get("confidence_grade") or pick.get("risk_grade"),
                 "model_factors_used": _model_factors_used(pick, tags),
                 "notes": classification["notes"],
@@ -210,6 +218,10 @@ def run_learning_review(card_date: str) -> dict[str, Any]:
         "unknown_variance": unknown_variance,
         "actionable_losses": actionable_losses,
         "top_loss_reasons": tag_counter.most_common(10),
+        "loss_reason_confidence": min(
+            [float(item.get("loss_reason_confidence", 0)) for item in reviewed_losses],
+            default=0.0,
+        ) if reviewed_losses else 100.0,
         "reviewed_losses": reviewed_losses,
         "suggested_adjustments": merged_suggestions,
         "missing_data": missing_data,
@@ -220,6 +232,10 @@ def run_learning_review(card_date: str) -> dict[str, Any]:
     report["report_path"] = str(report_path)
     if merged_suggestions:
         save_pending_weight_updates(card_date, merged_suggestions)
+    auto_apply_result = maybe_auto_apply_weight_updates(report)
+    report["auto_apply"] = bool(auto_apply_result.get("auto_applied"))
+    report["auto_apply_result"] = auto_apply_result
+    _write_json(report_path, report)
     return report
 
 
@@ -265,7 +281,11 @@ def render_learning_report(report: dict[str, Any]) -> str:
     if report.get("missing_data"):
         lines.extend(["", "Missing Data Logged:"])
         lines.extend(f"- {item}" for item in report["missing_data"][:10])
-    lines.extend(["", "Auto Apply: OFF", f"Saved: {report.get('report_path', 'Unavailable')}"])
+    auto_result = report.get("auto_apply_result") if isinstance(report.get("auto_apply_result"), dict) else {}
+    auto_label = "ON" if auto_result.get("enabled") else "OFF"
+    if auto_result.get("enabled") and not auto_result.get("auto_applied"):
+        auto_label = "ON — blocked by safety gates"
+    lines.extend(["", f"Auto Apply: {auto_label}", f"Saved: {report.get('report_path', 'Unavailable')}"])
     return "\n".join(lines).strip()
 
 
@@ -301,7 +321,7 @@ def render_weight_suggestions() -> str:
     lines = [
         "⚖️ BETGPTAI WEIGHT SUGGESTIONS",
         f"📅 Date: {pending.get('card_date', 'Unavailable')}",
-        "Auto Apply: OFF",
+        f"Auto Apply: {'ON' if ai_learning_auto_apply_enabled() else 'OFF'}",
         "",
     ]
     if not suggestions:
@@ -322,13 +342,16 @@ def learning_status_payload() -> dict[str, Any]:
     pending = load_pending_weight_updates()
     last_reports = sorted(LEARNING_REPORTS_DIR.glob("*.json")) if LEARNING_REPORTS_DIR.exists() else []
     last_review = last_reports[-1].stem if last_reports else "None"
+    latest_history = latest_weight_history()
     return {
         "available": True,
         "last_review_date": last_review,
         "pending_updates": bool(pending.get("suggestions")),
         "current_weights_file": str(MODEL_WEIGHTS_FILE),
         "reports_saved": learning_reports_count(),
-        "auto_apply": False,
+        "auto_apply": ai_learning_auto_apply_enabled(),
+        "last_applied_date": Path(str(latest_history.get("history_path", ""))).stem if latest_history else "None",
+        "last_changes_applied": len(latest_history.get("changes_applied") or []) if latest_history else 0,
     }
 
 
@@ -341,8 +364,103 @@ def render_learning_status(payload: dict[str, Any]) -> str:
         f"Pending Updates: {'✅ Yes' if payload.get('pending_updates') else '❌ No'}\n"
         f"Current Weights File: {payload.get('current_weights_file')}\n"
         f"Reports Saved: {payload.get('reports_saved')}\n"
-        "Auto Apply: OFF"
+        f"Auto Apply: {'ON' if payload.get('auto_apply') else 'OFF'}"
     )
+
+
+def render_learning_auto_status() -> str:
+    """Render /learning_auto_status."""
+    payload = learning_status_payload()
+    return (
+        "🧠 BETGPTAI LEARNING AUTO-APPLY\n\n"
+        f"AI Learning Auto Apply: {'ON' if payload.get('auto_apply') else 'OFF'}\n"
+        f"Last Applied Date: {payload.get('last_applied_date')}\n"
+        f"Changes Applied: {payload.get('last_changes_applied')}\n"
+        "Current Model Version: BETGPTAI v20.0\n"
+        "Safety Limits:\n"
+        "- Max single factor/day: 0.05\n"
+        "- Max total movement/day: 0.15\n"
+        "- Max single factor/7 days: 0.15\n"
+        "- Minimum reviewed picks: 5\n"
+        "- Minimum loss reason confidence: 70%\n"
+        "Next Review: After nightly results grading"
+    )
+
+
+def toggle_learning_auto_apply() -> dict[str, Any]:
+    """Owner command entrypoint for toggling auto-apply."""
+    return toggle_ai_learning_auto_apply()
+
+
+def render_weights_admin() -> str:
+    """Render current model weights for owner diagnostics."""
+    weights = load_model_weights()
+    lines = ["⚖️ BETGPTAI MODEL WEIGHTS", "", f"File: {MODEL_WEIGHTS_FILE}", ""]
+    for key in sorted(weights):
+        lines.append(f"{key}: {float(weights[key]):.4f}")
+    return "\n".join(lines).strip()
+
+
+def render_weight_history_admin() -> str:
+    """Render recent model-weight history for owner diagnostics."""
+    files = weight_history_files(limit=10)
+    lines = ["🧾 BETGPTAI WEIGHT HISTORY", ""]
+    if not files:
+        lines.append("No weight history saved yet.")
+        return "\n".join(lines).strip()
+    for path in reversed(files):
+        payload = _read_json(path, {})
+        changes = payload.get("changes_applied") if isinstance(payload, dict) else []
+        lines.append(f"📅 {path.stem}")
+        if changes:
+            for item in changes[:8]:
+                lines.append(
+                    f"- {item.get('factor')}: {float(item.get('old_value', 0)):.4f} → "
+                    f"{float(item.get('new_value', 0)):.4f} ({float(item.get('change', 0)):+.4f})"
+                )
+        else:
+            lines.append("- No changes applied.")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def render_auto_apply_notification(report: dict[str, Any]) -> str:
+    """Render admin-only notification when auto-apply runs or is blocked."""
+    result = report.get("auto_apply_result") if isinstance(report.get("auto_apply_result"), dict) else {}
+    safety = result.get("safety_status") if isinstance(result.get("safety_status"), dict) else {}
+    changes = result.get("applied_updates") if isinstance(result.get("applied_updates"), list) else []
+    if not result.get("enabled"):
+        return ""
+    if not result.get("auto_applied"):
+        reasons = safety.get("reasons") if isinstance(safety.get("reasons"), list) else []
+        return (
+            "🧠 AI Learning Auto-Apply Blocked\n"
+            f"Date: {report.get('display_date')}\n"
+            f"Safety Status: Failed\n"
+            f"Reason: {'; '.join(reasons) if reasons else result.get('message', 'Blocked')}"
+        )
+    lines = [
+        "🧠 AI Learning Applied",
+        f"Date: {report.get('display_date')}",
+        "Changes:",
+    ]
+    if changes:
+        for item in changes:
+            lines.append(
+                f"- {item.get('factor')}: {float(item.get('old_value', 0)):.4f} → "
+                f"{float(item.get('new_value', 0)):.4f} ({float(item.get('change', 0)):+.4f})"
+            )
+    else:
+        lines.append("- None")
+    lines.extend(
+        [
+            "Before: saved in history file",
+            "After: model_weights.json updated",
+            "Safety Status: Passed",
+            f"Saved: {result.get('history_path', 'Unavailable')}",
+        ]
+    )
+    return "\n".join(lines).strip()
 
 
 def approve_weight_update() -> dict[str, Any]:

@@ -22,7 +22,7 @@ from typing import Any
 import requests
 
 from ai_analysis import analyze_mlb_slate, get_last_analysis_metadata
-from ai_learning_engine import render_learning_report, run_learning_review
+from ai_learning_engine import render_auto_apply_notification, render_learning_report, run_learning_review
 from card_time import EASTERN, official_sports_date
 from daily_workflow import (
     generate_cards_job,
@@ -44,6 +44,7 @@ from results_tracker import (
     grade_mlb_picks_for_date,
     load_picks,
     save_official_picks,
+    saved_picks_summary,
 )
 from soccer_analysis import analyze_soccer_slate
 from soccer_data import get_soccer_schedule, get_soccer_slate
@@ -569,6 +570,9 @@ async def post_daily_results_if_ready(
                 int(admin_id),
                 render_learning_report(learning_report),
             )
+            auto_apply_message = render_auto_apply_notification(learning_report)
+            if auto_apply_message:
+                await _send_long(bot, int(admin_id), auto_apply_message)
     except Exception:
         logging.exception("AI Learning review failed after automatic grading")
     card = await asyncio.to_thread(_build_auto_results_card, day)
@@ -643,7 +647,7 @@ def scheduler_status_text(day: str | None = None) -> str:
         f"Date: {display_date(str(payload.get('card_date')))}\n"
         f"Today’s first pitch: {times.get('first_pitch_et')}\n"
         f"T-50 Verification: {verification.get('ready_for_image_generation', 'Not run')}\n"
-        f"T-45 Generation: {generation.get('generated', 'Not run')}\n"
+        f"T-45 Generation: {generation.get('card_generation_complete', generation.get('generated', 'Not run'))}\n"
         f"T-43 Posting: {posting.get('status', 'Not run')}\n"
         f"Auto Posting: {'✅ Enabled' if payload.get('auto_post_enabled') else '❌ Disabled'}\n"
         f"Last scheduler error: {payload.get('last_scheduler_error', 'None')}"
@@ -661,13 +665,28 @@ def post_status_text(day: str | None = None) -> str:
     log = _read_log()
     posted_today = bool(log.get(f"posted_mlb_card_{selected_day}"))
     images_ready = bool(generation.get("mlb_image") or generation.get("best_hit_image"))
+    saved_summary = saved_picks_summary(selected_day)
+    todays_count = int(saved_summary.get("total") or 0)
+    card_generated = bool(generation.get("card_generation_complete"))
+    picks_saved = bool(generation.get("picks_saved")) or todays_count > 0
+    posting_ready = bool(
+        card_generated
+        and picks_saved
+        and payload.get("auto_post_enabled")
+        and not posted_today
+    )
     scheduler_payload = log.get("scheduler", {}) if isinstance(log.get("scheduler"), dict) else {}
     return (
         "📡 BETGPTAI POST STATUS\n\n"
         f"Auto Posting:\n{'Enabled ✅' if payload.get('auto_post_enabled') else 'Disabled ❌'}\n\n"
         f"Verification:\n{'Passed ✅' if verification.get('ready_for_image_generation') else 'Failed/Pending ❌'}\n\n"
-        f"Generation:\n{'Completed ✅' if generation.get('generated') else 'Pending'}\n\n"
-        f"Images:\n{'Ready ✅' if images_ready else 'Pending'}\n\n"
+        f"T-45 Card Generated:\n{'Yes ✅' if card_generated else 'No/Pending ❌'}\n\n"
+        f"Images Generated:\n{'Yes ✅' if generation.get('image_generation_complete') or images_ready else 'No — text fallback OK'}\n\n"
+        f"Picks Saved:\n{'Yes ✅' if picks_saved else 'No ❌'}\n\n"
+        f"Today's Picks Count:\n{todays_count}\n\n"
+        f"Last Save Time:\n{saved_summary.get('last_saved_time') or 'Unavailable'}\n\n"
+        f"Posting Ready:\n{'Yes ✅' if posting_ready else 'No ❌'}\n\n"
+        f"Last Generation Error:\n{generation.get('generation_error') or 'None'}\n\n"
         f"Posted Today:\n{'Yes ✅' if posted_today else 'No ❌'}\n\n"
         f"Next Scheduled Post:\n{times.get('post_time_et') or 'Unavailable'}\n\n"
         f"Timezone:\n{get_app_timezone()}\n\n"

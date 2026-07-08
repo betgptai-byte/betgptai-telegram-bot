@@ -19,9 +19,11 @@ from game_time import format_game_clock
 from mlb_data import get_combined_slate
 from openai_image_generator import generate_image_from_prompt
 from player_props_engine import build_player_props_lab
-from premium_card_formatter import render_pick_block
-from results_tracker import load_picks, save_official_picks
+from results_tracker import load_picks
+from services.mlb_war_room_enrichment import enrich_war_room_game, war_room_debug_rows
+from services.pick_persistence import save_official_card
 from storage import data_file
+from verification_engine import average_verification_score, enrich_mlb_slate_verification
 
 
 EASTERN = ZoneInfo("America/New_York")
@@ -207,6 +209,11 @@ def build_mlb_top5_admin_card(
     except Exception as error:
         slate = []
         errors.append(f"Slate unavailable: {error}")
+    if slate:
+        try:
+            slate = enrich_mlb_slate_verification(slate, card_date)
+        except Exception as error:
+            errors.append(f"ESPN verification unavailable: {error}")
     official_team_totals = _ranked_market_candidates(slate, "team_totals", limit=5)
     team_totals = official_team_totals or _inferred_team_totals(slate, limit=5)
     top5 = {
@@ -233,18 +240,18 @@ def build_mlb_top5_admin_card(
 
 
 def render_mlb_top5_admin_card(report: dict[str, Any]) -> str:
-    """Render the admin-only MLB Top 5 card."""
+    """Render the admin-only MLB Top 5 card as a compact scan board."""
     top5 = _dict(report.get("top5"))
     sections = [
         ("🔥 TOP 5 MONEYLINE", "moneyline"),
         ("⚾ TOP 5 F5 MONEYLINE", "f5_moneyline"),
         ("📈 TOP 5 RUNLINE", "runline"),
-        ("🔢 TOP 5 GAME TOTALS", "game_totals"),
-        ("🏟 TOP 5 TEAM TOTALS", "team_totals"),
+        ("📊 TOP 5 TOTALS", "game_totals"),
+        ("🎯 TOP 5 TEAM TOTALS", "team_totals"),
     ]
     lines = [
         "⚾ BETGPTAI ADMIN MLB TOP 5 CARD",
-        f"📅 Card Date: {report.get('display_date')}",
+        f"📅 {report.get('display_date')}",
         "🧪 Admin Only",
         "",
     ]
@@ -257,16 +264,33 @@ def render_mlb_top5_admin_card(report: dict[str, Any]) -> str:
         if not rows:
             lines.append("No qualified plays available.")
         else:
-            lines.extend(
-                render_pick_block(row, rank=index, show_data_quality=True)
-                for index, row in enumerate(rows[:5], start=1)
-            )
+            lines.extend(_compact_top5_line(row, index) for index, row in enumerate(rows[:5], start=1))
         lines.append("")
-    lines.extend([
-        "Rules: F5 is moneyline only. Sportsbook names hidden. Not saved to picks.json.",
-        f"Saved JSON: {report.get('report_path')}",
-    ])
     return "\n".join(str(line) for line in lines).strip()
+
+
+def _compact_top5_line(row: dict[str, Any], rank: int) -> str:
+    """Return one compact Top 5 admin line: pick + game time only."""
+    pick = _compact_pick_text(row)
+    time_label = _safe(row.get("game_time_et") or format_game_clock(row.get("game_time"), status=row.get("game_status")), "Time unavailable")
+    return f"{rank}. {pick} — {time_label}"
+
+
+def _compact_pick_text(row: dict[str, Any]) -> str:
+    """Clean admin candidate text for compact Top 5 presentation."""
+    market = str(row.get("market_type") or "").lower()
+    text = _safe(row.get("pick_text"), "Pick")
+    text = re.sub(r"\s*\|\s*Safer Alt:.*$", "", text).strip()
+    text = text.replace(" @ ", "/")
+    total_match = re.match(r"(?i)^(Over|Under)\s+(\d+(?:\.\d+)?)\s+\((.+?)\/(.+?)\)$", text)
+    if total_match:
+        direction, line, away, home = total_match.groups()
+        text = f"{away}/{home} {direction.title()} {line}"
+    if market == "moneyline" and not re.search(r"\bML\b", text, re.I):
+        text = f"{text} ML"
+    if market == "f5_moneyline" and "F5" not in text.upper():
+        text = f"{text} F5 ML"
+    return text
 
 
 def _display_date(card_date: str) -> str:
@@ -283,6 +307,12 @@ def _num(value: Any, default: float = 0.0) -> float:
 def _safe(value: Any, fallback: str = "Unavailable") -> str:
     text = str(value or "").strip()
     return text if text and text.lower() != "unavailable" else fallback
+
+
+def _na(value: Any) -> str:
+    """Render unavailable War Room values as N/A."""
+    text = str(value if value is not None else "").strip()
+    return text if text and text.lower() not in {"unavailable", "none", "null"} else "N/A"
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -456,22 +486,22 @@ def _ai_output_for_game(
     props_payload: dict[str, Any],
 ) -> dict[str, Any]:
     game_pk = game.get("game_pk") or game.get("game_id")
+    enrichment = _dict(game.get("war_room_enrichment")) or enrich_war_room_game(game)
     best_hit = (_props_by_game(props_payload, game_pk, "hits") or [{}])[0]
     best_hr = (_props_by_game(props_payload, game_pk, "home_runs") or [{}])[0]
     best_k = (_props_by_game(props_payload, game_pk, "strikeouts") or [{}])[0]
-    away = _safe(game.get("away_team"), "Away")
-    home = _safe(game.get("home_team"), "Home")
+    strongest = _safe(enrichment.get("strongest_lean"), "PASS — no qualifying quant edge")
     return {
-        "moneyline": f"{home} ML lean" if game.get("odds_status") == "available" else "Unavailable",
-        "f5": f"{home} F5 ML lean",
-        "runline": f"{home} runline lean",
-        "game_total": "Model total lean unavailable in admin report",
-        "team_total": "Team total lean unavailable in admin report",
+        "moneyline": strongest if "ML" in strongest else "PASS",
+        "f5": "Use F5 only if quant/SP edge qualifies" if strongest.startswith("PASS") else strongest.replace(" ML", " F5 ML"),
+        "runline": "PASS — no qualifying runline edge" if strongest.startswith("PASS") else "Review runline only if ML price is too high",
+        "game_total": "PASS — no qualifying total edge from quant output",
+        "team_total": "PASS — no qualifying team-total edge from quant output",
         "best_hit_prop": _safe(best_hit.get("player_name"), "Unavailable"),
         "best_hr_prop": _safe(best_hr.get("player_name"), "Unavailable"),
         "best_strikeout_prop": _safe(best_k.get("player_name"), "Unavailable"),
-        "confidence": _game_grade(game),
-        "strongest_lean_per_game": f"{away} @ {home}: {home} ML lean",
+        "confidence": enrichment.get("overall_grade"),
+        "strongest_lean_per_game": strongest,
     }
 
 
@@ -502,25 +532,37 @@ def _model_notes(game: dict[str, Any]) -> dict[str, list[str]]:
 
 
 def _game_report(game: dict[str, Any], props_payload: dict[str, Any]) -> dict[str, Any]:
+    enrichment = enrich_war_room_game(game)
+    game = {**game, "war_room_enrichment": enrichment}
     away = _side_context(game, "away")
     home = _side_context(game, "home")
     game_pk = game.get("game_pk") or game.get("game_id")
     weather = _weather_block(game)
+    game_context = _dict(enrichment.get("game_context"))
+    pitcher_context = _dict(enrichment.get("pitcher_context"))
+    weather_context = _dict(enrichment.get("weather_context"))
+    market_context = _dict(enrichment.get("market_context"))
     return {
         "game_pk": game_pk,
-        "game": f"{game.get('away_team')} @ {game.get('home_team')}",
-        "time_et": format_game_clock(game.get("game_time"), status=game.get("status")),
+        "game": f"{game_context.get('away_team')} @ {game_context.get('home_team')}",
+        "time_et": game_context.get("game_time_et"),
         "starting_pitchers": {
-            "away": _pitcher_block(away),
-            "home": _pitcher_block(home),
+            "away": {**_pitcher_block(away), **_dict(pitcher_context.get("away"))},
+            "home": {**_pitcher_block(home), **_dict(pitcher_context.get("home"))},
         },
-        "current_records": "Unavailable",
+        "current_records": f"{game_context.get('away_record')} / {game_context.get('home_record')}",
         "home_away": {
             "away": game.get("away_team"),
             "home": game.get("home_team"),
         },
-        "weather": weather,
-        "ballpark": weather["ballpark"],
+        "weather": {**weather, **weather_context},
+        "market_context": market_context,
+        "war_room_enrichment": enrichment,
+        "verification_score": enrichment.get("verification_score"),
+        "verification": enrichment.get("verification"),
+        "data_quality_grade": enrichment.get("data_quality_grade"),
+        "missing_fields_count": enrichment.get("missing_fields_count"),
+        "ballpark": game_context.get("venue") or weather["ballpark"],
         "offense": {
             "away": _offense_block(away),
             "home": _offense_block(home),
@@ -566,7 +608,7 @@ def _game_report(game: dict[str, Any], props_payload: dict[str, Any]) -> dict[st
         },
         "ai_output": _ai_output_for_game(game, props_payload),
         "model_notes": _model_notes(game),
-        "overall_grade": _game_grade(game),
+        "overall_grade": enrichment.get("overall_grade"),
     }
 
 
@@ -651,6 +693,7 @@ def build_mlb_admin_report(
         game_date=card_date,
         highlightly_api_key=highlightly_api_key,
     )
+    slate = enrich_mlb_slate_verification(slate, card_date)
     props_payload = build_player_props_lab(slate, card_date) if slate else {}
     official_card = ""
     saved_picks = 0
@@ -663,12 +706,15 @@ def build_mlb_admin_report(
                 "",
             )
             if save_picks and official_card:
-                saved_picks = save_official_picks(
-                    official_card,
-                    slate,
-                    card_date,
-                    source_command="mlb_admin",
-                )
+                save_result = save_official_card({
+                    "analysis": official_card,
+                    "slate": slate,
+                    "card_date": card_date,
+                    "source_command": "mlb_admin",
+                })
+                if not save_result.get("success"):
+                    raise RuntimeError(save_result.get("error") or "Pick persistence failed")
+                saved_picks = int(save_result.get("saved_pick_count") or 0)
         except RuntimeError:
             # If already inside an event loop, caller should pass through async wrapper.
             official_card = ""
@@ -693,6 +739,7 @@ def build_mlb_admin_report(
         "display_date": _display_date(card_date),
         "created_at": datetime.now(EASTERN).isoformat(timespec="seconds"),
         "saved_picks": saved_picks,
+        "verification_score": average_verification_score(slate),
         "games": games,
         "top_lists": top_lists,
         "todays_official_card": _official_card_summary(official_card, card_date),
@@ -722,6 +769,10 @@ async def build_mlb_admin_report_async(
             game_date=card_date,
             highlightly_api_key=highlightly_api_key,
         )
+        try:
+            slate = enrich_mlb_slate_verification(slate, card_date)
+        except Exception as error:
+            errors.append(f"ESPN verification unavailable: {error}")
     except Exception as error:
         slate = []
         errors.append(f"Slate unavailable: {error}")
@@ -742,14 +793,17 @@ async def build_mlb_admin_report_async(
             official_card = build_fallback_card(slate)
         if save_picks and official_card:
             try:
-                saved_picks = save_official_picks(
-                    official_card,
-                    slate,
-                    card_date,
-                    source_command="mlb_admin",
-                )
+                save_result = save_official_card({
+                    "analysis": official_card,
+                    "slate": slate,
+                    "card_date": card_date,
+                    "source_command": "mlb_admin",
+                })
+                if not save_result.get("success"):
+                    raise RuntimeError(save_result.get("error") or "Pick persistence failed")
+                saved_picks = int(save_result.get("saved_pick_count") or 0)
             except Exception as error:
-                errors.append(f"Pick saving unavailable: {error}")
+                errors.append(f"Pick saving failed: {error}")
     games = [_game_report(game, props_payload) for game in slate]
     top_lists = {
         "top_10_moneylines": _pick_lines(card_date, "moneyline"),
@@ -768,6 +822,7 @@ async def build_mlb_admin_report_async(
         "display_date": _display_date(card_date),
         "created_at": datetime.now(EASTERN).isoformat(timespec="seconds"),
         "saved_picks": saved_picks,
+        "verification_score": average_verification_score(slate),
         "games": games,
         "top_lists": top_lists,
         "todays_official_card": _official_card_summary(official_card, card_date),
@@ -787,6 +842,7 @@ def render_mlb_admin_report(report: dict[str, Any], *, full: bool = True) -> str
         "⚾ BETGPTAI OFFICIAL MLB WAR ROOM",
         f"📅 Date: {report.get('display_date')}",
         "🧪 ADMIN ONLY — NOT PUBLIC CARD",
+        f"Verification Score: {report.get('verification_score', 0)}/100",
         "",
     ]
     errors = report.get("errors") if isinstance(report.get("errors"), list) else []
@@ -843,6 +899,63 @@ def render_mlb_admin_report(report: dict[str, Any], *, full: bool = True) -> str
     return "\n".join(str(line) for line in lines).strip()
 
 
+def render_warroom_debug(report: dict[str, Any]) -> str:
+    """Render owner-only War Room enrichment diagnostics."""
+    rows = []
+    for game in report.get("games", []) if isinstance(report.get("games"), list) else []:
+        enrichment = _dict(game.get("war_room_enrichment"))
+        debug = dict(enrichment.get("debug") or {})
+        if not debug:
+            debug = {
+                "game_pk": game.get("game_pk"),
+                "records_found": False,
+                "weather_found": False,
+                "pitcher_stats_found": False,
+                "statcast_found": False,
+                "fangraphs_found": False,
+                "odds_found": False,
+            }
+        debug["game"] = game.get("game")
+        debug["missing_fields_count"] = game.get("missing_fields_count")
+        debug["data_quality_grade"] = game.get("data_quality_grade")
+        debug["verification_score"] = game.get("verification_score")
+        debug["verification_alerts"] = (
+            (_dict(game.get("verification")).get("admin_alerts"))
+            or (_dict(enrichment.get("debug")).get("verification_alerts"))
+            or []
+        )
+        rows.append(debug)
+    lines = [
+        "🧪 BETGPTAI WAR ROOM DEBUG",
+        f"📅 Date: {report.get('display_date')}",
+        "",
+    ]
+    if not rows:
+        lines.append("No War Room games were available.")
+        return "\n".join(lines).strip()
+    for row in rows:
+        lines.extend([
+            DIVIDER,
+            str(row.get("game") or "Game unavailable"),
+            f"game_pk: {row.get('game_pk')}",
+            f"records found: {'yes' if row.get('records_found') else 'no'}",
+            f"weather found: {'yes' if row.get('weather_found') else 'no'}",
+            f"pitcher stats found: {'yes' if row.get('pitcher_stats_found') else 'no'}",
+            f"statcast found: {'yes' if row.get('statcast_found') else 'no'}",
+            f"fangraphs found: {'yes' if row.get('fangraphs_found') else 'no'}",
+            f"odds found: {'yes' if row.get('odds_found') else 'no'}",
+            f"missing fields count: {row.get('missing_fields_count')}",
+            f"data quality grade: {row.get('data_quality_grade')}",
+        ])
+        alerts = row.get("verification_alerts") if isinstance(row.get("verification_alerts"), list) else []
+        lines.append(f"verification score: {row.get('verification_score', 0)}/100")
+        if alerts:
+            lines.append("verification alerts:")
+            lines.extend(f"- {alert}" for alert in alerts[:5])
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
 def _render_game(game: dict[str, Any], *, full: bool) -> list[str]:
     sp = _dict(game.get("starting_pitchers"))
     away_sp = _dict(sp.get("away"))
@@ -856,25 +969,27 @@ def _render_game(game: dict[str, Any], *, full: bool) -> list[str]:
         DIVIDER,
         f"Game: {game.get('game')}",
         f"Time ET: {game.get('time_et')}",
-        f"Starting Pitchers: {away_sp.get('name')} vs {home_sp.get('name')}",
-        f"Current Records: {game.get('current_records')}",
+        f"Starting Pitchers: {_na(away_sp.get('name'))} vs {_na(home_sp.get('name'))}",
+        f"Current Records: {_na(game.get('current_records'))}",
         f"Home/Away: {game.get('game')}",
-        f"Weather: {weather.get('temperature')} / Wind {weather.get('wind')}",
-        f"Ballpark: {game.get('ballpark')}",
+        f"Weather: {_na(weather.get('summary'))}",
+        f"Ballpark: {_na(game.get('ballpark'))}",
+        f"Data Quality: {_na(game.get('data_quality_grade'))} ({game.get('missing_fields_count')} missing fields)",
+        f"Verification Score: {game.get('verification_score', 0)}/100",
         f"⭐ Overall Grade: {game.get('overall_grade')}",
         "",
         DIVIDER,
         "SP Analysis",
-        f"Away SP ERA/WHIP: {away_sp.get('era')} / {away_sp.get('whip')}",
-        f"Away SP K%/BB%/HR9: {away_sp.get('k_pct')} / {away_sp.get('bb_pct')} / {away_sp.get('hr_per_9')}",
-        f"Away Pitch Mix: {away_sp.get('pitch_mix')}",
-        f"Away Velocity: {away_sp.get('pitch_velocity')}",
-        f"Away Expected Regression: {away_sp.get('expected_regression')}",
-        f"Home SP ERA/WHIP: {home_sp.get('era')} / {home_sp.get('whip')}",
-        f"Home SP K%/BB%/HR9: {home_sp.get('k_pct')} / {home_sp.get('bb_pct')} / {home_sp.get('hr_per_9')}",
-        f"Home Pitch Mix: {home_sp.get('pitch_mix')}",
-        f"Home Velocity: {home_sp.get('pitch_velocity')}",
-        f"Home Expected Regression: {home_sp.get('expected_regression')}",
+        f"Away SP ERA/WHIP: {_na(away_sp.get('ERA') or away_sp.get('era'))} / {_na(away_sp.get('WHIP') or away_sp.get('whip'))}",
+        f"Away SP K%/BB%/HR9: {_na(away_sp.get('K%') or away_sp.get('k_pct'))} / {_na(away_sp.get('BB%') or away_sp.get('bb_pct'))} / {_na(away_sp.get('HR/9') or away_sp.get('hr_per_9'))}",
+        f"Away Pitch Mix: {_na(away_sp.get('Pitch Mix') or away_sp.get('pitch_mix'))}",
+        f"Away Velocity: {_na(away_sp.get('Avg Velocity') or away_sp.get('pitch_velocity'))}",
+        f"Away Expected Regression: {_na(away_sp.get('expected_regression'))}",
+        f"Home SP ERA/WHIP: {_na(home_sp.get('ERA') or home_sp.get('era'))} / {_na(home_sp.get('WHIP') or home_sp.get('whip'))}",
+        f"Home SP K%/BB%/HR9: {_na(home_sp.get('K%') or home_sp.get('k_pct'))} / {_na(home_sp.get('BB%') or home_sp.get('bb_pct'))} / {_na(home_sp.get('HR/9') or home_sp.get('hr_per_9'))}",
+        f"Home Pitch Mix: {_na(home_sp.get('Pitch Mix') or home_sp.get('pitch_mix'))}",
+        f"Home Velocity: {_na(home_sp.get('Avg Velocity') or home_sp.get('pitch_velocity'))}",
+        f"Home Expected Regression: {_na(home_sp.get('expected_regression'))}",
         "",
     ]
     if not full:
@@ -924,11 +1039,11 @@ def _render_game(game: dict[str, Any], *, full: bool) -> list[str]:
         "",
         DIVIDER,
         "Weather",
-        f"Wind: {weather.get('wind')}",
-        f"Temperature: {weather.get('temperature')}",
-        f"Humidity: {weather.get('humidity')}",
-        f"Roof: {weather.get('roof')}",
-        f"Run environment: {weather.get('run_environment')}",
+        f"Wind: {_na(weather.get('wind'))}",
+        f"Temperature: {_na(weather.get('temp') or weather.get('temperature'))}",
+        f"Humidity: {_na(weather.get('humidity'))}",
+        f"Roof: {_na(weather.get('roof'))}",
+        f"Run environment: {_na(weather.get('run_environment'))}",
         "",
         DIVIDER,
         "AI Output",

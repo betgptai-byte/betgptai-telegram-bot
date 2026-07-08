@@ -66,6 +66,16 @@ def get_mlb_schedule(game_date: str | None = None) -> list[dict[str, Any]]:
     data = _get_json(MLB_SCHEDULE_URL, {
         "sportId": "1", "hydrate": "probablePitcher,team", "date": selected_date,
     })
+
+    def record_summary(team_side: dict[str, Any]) -> str | None:
+        record = team_side.get("leagueRecord") or {}
+        if record.get("summary"):
+            return record.get("summary")
+        wins, losses = record.get("wins"), record.get("losses")
+        if wins is not None and losses is not None:
+            return f"{wins}-{losses}"
+        return None
+
     games: list[dict[str, Any]] = []
     for date_group in data.get("dates", []):
         for game in date_group.get("games", []):
@@ -73,16 +83,23 @@ def get_mlb_schedule(game_date: str | None = None) -> list[dict[str, Any]]:
             home = game.get("teams", {}).get("home", {})
             games.append({
                 "game_id": game.get("gamePk"),
+                "game_pk": game.get("gamePk"),
                 "game_time": game.get("gameDate", "Unknown"),
                 "status": game.get("status", {}).get("detailedState", "Unknown"),
                 "away_team": away.get("team", {}).get("name", "Unknown"),
                 "home_team": home.get("team", {}).get("name", "Unknown"),
                 "away_team_id": away.get("team", {}).get("id"),
                 "home_team_id": home.get("team", {}).get("id"),
+                "away_record": record_summary(away),
+                "home_record": record_summary(home),
+                "away_record_pct": (away.get("leagueRecord") or {}).get("pct"),
+                "home_record_pct": (home.get("leagueRecord") or {}).get("pct"),
                 "away_pitcher": away.get("probablePitcher", {}).get("fullName", "TBD"),
                 "home_pitcher": home.get("probablePitcher", {}).get("fullName", "TBD"),
                 "away_pitcher_id": away.get("probablePitcher", {}).get("id"),
                 "home_pitcher_id": home.get("probablePitcher", {}).get("id"),
+                "away_pitcher_hand": (away.get("probablePitcher", {}).get("pitchHand") or {}).get("code"),
+                "home_pitcher_hand": (home.get("probablePitcher", {}).get("pitchHand") or {}).get("code"),
                 "venue": game.get("venue", {}).get("name"),
             })
     return games

@@ -18,6 +18,7 @@ MLB_TEAMS_URL = "https://statsapi.mlb.com/api/v1/teams"
 MLB_PEOPLE_SEARCH_URL = "https://statsapi.mlb.com/api/v1/people/search"
 MLB_PEOPLE_URL = "https://statsapi.mlb.com/api/v1/people"
 MLB_BOXSCORE_URL = "https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore"
+MLB_TEAM_ROSTER_URL = "https://statsapi.mlb.com/api/v1/teams/{team_id}/roster"
 REQUEST_TIMEOUT = 15
 
 
@@ -59,18 +60,41 @@ def _truthy_same_team(left: Any, right: Any) -> bool:
 
 
 @functools.lru_cache(maxsize=1)
-def _current_roster_index() -> dict[str, dict[str, Any]]:
-    """Build a cached player-name index from MLB teams hydrated with rosters."""
+def _mlb_teams() -> list[dict[str, Any]]:
+    """Return current MLB teams from MLB Stats API."""
     response = requests.get(
         MLB_TEAMS_URL,
-        params={"sportId": 1, "hydrate": "roster"},
+        params={"sportId": 1},
         timeout=REQUEST_TIMEOUT,
     )
     response.raise_for_status()
+    return [team for team in response.json().get("teams", []) if isinstance(team, dict)]
+
+
+def _active_roster_rows(team: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return active roster rows for one team using MLB Stats API."""
+    team_id = team.get("id")
+    if not team_id:
+        return []
+    response = requests.get(
+        MLB_TEAM_ROSTER_URL.format(team_id=team_id),
+        params={"rosterType": "active"},
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    return [
+        row for row in response.json().get("roster", [])
+        if isinstance(row, dict)
+    ]
+
+
+@functools.lru_cache(maxsize=1)
+def _current_roster_index() -> dict[str, dict[str, Any]]:
+    """Build a cached player-name index from MLB active roster endpoints."""
     index: dict[str, dict[str, Any]] = {}
-    for team in response.json().get("teams", []):
+    for team in _mlb_teams():
         team_name = team.get("name") or team.get("teamName")
-        for item in (team.get("roster") or {}).get("roster", []):
+        for item in _active_roster_rows(team):
             person = item.get("person") or {}
             player_name = person.get("fullName")
             if not player_name:
@@ -89,16 +113,10 @@ def _current_roster_index() -> dict[str, dict[str, Any]]:
 @functools.lru_cache(maxsize=1)
 def _current_roster_id_index() -> dict[str, dict[str, Any]]:
     """Build a cached active-roster index keyed by MLB player ID."""
-    response = requests.get(
-        MLB_TEAMS_URL,
-        params={"sportId": 1, "hydrate": "roster"},
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
     index: dict[str, dict[str, Any]] = {}
-    for team in response.json().get("teams", []):
+    for team in _mlb_teams():
         team_name = team.get("name") or team.get("teamName")
-        for item in (team.get("roster") or {}).get("roster", []):
+        for item in _active_roster_rows(team):
             person = item.get("person") or {}
             player_id = person.get("id")
             if not player_id:
@@ -288,6 +306,7 @@ def verify_player_team(player_name: str, expected_team: str = "") -> dict[str, A
     }
 
 
+@functools.lru_cache(maxsize=4096)
 def verify_player_team_by_id(player_id: Any, expected_team: str = "") -> dict[str, Any]:
     """Verify a player's current team using MLB Stats API player ID.
 
@@ -305,6 +324,24 @@ def verify_player_team_by_id(player_id: Any, expected_team: str = "") -> dict[st
         }
     try:
         roster_player = _current_roster_id_index().get(str(player_id))
+        if roster_player:
+            current_team = str(roster_player.get("current_team") or "")
+            active_roster = True
+            verified = active_roster and (not expected_team or _truthy_same_team(current_team, expected_team))
+            return {
+                "verified": verified,
+                "player_id": player_id,
+                "player_name": roster_player.get("player_name"),
+                "current_team": current_team,
+                "expected_team": expected_team,
+                "active_roster": active_roster,
+                "status": "verified_active_roster" if verified else "team_mismatch",
+                "reason": (
+                    f"{roster_player.get('player_name')} is active with {current_team}."
+                    if verified
+                    else f"{roster_player.get('player_name')} is active with {current_team}, not {expected_team}."
+                ),
+            }
         response = requests.get(
             f"{MLB_PEOPLE_URL}/{player_id}",
             params={"hydrate": "currentTeam"},

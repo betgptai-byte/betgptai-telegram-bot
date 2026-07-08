@@ -23,6 +23,7 @@ from model_report import load_model_report
 from player_props_engine import build_player_props_lab
 from results_tracker import load_picks
 from storage import data_file, storage_status
+from verification_engine import average_verification_score, enrich_mlb_slate_verification
 
 
 EASTERN = ZoneInfo("America/New_York")
@@ -177,8 +178,15 @@ def _prop_empty_reason(props_payload: dict[str, Any], prop_family: str) -> str:
         return "No strikeout props available because probable pitchers were missing."
     rejected = debug.get("rejected_props") if isinstance(debug.get("rejected_props"), list) else []
     verification = debug.get("player_verification_issues") if isinstance(debug.get("player_verification_issues"), list) else []
+    reason_counts = debug.get("reason_counts") if isinstance(debug.get("reason_counts"), dict) else {}
     if verification:
-        return f"No props available because player verification failed: {verification[0]}"
+        if reason_counts:
+            top_reasons = ", ".join(
+                f"{reason} ({count})"
+                for reason, count in sorted(reason_counts.items(), key=lambda item: item[1], reverse=True)[:3]
+            )
+            return f"No props available because all candidates failed verification/filtering: {top_reasons}."
+        return "No props available because all candidates failed player verification/filtering."
     if rejected:
         return f"No props available because candidates were rejected: {rejected[0]}"
     missing = debug.get("missing_fields") if isinstance(debug.get("missing_fields"), list) else []
@@ -459,6 +467,10 @@ def build_intelligence_dashboard(
         except Exception as schedule_error:
             errors.append(f"MLB schedule unavailable: {schedule_error}")
             slate = []
+    try:
+        slate = enrich_mlb_slate_verification(slate, card_date) if slate else slate
+    except Exception as error:
+        errors.append(f"ESPN verification unavailable: {error}")
 
     try:
         props = build_player_props_lab(slate, card_date) if slate else {}
@@ -498,6 +510,7 @@ def build_intelligence_dashboard(
             "storage_status": "healthy" if storage.get("results_database_healthy") else "unhealthy",
             "apis_status": statuses,
             "today_mlb_games": len(slate),
+            "verification_score": average_verification_score(slate),
             "lineup_status": _lineup_status(props),
             "starting_pitcher_status": _starting_pitcher_status(slate),
             "images_status": _image_status(card_date),
@@ -574,6 +587,7 @@ def render_daily_intel(payload: dict[str, Any]) -> str:
         "DAILY HEALTH",
         f"Storage: {health.get('storage_status')}",
         f"MLB Games: {health.get('today_mlb_games')}",
+        f"Verification Score: {health.get('verification_score', 0)}/100",
         f"Lineups: {health.get('lineup_status')}",
         f"Starting Pitchers: {health.get('starting_pitcher_status')}",
         f"Images: {health.get('images_status')}",

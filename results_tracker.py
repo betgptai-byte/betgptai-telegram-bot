@@ -59,6 +59,14 @@ def _read_json(path: Path, default: Any = None) -> Any:
 
 def _write_json(path: Path, data: Any) -> None:
     """Write JSON through a temporary file to avoid half-written tracker data."""
+    if path == PICKS_FILE:
+        try:
+            from services.pick_persistence import write_picks_payload
+
+            write_picks_payload(data, event="results_tracker_write")
+            return
+        except Exception as error:
+            raise ResultsTrackerError(f"Could not update {path.name}.") from error
     temporary_path = path.with_suffix(f"{path.suffix}.tmp")
     try:
         temporary_path.write_text(
@@ -92,8 +100,10 @@ def load_picks() -> list[dict[str, Any]]:
                 _normalize_saved_pick(leg, parent=pick)
                 leg_after = json.dumps(leg, sort_keys=True, default=str)
                 changed = changed or leg_before != leg_after
-    if changed:
-        _write_json(PICKS_FILE, cleaned)
+    # Do not write normalized legacy records during reads. Official pick writes
+    # are routed through services.pick_persistence so a read operation can never
+    # corrupt or partially rewrite picks.json.
+    _ = changed
     return cleaned
 
 
@@ -858,6 +868,51 @@ def _resolve_pick(
             game = matching_games[0]
             return resolved_game_payload(game, line=team_total["line"], odds=displayed_odds)
     if len(candidates) != 1:
+        # Schedule-only fallback: if odds are missing or a market does not have
+        # a usable price, still persist the official pick when it can be matched
+        # cleanly to one MLB game. This keeps results, posting, and learning from
+        # failing just because The Odds API had no current market data.
+        if pick_type in {"moneyline", "runline", "team_total"} and selected_team:
+            matching_games = [
+                game for game in slate
+                if any(
+                    _teams_match(str(game.get(key, "")), selected_team)
+                    for key in ("away_team", "home_team")
+                )
+            ]
+            if len(matching_games) == 1:
+                fallback_line = team_total["line"] if team_total else point
+                return resolved_game_payload(
+                    matching_games[0],
+                    line=fallback_line,
+                    odds=displayed_odds,
+                )
+        if pick_type == "total":
+            text = f"{selection} {context}".lower()
+
+            def total_mentions_game(game: dict[str, Any]) -> bool:
+                mentions = 0
+                for key in ("away_team", "home_team"):
+                    team = str(game.get(key) or "")
+                    nickname = team.split()[-1] if team.split() else ""
+                    if team and team.lower() in text:
+                        mentions += 1
+                    elif len(nickname) >= 4 and re.search(
+                        rf"\b{re.escape(nickname.lower())}\b", text
+                    ):
+                        mentions += 1
+                return mentions >= 1
+
+            matching_games = [game for game in slate if total_mentions_game(game)]
+            if len(matching_games) == 1:
+                return resolved_game_payload(
+                    matching_games[0],
+                    line=point,
+                    odds=displayed_odds,
+                )
+            if len(slate) == 1:
+                return resolved_game_payload(slate[0], line=point, odds=displayed_odds)
+    if len(candidates) != 1:
         return None
     game, wager = candidates[0]
     return resolved_game_payload(
@@ -1111,64 +1166,20 @@ def save_official_picks(
     pick_date: str | None = None,
     source_command: str = "unknown",
 ) -> int:
-    """Save a generated card immediately, regardless of scheduled game status."""
-    existing = load_picks()
-    if slate and not any(game.get("betgptai_quant_v20") for game in slate):
-        try:
-            slate = enrich_slate_with_quant_scores(slate, pick_date)
-        except Exception:
-            logging.exception("BETGPTAI v20 scoring unavailable while saving picks")
-    selected_date = pick_date or date.today().isoformat()
-    new_picks = extract_official_picks(analysis, slate, selected_date, source_command)
-    new_picks.extend(_approved_prop_records(selected_date, source_command))
-    if not new_picks:
-        raise ResultsTrackerError(
-            "The generated free card did not contain any trackable official picks."
-        )
+    """Save a generated card immediately through the Pick Persistence Service."""
+    from services.pick_persistence import save_official_card
 
-    required_fields = {
-        "pick_id", "card_date", "display_date", "sport", "source_command",
-        "game_pk", "home_team", "away_team", "market_type", "pick_text",
-        "game_time_et", "status", "created_at", "graded_at",
-        "model_version", "component_scores", "final_edge_score", "confidence",
-        "risk_level", "data_quality_grade", "league", "market_line", "odds",
-        "edge_score", "units", "weights_snapshot", "starting_pitchers",
-        "lineup_status", "weather_summary", "reason",
-    }
-    for pick in new_picks:
-        pick["source_command"] = source_command
-        _normalize_saved_pick(pick)
-        if not pick.get("pick_id"):
-            pick["pick_id"] = _new_pick_uuid()
-        missing = required_fields.difference(pick)
-        if missing:
-            raise ResultsTrackerError(
-                "An official pick is missing: " + ", ".join(sorted(missing))
-            )
-        # Picks are official as soon as the card is generated. They remain
-        # pending until /update_results later finds a final MLB score.
-        pick["result"] = None
-        pick["status"] = PENDING_RESULT
-        pick["profit_units"] = 0
-        pick["units_risked"] = 1
-        pick["units"] = 1
-        pick["units_won"] = 0
-
-    # Do not duplicate official picks when the same card is generated from a
-    # slash command, tap menu, or image preview. The unique key is:
-    # card_date + game_pk + market_type + selected_team + line.
-    existing_keys = {_official_dedupe_key(pick) for pick in existing}
-    saved_picks: list[dict[str, Any]] = []
-    new_keys: set[tuple[str, str, str, str, str]] = set()
-    for pick in new_picks:
-        key = _official_dedupe_key(pick)
-        if key in existing_keys or key in new_keys:
-            continue
-        new_keys.add(key)
-        saved_picks.append(pick)
-    _write_json(PICKS_FILE, existing + saved_picks)
-    _append_picks_log(saved_picks)
-    return len(saved_picks)
+    result = save_official_card(
+        {
+            "analysis": analysis,
+            "slate": slate,
+            "card_date": pick_date or date.today().isoformat(),
+            "source_command": source_command,
+        }
+    )
+    if not result.get("success"):
+        raise ResultsTrackerError(str(result.get("error") or "Pick persistence failed."))
+    return int(result.get("saved_pick_count") or 0)
 
 
 def saved_picks_summary(card_date: str) -> dict[str, Any]:

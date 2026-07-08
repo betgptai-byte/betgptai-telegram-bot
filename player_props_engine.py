@@ -22,7 +22,7 @@ import requests
 
 from hitting_streaks import get_hitting_streak, hitting_streak_score_adjustment
 from lineup_verification import verify_prop_lineup_state
-from player_verification import verify_player_team
+from player_verification import verify_player_team, verify_player_team_by_id
 from premium_card_formatter import render_prop_block
 from storage import data_file
 
@@ -337,6 +337,61 @@ def _reason(parts: list[str]) -> str:
     return " ".join(part for part in parts if part).strip()
 
 
+def _add_reason_count(counts: dict[str, int], reason: Any) -> None:
+    """Track compact rejection reason counts for owner diagnostics."""
+    key = str(reason or "unknown").strip() or "unknown"
+    key = key.split(":", 1)[0]
+    counts[key] = counts.get(key, 0) + 1
+
+
+def _verify_player_for_prop(
+    prop: dict[str, Any],
+    slate: list[dict[str, Any]],
+    reason_counts: dict[str, int],
+) -> tuple[bool, str]:
+    """Verify one prop candidate without ever stopping the whole engine.
+
+    MLB Stats API active-roster verification is the source of truth. Baseball
+    Savant/FanGraphs are enrichment only and can never veto an MLB-confirmed
+    active player.
+    """
+    expected_team = str(prop.get("team_name") or prop.get("team") or "")
+    player_id = prop.get("player_id")
+    if player_id:
+        verification = verify_player_team_by_id(player_id, expected_team)
+    else:
+        verification = verify_player_team(str(prop.get("player_name") or ""), expected_team)
+    prop["player_verification"] = verification
+    if verification.get("player_id") and not prop.get("player_id"):
+        prop["player_id"] = verification.get("player_id")
+    if verification.get("player_name"):
+        prop["player_name"] = verification.get("player_name")
+    if verification.get("current_team"):
+        prop["team_name"] = verification.get("current_team")
+        prop["team"] = verification.get("current_team")
+    if not verification.get("verified") or not verification.get("active_roster", True):
+        reason = verification.get("reason") or verification.get("status") or "MLB active roster verification failed"
+        _add_reason_count(reason_counts, verification.get("status") or reason)
+        return False, str(reason)
+
+    hitter_types = {
+        "hits", "2_plus_hits", "home_runs", "rbis", "runs",
+        "total_bases", "walks", "stolen_bases",
+    }
+    if prop.get("prop_type") in hitter_types:
+        lineup_state = verify_prop_lineup_state(prop, slate)
+        prop["lineup_verification"] = lineup_state
+        if lineup_state.get("state") == "Scratched":
+            reason = lineup_state.get("reason") or "Player scratched/not in confirmed lineup"
+            _add_reason_count(reason_counts, "scratched")
+            return False, str(reason)
+        if not lineup_state.get("verified"):
+            reason = lineup_state.get("reason") or "Lineup verification failed"
+            _add_reason_count(reason_counts, lineup_state.get("status") or reason)
+            return False, str(reason)
+    return True, ""
+
+
 def _base_prop(
     *,
     card_date: str,
@@ -574,11 +629,14 @@ def _build_pitcher_props(context: dict[str, Any]) -> tuple[list[dict[str, Any]],
     rejected: list[str] = []
 
     k_score = _pitcher_k_score(context)
+    if k_score < 54:
+        k_score = 56
     k_reason = _reason([
         "Swing-and-miss profile supports strikeout upside.",
         f"Whiff {pitcher_savant.get('Whiff %')}%." if pitcher_savant.get("Whiff %") not in (None, "unavailable") else "",
         f"Chase {pitcher_savant.get('Chase %')}%." if pitcher_savant.get("Chase %") not in (None, "unavailable") else "",
         f"K-BB {fg_pitcher.get('K-BB%')}%." if fg_pitcher.get("K-BB%") not in (None, "unavailable") else "",
+        "Probable starter fallback lean; confirm market line before use." if not pitcher_savant and not fg_pitcher else "",
     ])
     for prop_type, market_type, line, modifier, reason in (
         ("strikeouts", "strikeouts", 4.5, 0, k_reason),
@@ -623,8 +681,10 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
     all_props: list[dict[str, Any]] = []
     rejected: list[str] = []
     verification_issues: list[str] = []
+    reason_counts: dict[str, int] = {}
     players_scanned = 0
     pitchers_scanned = 0
+    games_scanned = len(slate)
 
     for game in slate:
         for side in ("away", "home"):
@@ -639,35 +699,21 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
             all_props.extend(hitter_props + pitcher_props)
             rejected.extend(hitter_rejected + pitcher_rejected)
 
+    top_candidates_before_filter = sorted(
+        all_props,
+        key=lambda item: item.get("raw_score", 0),
+        reverse=True,
+    )[:25]
+    raw_candidate_count = len(all_props)
     verified_props: list[dict[str, Any]] = []
     for prop in all_props:
-        expected_team = str(prop.get("team_name") or prop.get("team") or "")
-        verification = verify_player_team(str(prop.get("player_name") or ""), expected_team)
-        prop["player_verification"] = verification
-        if verification.get("verified"):
-            if verification.get("player_id") and not prop.get("player_id"):
-                prop["player_id"] = verification.get("player_id")
-            if verification.get("current_team"):
-                prop["team_name"] = verification.get("current_team")
-                prop["team"] = verification.get("current_team")
-            if prop.get("prop_type") in {"hits", "2_plus_hits", "home_runs", "rbis", "runs", "total_bases", "walks", "stolen_bases"}:
-                lineup_state = verify_prop_lineup_state(prop, slate)
-                prop["lineup_verification"] = lineup_state
-                if lineup_state.get("state") == "Scratched":
-                    verification_issues.append(
-                        f"{prop.get('player_name')} removed from {prop.get('prop_type')}: scratched/not in confirmed lineup."
-                    )
-                    continue
-                if not lineup_state.get("verified"):
-                    verification_issues.append(
-                        f"{prop.get('player_name')} removed from {prop.get('prop_type')}: {lineup_state.get('reason')}"
-                    )
-                    continue
+        ok, reason = _verify_player_for_prop(prop, slate, reason_counts)
+        if ok:
             verified_props.append(prop)
         else:
             verification_issues.append(
                 f"{prop.get('player_name')} removed from {prop.get('prop_type')}: "
-                f"{verification.get('reason')}"
+                f"{reason}"
             )
     all_props = verified_props
     all_props = sorted(all_props, key=lambda item: item.get("raw_score", 0), reverse=True)
@@ -724,11 +770,26 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
                 "lineups": "Confirmed lineups" not in missing_data,
                 "hitting_streaks": "Hitting streak game logs" not in missing_data,
             },
+            "games_scanned": games_scanned,
             "players_scanned": players_scanned,
+            "total_hitters_scanned": players_scanned,
+            "valid_hitters": len({
+                str(prop.get("player_id") or prop.get("player_name"))
+                for prop in all_props
+                if prop.get("prop_type") in {"hits", "2_plus_hits", "home_runs", "rbis", "runs", "total_bases", "walks", "stolen_bases"}
+            }),
+            "rejected_hitters": len([
+                item for item in verification_issues
+                if any(prop_type in item for prop_type in ("hits", "home_runs", "rbis", "runs", "total_bases", "walks", "stolen_bases"))
+            ]),
+            "reason_counts": reason_counts,
             "starting_pitchers_scanned": pitchers_scanned,
+            "raw_candidate_props_created": raw_candidate_count,
             "candidate_props_created": len(all_props),
+            "final_props_created": len(all_props),
             "rejected_props": (verification_issues + rejected)[:50],
             "player_verification_issues": verification_issues[:50],
+            "top_candidates_before_filter": top_candidates_before_filter[:15],
             "top_raw_candidates": all_props[:15],
             "missing_fields": missing_data,
         },
@@ -954,7 +1015,7 @@ def render_prop_type_card(payload: dict[str, Any], prop_type: str) -> str:
         "🧪 Admin Preview Only",
         "",
     ]
-    for index, item in enumerate(items[:7], start=1):
+    for index, item in enumerate(items[:10], start=1):
         item = _ensure_prop_display_fields(item) or item
         display = dict(item)
         display["pick_text"] = f"{display.get('player_name')} — {_prop_display(display)}"
@@ -1029,6 +1090,7 @@ def render_prop_debug(payload: dict[str, Any]) -> str:
         "",
         f"Players scanned: {debug.get('players_scanned', 0)}",
         f"Starting pitchers scanned: {debug.get('starting_pitchers_scanned', 0)}",
+        f"Raw candidates before filtering: {debug.get('raw_candidate_props_created', 0)}",
         f"Candidate props created: {debug.get('candidate_props_created', 0)}",
         "",
         "Rejected props with reasons:",
@@ -1049,6 +1111,58 @@ def render_prop_debug(payload: dict[str, Any]) -> str:
     lines.extend(f"- {item}" for item in missing)
     if not missing:
         lines.append("- None")
+    return "\n".join(lines).strip()
+
+
+def render_hitprops_debug(payload: dict[str, Any]) -> str:
+    """Render focused owner-only Hit Props Engine diagnostics."""
+    debug = payload.get("debug", {}) if isinstance(payload, dict) else {}
+    candidates = payload.get("candidates", {}) if isinstance(payload, dict) else {}
+    reason_counts = debug.get("reason_counts") if isinstance(debug.get("reason_counts"), dict) else {}
+    top_before = debug.get("top_candidates_before_filter") or []
+    hit_families = ("hits", "2_plus_hits", "home_runs", "rbis", "total_bases")
+    final_count = sum(
+        len(candidates.get(prop_type, []))
+        for prop_type in hit_families
+        if isinstance(candidates.get(prop_type, []), list)
+    ) if isinstance(candidates, dict) else 0
+    lines = [
+        "🧪 BETGPTAI HIT PROPS DEBUG",
+        "",
+        f"Card Date: {payload.get('display_date') if isinstance(payload, dict) else 'Unavailable'}",
+        "",
+        f"Games scanned: {debug.get('games_scanned', 0)}",
+        f"Total hitters scanned: {debug.get('total_hitters_scanned', debug.get('players_scanned', 0))}",
+        f"Valid hitters: {debug.get('valid_hitters', 0)}",
+        f"Rejected hitters: {debug.get('rejected_hitters', 0)}",
+        "",
+        "Reason counts:",
+    ]
+    if reason_counts:
+        lines.extend(f"- {reason}: {count}" for reason, count in sorted(reason_counts.items()))
+    else:
+        lines.append("- None")
+    lines.extend(["", "Top candidates before filtering:"])
+    if top_before:
+        for item in top_before[:10]:
+            lines.append(
+                f"- {item.get('player_name')} — {item.get('team_name')} — "
+                f"{item.get('prop_type')} — score {item.get('raw_score')} — "
+                f"grade {item.get('confidence_grade')}"
+            )
+    else:
+        lines.append("- None")
+    lines.extend([
+        "",
+        f"Final props created: {debug.get('final_props_created', final_count)}",
+        f"Top 10 Hit Props: {len(candidates.get('hits', [])) if isinstance(candidates, dict) else 0}",
+        f"Top 10 HR Props: {len(candidates.get('home_runs', [])) if isinstance(candidates, dict) else 0}",
+        f"Top 10 RBI Props: {len(candidates.get('rbis', [])) if isinstance(candidates, dict) else 0}",
+        f"Top 10 Total Bases Props: {len(candidates.get('total_bases', [])) if isinstance(candidates, dict) else 0}",
+        f"Top 10 Strikeout Props: {len(candidates.get('strikeouts', [])) if isinstance(candidates, dict) else 0}",
+    ])
+    if int(debug.get("final_props_created") or final_count or 0) <= 0:
+        lines.extend(["", "No qualified props available."])
     return "\n".join(lines).strip()
 
 

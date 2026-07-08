@@ -87,6 +87,7 @@ from mlb_admin_report import (
     prepare_mlb_admin_image,
     render_mlb_admin_report,
     render_mlb_top5_admin_card,
+    render_warroom_debug,
 )
 from model_report import load_model_report, save_model_report
 from mlb_auto_image import prepare_mlb_auto_image
@@ -101,12 +102,14 @@ from player_props_engine import (
     approve_prop,
     build_player_props_lab,
     player_props_engine_available,
+    render_hitprops_debug,
     render_hits_by_team_card,
     render_prop_debug,
     render_prop_type_card,
     render_props_test,
     render_props_admin_card,
 )
+from verification_engine import average_verification_score, enrich_mlb_slate_verification
 from api_sports_baseball import api_sports_baseball_available
 from fangraphs_data import (
     fangraphs_available,
@@ -131,6 +134,11 @@ from soccer_data import (
 )
 from soccer_results import SoccerResultsError, build_soccer_results_dashboard
 from storage import data_file, storage_status as get_storage_status
+from services.pick_persistence import (
+    render_save_debug,
+    repair_storage as repair_pick_storage,
+    save_debug as pick_persistence_debug,
+)
 from results_tracker import (
     ResultsTrackerError,
     available_card_dates,
@@ -463,6 +471,11 @@ def _save_official_mlb_card(
         card_date,
         source_command=source_command,
     )
+    summary = render_saved_picks_summary(card_date)
+    if saved_count <= 0 and "Total picks saved: 0" in summary:
+        raise ResultsTrackerError(
+            f"Pick Persistence Service reported success but no official picks exist for {card_date}."
+        )
     print(f"Saved {saved_count} official MLB picks for {card_date}.", flush=True)
     return saved_count
 
@@ -944,11 +957,12 @@ async def mlb_auto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 selected_date,
                 source_command,
             )
-        except Exception:
+        except Exception as error:
             logging.exception("Could not save official picks to picks.json")
             await update.message.reply_text(
-                "The card was generated, but its picks could not be saved. "
-                "No picks were sent. Check picks.json and try again."
+                "The card was generated, but its picks could not be saved.\n\n"
+                f"Error: {error!r}\n\n"
+                "No picks were sent."
             )
             return
 
@@ -1738,6 +1752,44 @@ async def saved_picks_today(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(text)
 
 
+async def save_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only diagnostics for the Pick Persistence Service."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+    try:
+        text = await asyncio.to_thread(render_save_debug, selected_date)
+    except Exception as error:
+        logging.exception("Unexpected /save_debug error")
+        text = f"Unable to inspect pick persistence right now.\n\nError: {error}"
+    await update.message.reply_text(text)
+
+
+async def repair_storage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only repair for core runtime JSON files."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    try:
+        payload = await asyncio.to_thread(repair_pick_storage)
+        lines = ["🛠 BETGPTAI STORAGE REPAIR", ""]
+        for filename, status in payload.items():
+            if isinstance(status, dict):
+                valid = "✅" if status.get("valid") else "❌"
+                created = "created" if status.get("created") else "checked"
+                path = status.get("path", filename)
+                lines.append(f"{filename}: {valid} {created}")
+                lines.append(f"Path: {path}")
+            else:
+                lines.append(f"{filename}: {status}")
+            lines.append("")
+        await update.message.reply_text("\n".join(lines).strip())
+    except Exception as error:
+        logging.exception("Unexpected /repair_storage error")
+        await update.message.reply_text(f"Unable to repair storage right now.\n\nError: {error}")
+
+
 async def post_results_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner-only manual run of the automatic results poster."""
     if not await _require_admin(update) or not update.message:
@@ -2287,6 +2339,7 @@ async def _mission_control_health_text() -> str:
     """Compact owner-only health snapshot for the inline Mission Control panel."""
     selected_date = official_sports_date().isoformat()
     storage_payload = await asyncio.to_thread(get_storage_status)
+    pick_storage_payload = await asyncio.to_thread(pick_persistence_debug, selected_date)
     slate: list[dict[str, Any]] = []
     try:
         slate = await asyncio.to_thread(
@@ -2295,6 +2348,7 @@ async def _mission_control_health_text() -> str:
             game_date=selected_date,
             highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
         )
+        slate = await asyncio.to_thread(enrich_mlb_slate_verification, slate, selected_date)
     except Exception as error:
         API_LOG.exception("component=MissionControl error=%s recovery=admin_snapshot_partial", error)
     images_dir = data_file("generated_cards") / selected_date
@@ -2311,6 +2365,7 @@ async def _mission_control_health_text() -> str:
     ready_to_publish = bool(slate and results_ready and weather_ready and quant_payload)
     ready_games = sum(1 for item in quant_payload if item.get("game_status") == "ready")
     quant_weights = await asyncio.to_thread(current_quant_weights)
+    verification_score = average_verification_score(slate)
     weights_text = (
         f"SP {quant_weights['sp_score']:.0%} / "
         f"Offense {quant_weights['offense_score']:.0%} / "
@@ -2324,8 +2379,12 @@ async def _mission_control_health_text() -> str:
         "🧠 BETGPTAI MISSION CONTROL\n\n"
         f"System Health: {'✅ Healthy' if storage_payload.get('writable') else '❌ Needs attention'}\n"
         f"Storage: {'✅ Healthy' if storage_payload.get('results_database_healthy') else '❌ Failed'}\n"
+        f"Picks Saved Today: {pick_storage_payload.get('todays_picks', 0)}\n"
+        f"Last Save: {pick_storage_payload.get('last_save_time', 'Unavailable')}\n"
+        f"Last Storage Error: {pick_storage_payload.get('last_error', 'None')}\n"
         "API Status: Use /status for full provider detail\n"
         f"Today's Games: {len(slate)}\n"
+        f"Verification Score: {verification_score}/100\n"
         f"v20 Engine: {'✅ Available' if v20_games else '➖ No slate scored yet'}\n"
         f"v20 Model: {QUANT_MODEL_VERSION}\n"
         f"v20 Qualified Edges: {v20_qualified}/{len(v20_games)}\n"
@@ -2407,6 +2466,8 @@ async def _send_props_lab(
             card = render_prop_type_card(payload, "strikeouts")
         elif mode == "debug":
             card = render_prop_debug(payload)
+        elif mode == "hitprops_debug":
+            card = render_hitprops_debug(payload)
         elif mode == "test":
             card = render_props_test(payload)
         else:
@@ -3322,6 +3383,28 @@ async def mlb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+async def warroom_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only War Room enrichment diagnostics."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+    await update.message.reply_text("⏳ Building War Room debug snapshot...")
+    try:
+        report = await build_mlb_admin_report_async(
+            selected_date,
+            odds_api_key=os.getenv("ODDS_API_KEY", ""),
+            openai_api_key=os.getenv("OPENAI_API_KEY", ""),
+            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
+            highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+            save_picks=False,
+        )
+        await _send_long_message(update, render_warroom_debug(report))
+    except Exception as error:
+        logging.exception("Unexpected /warroom_debug error")
+        await update.message.reply_text(f"Unable to build War Room debug right now.\n\nError: {error}")
+
+
 async def mlb_top5_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner-only Full MLB Top 5 admin card."""
     del context
@@ -3439,6 +3522,12 @@ async def prop_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await _send_props_lab(update, "debug")
 
 
+async def hitprops_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only focused Hit Props Engine diagnostics."""
+    del context
+    await _send_props_lab(update, "hitprops_debug")
+
+
 async def props_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner-only engine status card."""
     del context
@@ -3536,13 +3625,14 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/time_debug · /scheduler_status · /post_status\n"
         "/force_generate_today · /force_post_today\n\n"
         "💾 PICK PERSISTENCE\n"
-        "/save_today_picks · /saved_picks_today\n\n"
+        "/save_today_picks · /saved_picks_today\n"
+        "/save_debug · /repair_storage\n\n"
         "📋 LINEUPS\n"
         "/lineup_status\n\n"
         "🧠 MODEL REPORT\n"
         "/model_report\n\n"
         "⚾ MLB ADMIN CARDS\n"
-        "/mlb_admin · /mlb_top5_admin\n\n"
+        "/mlb_admin · /mlb_top5_admin · /warroom_debug\n\n"
         "📊 UPDATE RESULTS\n"
         "/update_results\n\n"
         "✅ GRADE PICKS\n"
@@ -3571,7 +3661,7 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/best_hit_image_admin · /post_best_hit_image_admin\n"
         "/verify_best_hit_prop · /clear_prop_cache\n"
         "/magazine_admin · /verify_player PLAYER_NAME\n"
-        "/props_test · /prop_debug\n"
+        "/props_test · /prop_debug · /hitprops_debug\n"
         "/approve_prop PROP_ID\n\n"
         "📝 BACKFILL PICKS\n"
         "/backfill_today\n\n"
@@ -4144,11 +4234,12 @@ async def _build_mlb_auto_card_for_menu() -> str:
             selected_date,
             "tap_menu_mlb_card",
         )
-    except Exception:
+    except Exception as error:
         logging.exception("Could not save official picks to picks.json")
         return (
-            "The card was generated, but its picks could not be saved. "
-            "No picks were sent. Check picks.json and try again."
+            "The card was generated, but its picks could not be saved.\n\n"
+            f"Error: {error!r}\n\n"
+            "No picks were sent."
         )
     return render_mlb_premium_card(selected_date)
 
@@ -4736,6 +4827,7 @@ async def main() -> None:
     application.add_handler(CommandHandler("mlb_auto", mlb_auto))
     application.add_handler(CommandHandler("generate_today", mlb_auto))
     application.add_handler(CommandHandler("mlb_admin", mlb_admin))
+    application.add_handler(CommandHandler("warroom_debug", warroom_debug))
     application.add_handler(CommandHandler("mlb_top5_admin", mlb_top5_admin))
     application.add_handler(CommandHandler("mlb_admin_image", mlb_admin_image))
     application.add_handler(CommandHandler("soccer", soccer))
@@ -4769,6 +4861,8 @@ async def main() -> None:
     application.add_handler(CommandHandler("force_post_today", force_post_today))
     application.add_handler(CommandHandler("save_today_picks", save_today_picks))
     application.add_handler(CommandHandler("saved_picks_today", saved_picks_today))
+    application.add_handler(CommandHandler("save_debug", save_debug))
+    application.add_handler(CommandHandler("repair_storage", repair_storage))
     application.add_handler(CommandHandler("post_results_now", post_results_now))
     application.add_handler(CommandHandler("enable_auto_results", enable_auto_results))
     application.add_handler(CommandHandler("disable_auto_results", disable_auto_results))
@@ -4818,6 +4912,7 @@ async def main() -> None:
     application.add_handler(CommandHandler("verify_player", verify_player_command))
     application.add_handler(CommandHandler("props_test", props_test))
     application.add_handler(CommandHandler("prop_debug", prop_debug))
+    application.add_handler(CommandHandler("hitprops_debug", hitprops_debug))
     application.add_handler(CommandHandler("approve_prop", approve_prop_command))
     application.add_handler(CommandHandler("soccer_full", soccer_owner_card))
     application.add_handler(CommandHandler("btts", soccer_owner_card))

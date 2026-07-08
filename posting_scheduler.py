@@ -185,12 +185,11 @@ async def _mlb_card(day: str) -> tuple[str, list[dict[str, Any]]]:
     await asyncio.to_thread(
         save_model_report, day, slate, card, get_last_analysis_metadata()
     )
-    try:
-        saved = await asyncio.to_thread(save_official_picks, card, slate, day)
-        print(f"Saved {saved} official picks to picks.json", flush=True)
-    except Exception:
-        # Posting remains available even when the tracker needs owner attention.
-        logging.exception("Could not save scheduled official picks")
+    saved = await asyncio.to_thread(save_official_picks, card, slate, day)
+    summary = saved_picks_summary(day)
+    if saved <= 0 and int(summary.get("total") or 0) <= 0:
+        raise RuntimeError(f"No official picks were saved for {day}; scheduled posting aborted.")
+    print(f"Saved {saved} official picks to picks.json", flush=True)
     _CARD_CACHE.setdefault(day, {}).update({"mlb_card": card, "mlb_slate": slate})
     return card, slate
 

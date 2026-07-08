@@ -1,7 +1,7 @@
 {
   "model_version": "BETGPTAI v20.0",
   "card_date": "2026-07-07",
-  "created_at": "2026-07-08T01:17:26Z",
+  "created_at": "2026-07-08T14:54:06Z",
   "games": [
     {
       "game_pk": 823062,
@@ -10,7 +10,7 @@
       "model_version": "BETGPTAI v20.0",
       "component_scores": {
         "sp_score": 100.0,
-        "offense_score": 57.31119999999999,
+        "offense_score": 56.94925,
         "bullpen_score": 55.0,
         "defense_score": 50.0,
         "weather_park_score": 52.0,
@@ -27,13 +27,13 @@
         "situational_score": 0.05
       },
       "sp_score": 100.0,
-      "offense_score": 57.31119999999999,
+      "offense_score": 56.94925,
       "bullpen_score": 55.0,
       "defense_score": 50.0,
       "weather_park_score": 52.0,
       "market_value_score": 50.0,
       "situational_score": 55.0,
-      "final_edge_score": 67.66,
+      "final_edge_score": 67.59,
       "minimum_edge_score": 82.0,
       "engine_decision": "PASS",
       "confidence": "PASS",
@@ -43,15 +43,15 @@
         "sp_score": {
           "side_scores": {
             "away": 100.0,
-            "home": 25.660000000000004
+            "home": 25.190000000000005
           },
           "available_fields": 12,
           "possible_fields": 12
         },
         "offense_score": {
           "side_scores": {
-            "away": 52.90325000000001,
-            "home": 55.21445
+            "away": 52.963100000000004,
+            "home": 54.91235
           },
           "available_fields": 8,
           "possible_fields": 8
@@ -89,7 +89,7 @@
         "matchup": "Milwaukee Brewers @ St. Louis Cardinals",
         "scores": {
           "sp_score": 100.0,
-          "offense_score": 57.31119999999999,
+          "offense_score": 56.94925,
           "bullpen_score": 55.0,
           "defense_score": 50.0,
           "weather_park_score": 52.0,
@@ -104,8 +104,8 @@
       "home_team": "Baltimore Orioles",
       "model_version": "BETGPTAI v20.0",
       "component_scores": {
-        "sp_score": 55.56000000000001,
-        "offense_score": 56.6854,
+        "sp_score": 58.07000000000001,
+        "offense_score": 56.7499,
         "bullpen_score": 55.0,
         "defense_score": 50.0,
         "weather_park_score": 52.0,
@@ -121,14 +121,14 @@
         "market_value_score": 0.1,
         "situational_score": 0.05
       },
-      "sp_score": 55.56000000000001,
-      "offense_score": 56.6854,
+      "sp_score": 58.07000000000001,
+      "offense_score": 56.7499,
       "bullpen_score": 55.0,
       "defense_score": 50.0,
       "weather_park_score": 52.0,
       "market_value_score": 50.0,
       "situational_score": 55.0,
-      "final_edge_score": 54.21,
+      "final_edge_score": 54.97,
       "minimum_edge_score": 82.0,
       "engine_decision": "PASS",
       "confidence": "PASS",
@@ -137,16 +137,16 @@
       "details": {
         "sp_score": {
           "side_scores": {
-            "away": 57.650000000000006,
-            "home": 57.089999999999996
+            "away": 59.59000000000001,
+            "home": 56.52
           },
           "available_fields": 12,
           "possible_fields": 12
         },
         "offense_score": {
           "side_scores": {
-            "away": 53.78945,
-            "home": 55.47485
+            "away": 53.735600000000005,
+            "home": 55.4855
           },
           "available_fields": 8,
           "possible_fields": 8
@@ -183,8 +183,8 @@
         "game_pk": 824820,
         "matchup": "Chicago Cubs @ Baltimore Orioles",
         "scores": {
-          "sp_score": 55.56000000000001,
-          "offense_score": 56.6854,
+          "sp_score": 58.07000000000001,
+          "offense_score": 56.7499,
           "bullpen_score": 55.0,
           "defense_score": 50.0,
           "weather_park_score": 52.0,
@@ -199,8 +199,8 @@
       "home_team": "Detroit Tigers",
       "model_version": "BETGPTAI v20.0",
       "component_scores": {
-        "sp_score": 64.47999999999998,
-        "offense_score": 55.5709,
+        "sp_score": 65.8,
+        "offense_score": 55.689400000000006,
         "bullpen_score": 55.0,
         "defense_score": 50.0,
         "weather_park_score": 42.0,
@@ -216,14 +216,14 @@
         "market_value_score": 0.1,
         "situational_score": 0.05
       },
-      "sp_score": 64.47999999999998,
-      "offense_score": 55.5709,
+      "sp_score": 65.8,
+      "offense_score": 55.689400000000006,
       "bullpen_score": 55.0,
       "defense_score": 50.0,
       "weather_park_score": 42.0,
       "market_value_score": 50.0,
       "situational_score": 55.0,
-      "final_edge_score": 55.66,
+      "final_edge_score": 56.08,
       "minimum_edge_score": 82.0,
       "engine_decision": "PASS",
       "confidence": "PASS",
@@ -232,16 +232,16 @@
       "details": {
         "sp_score": {
           "side_scores": {
-            "away": 78.11000000000001,
-            "home": 87.58999999999999
+            "away": 78.27000000000001,
+            "home": 89.07000000000001
           },
           "available_fields": 12,
           "possible_fields": 12
         },
         "offense_score": {
           "side_scores": {
-            "away": 54.18785,
-            "home": 54.75875
+            "away": 53.91215,
+            "home": 54.60155
           },
           "available_fields": 8,
           "possible_fields": 8
@@ -278,8 +278,8 @@
         "game_pk": 824254,
         "matchup": "Athletics @ Detroit Tigers",
         "scores": {
-          "sp_score": 64.47999999999998,
-          "offense_score": 55.5709,
+          "sp_score": 65.8,
+          "offense_score": 55.689400000000006,
           "bullpen_score": 55.0,
           "defense_score": 50.0,
           "weather_park_score": 42.0,
@@ -295,7 +295,7 @@
       "model_version": "BETGPTAI v20.0",
       "component_scores": {
         "sp_score": 100.0,
-        "offense_score": 55.576,
+        "offense_score": 55.6228,
         "bullpen_score": 55.0,
         "defense_score": 50.0,
         "weather_park_score": 42.0,
@@ -312,7 +312,7 @@
         "situational_score": 0.05
       },
       "sp_score": 100.0,
-      "offense_score": 55.576,
+      "offense_score": 55.6228,
       "bullpen_score": 55.0,
       "defense_score": 50.0,
       "weather_park_score": 42.0,
@@ -327,16 +327,16 @@
       "details": {
         "sp_score": {
           "side_scores": {
-            "away": 31.140000000000004,
-            "home": 80.5
+            "away": 19.840000000000003,
+            "home": 80.7
           },
           "available_fields": 12,
           "possible_fields": 12
         },
         "offense_score": {
           "side_scores": {
-            "away": 55.303250000000006,
-            "home": 55.879250000000006
+            "away": 55.1345,
+            "home": 55.7573
           },
           "available_fields": 8,
           "possible_fields": 8
@@ -374,7 +374,7 @@
         "matchup": "Atlanta Braves @ Pittsburgh Pirates",
         "scores": {
           "sp_score": 100.0,
-          "offense_score": 55.576,
+          "offense_score": 55.6228,
           "bullpen_score": 55.0,
           "defense_score": 50.0,
           "weather_park_score": 42.0,
@@ -389,8 +389,8 @@
       "home_team": "Miami Marlins",
       "model_version": "BETGPTAI v20.0",
       "component_scores": {
-        "sp_score": 68.58999999999999,
-        "offense_score": 58.2424,
+        "sp_score": 68.10000000000001,
+        "offense_score": 58.12705000000001,
         "bullpen_score": 55.0,
         "defense_score": 50.0,
         "weather_park_score": 42.0,
@@ -406,14 +406,14 @@
         "market_value_score": 0.1,
         "situational_score": 0.05
       },
-      "sp_score": 68.58999999999999,
-      "offense_score": 58.2424,
+      "sp_score": 68.10000000000001,
+      "offense_score": 58.12705000000001,
       "bullpen_score": 55.0,
       "defense_score": 50.0,
       "weather_park_score": 42.0,
       "market_value_score": 50.0,
       "situational_score": 55.0,
-      "final_edge_score": 57.43,
+      "final_edge_score": 57.26,
       "minimum_edge_score": 82.0,
       "engine_decision": "PASS",
       "confidence": "PASS",
@@ -422,16 +422,16 @@
       "details": {
         "sp_score": {
           "side_scores": {
-            "away": 69.14,
-            "home": 82.72999999999999
+            "away": 69.11,
+            "home": 82.21000000000001
           },
           "available_fields": 12,
           "possible_fields": 12
         },
         "offense_score": {
           "side_scores": {
-            "away": 53.166650000000004,
-            "home": 49.92425
+            "away": 53.12870000000001,
+            "home": 50.00165
           },
           "available_fields": 8,
           "possible_fields": 8
@@ -468,8 +468,8 @@
         "game_pk": 823847,
         "matchup": "Seattle Mariners @ Miami Marlins",
         "scores": {
-          "sp_score": 68.58999999999999,
-          "offense_score": 58.2424,
+          "sp_score": 68.10000000000001,
+          "offense_score": 58.12705000000001,
           "bullpen_score": 55.0,
           "defense_score": 50.0,
           "weather_park_score": 42.0,
@@ -484,8 +484,8 @@
       "home_team": "Tampa Bay Rays",
       "model_version": "BETGPTAI v20.0",
       "component_scores": {
-        "sp_score": 70.49000000000001,
-        "offense_score": 66.59935,
+        "sp_score": 72.01000000000002,
+        "offense_score": 66.328,
         "bullpen_score": 55.0,
         "defense_score": 50.0,
         "weather_park_score": 42.0,
@@ -501,14 +501,14 @@
         "market_value_score": 0.1,
         "situational_score": 0.05
       },
-      "sp_score": 70.49000000000001,
-      "offense_score": 66.59935,
+      "sp_score": 72.01000000000002,
+      "offense_score": 66.328,
       "bullpen_score": 55.0,
       "defense_score": 50.0,
       "weather_park_score": 42.0,
       "market_value_score": 50.0,
       "situational_score": 55.0,
-      "final_edge_score": 59.67,
+      "final_edge_score": 60.07,
       "minimum_edge_score": 82.0,
       "engine_decision": "PASS",
       "confidence": "PASS",
@@ -517,16 +517,16 @@
       "details": {
         "sp_score": {
           "side_scores": {
-            "away": 59.96999999999999,
-            "home": 75.46000000000001
+            "away": 58.76,
+            "home": 75.77000000000001
           },
           "available_fields": 12,
           "possible_fields": 12
         },
         "offense_score": {
           "side_scores": {
-            "away": 57.75605,
-            "home": 46.1567
+            "away": 57.5168,
+            "home": 46.1888
           },
           "available_fields": 8,
           "possible_fields": 8
@@ -563,8 +563,8 @@
         "game_pk": 822956,
         "matchup": "New York Yankees @ Tampa Bay Rays",
         "scores": {
-          "sp_score": 70.49000000000001,
-          "offense_score": 66.59935,
+          "sp_score": 72.01000000000002,
+          "offense_score": 66.328,
           "bullpen_score": 55.0,
           "defense_score": 50.0,
           "weather_park_score": 42.0,
@@ -579,8 +579,8 @@
       "home_team": "Washington Nationals",
       "model_version": "BETGPTAI v20.0",
       "component_scores": {
-        "sp_score": 82.58999999999999,
-        "offense_score": 58.2478,
+        "sp_score": 83.95999999999998,
+        "offense_score": 58.4785,
         "bullpen_score": 55.0,
         "defense_score": 50.0,
         "weather_park_score": 52.0,
@@ -596,14 +596,14 @@
         "market_value_score": 0.1,
         "situational_score": 0.05
       },
-      "sp_score": 82.58999999999999,
-      "offense_score": 58.2478,
+      "sp_score": 83.95999999999998,
+      "offense_score": 58.4785,
       "bullpen_score": 55.0,
       "defense_score": 50.0,
       "weather_park_score": 52.0,
       "market_value_score": 50.0,
       "situational_score": 55.0,
-      "final_edge_score": 62.63,
+      "final_edge_score": 63.08,
       "minimum_edge_score": 82.0,
       "engine_decision": "PASS",
       "confidence": "PASS",
@@ -612,16 +612,16 @@
       "details": {
         "sp_score": {
           "side_scores": {
-            "away": 40.140000000000015,
-            "home": 67.73
+            "away": 40.2,
+            "home": 69.15999999999998
           },
           "available_fields": 12,
           "possible_fields": 12
         },
         "offense_score": {
           "side_scores": {
-            "away": 53.38205000000001,
-            "home": 56.629850000000005
+            "away": 53.300450000000005,
+            "home": 56.77895
           },
           "available_fields": 8,
           "possible_fields": 8
@@ -658,8 +658,8 @@
         "game_pk": 822713,
         "matchup": "Houston Astros @ Washington Nationals",
         "scores": {
-          "sp_score": 82.58999999999999,
-          "offense_score": 58.2478,
+          "sp_score": 83.95999999999998,
+          "offense_score": 58.4785,
           "bullpen_score": 55.0,
           "defense_score": 50.0,
           "weather_park_score": 52.0,
@@ -674,8 +674,8 @@
       "home_team": "New York Mets",
       "model_version": "BETGPTAI v20.0",
       "component_scores": {
-        "sp_score": 62.85000000000001,
-        "offense_score": 56.06635000000001,
+        "sp_score": 62.36000000000001,
+        "offense_score": 55.96885,
         "bullpen_score": 55.0,
         "defense_score": 50.0,
         "weather_park_score": 42.0,
@@ -691,14 +691,14 @@
         "market_value_score": 0.1,
         "situational_score": 0.05
       },
-      "sp_score": 62.85000000000001,
-      "offense_score": 56.06635000000001,
+      "sp_score": 62.36000000000001,
+      "offense_score": 55.96885,
       "bullpen_score": 55.0,
       "defense_score": 50.0,
       "weather_park_score": 42.0,
       "market_value_score": 50.0,
       "situational_score": 55.0,
-      "final_edge_score": 55.27,
+      "final_edge_score": 55.1,
       "minimum_edge_score": 82.0,
       "engine_decision": "PASS",
       "confidence": "PASS",
@@ -707,16 +707,16 @@
       "details": {
         "sp_score": {
           "side_scores": {
-            "away": 44.63000000000001,
-            "home": 36.78
+            "away": 44.550000000000004,
+            "home": 37.19
           },
           "available_fields": 12,
           "possible_fields": 12
         },
         "offense_score": {
           "side_scores": {
-            "away": 54.741499999999995,
-            "home": 55.80785
+            "away": 55.06145,
+            "home": 56.030300000000004
           },
           "available_fields": 8,
           "possible_fields": 8
@@ -753,8 +753,8 @@
         "game_pk": 823607,
         "matchup": "Kansas City Royals @ New York Mets",
         "scores": {
-          "sp_score": 62.85000000000001,
-          "offense_score": 56.06635000000001,
+          "sp_score": 62.36000000000001,
+          "offense_score": 55.96885,
           "bullpen_score": 55.0,
           "defense_score": 50.0,
           "weather_park_score": 42.0,
@@ -769,8 +769,8 @@
       "home_team": "Cincinnati Reds",
       "model_version": "BETGPTAI v20.0",
       "component_scores": {
-        "sp_score": 92.11,
-        "offense_score": 55.778200000000005,
+        "sp_score": 92.69999999999999,
+        "offense_score": 55.398100000000014,
         "bullpen_score": 55.0,
         "defense_score": 50.0,
         "weather_park_score": 67.0,
@@ -786,14 +786,14 @@
         "market_value_score": 0.1,
         "situational_score": 0.05
       },
-      "sp_score": 92.11,
-      "offense_score": 55.778200000000005,
+      "sp_score": 92.69999999999999,
+      "offense_score": 55.398100000000014,
       "bullpen_score": 55.0,
       "defense_score": 50.0,
       "weather_park_score": 67.0,
       "market_value_score": 50.0,
       "situational_score": 55.0,
-      "final_edge_score": 66.49,
+      "final_edge_score": 66.59,
       "minimum_edge_score": 82.0,
       "engine_decision": "PASS",
       "confidence": "PASS",
@@ -802,16 +802,16 @@
       "details": {
         "sp_score": {
           "side_scores": {
-            "away": 97.01,
-            "home": 59.900000000000006
+            "away": 97.87,
+            "home": 60.17000000000001
           },
           "available_fields": 12,
           "possible_fields": 12
         },
         "offense_score": {
           "side_scores": {
-            "away": 53.7923,
-            "home": 54.5705
+            "away": 53.72644999999999,
+            "home": 54.124550000000006
           },
           "available_fields": 8,
           "possible_fields": 8
@@ -848,8 +848,8 @@
         "game_pk": 824495,
         "matchup": "Philadelphia Phillies @ Cincinnati Reds",
         "scores": {
-          "sp_score": 92.11,
-          "offense_score": 55.778200000000005,
+          "sp_score": 92.69999999999999,
+          "offense_score": 55.398100000000014,
           "bullpen_score": 55.0,
           "defense_score": 50.0,
           "weather_park_score": 67.0,
@@ -864,8 +864,8 @@
       "home_team": "Minnesota Twins",
       "model_version": "BETGPTAI v20.0",
       "component_scores": {
-        "sp_score": 60.759999999999984,
-        "offense_score": 61.87599999999999,
+        "sp_score": 58.44999999999999,
+        "offense_score": 61.9126,
         "bullpen_score": 55.0,
         "defense_score": 50.0,
         "weather_park_score": 52.0,
@@ -881,14 +881,14 @@
         "market_value_score": 0.1,
         "situational_score": 0.05
       },
-      "sp_score": 60.759999999999984,
-      "offense_score": 61.87599999999999,
+      "sp_score": 58.44999999999999,
+      "offense_score": 61.9126,
       "bullpen_score": 55.0,
       "defense_score": 50.0,
       "weather_park_score": 52.0,
       "market_value_score": 50.0,
       "situational_score": 55.0,
-      "final_edge_score": 56.8,
+      "final_edge_score": 56.12,
       "minimum_edge_score": 82.0,
       "engine_decision": "PASS",
       "confidence": "PASS",
@@ -897,16 +897,16 @@
       "details": {
         "sp_score": {
           "side_scores": {
-            "away": 68.26,
-            "home": 62.50000000000002
+            "away": 68.59,
+            "home": 65.14000000000001
           },
           "available_fields": 12,
           "possible_fields": 12
         },
         "offense_score": {
           "side_scores": {
-            "away": 46.226150000000004,
-            "home": 53.102149999999995
+            "away": 45.98524999999999,
+            "home": 52.89784999999999
           },
           "available_fields": 8,
           "possible_fields": 8
@@ -943,8 +943,8 @@
         "game_pk": 823687,
         "matchup": "Cleveland Guardians @ Minnesota Twins",
         "scores": {
-          "sp_score": 60.759999999999984,
-          "offense_score": 61.87599999999999,
+          "sp_score": 58.44999999999999,
+          "offense_score": 61.9126,
           "bullpen_score": 55.0,
           "defense_score": 50.0,
           "weather_park_score": 52.0,
@@ -959,8 +959,8 @@
       "home_team": "Chicago White Sox",
       "model_version": "BETGPTAI v20.0",
       "component_scores": {
-        "sp_score": 96.19,
-        "offense_score": 63.04495000000001,
+        "sp_score": 99.32999999999998,
+        "offense_score": 62.257000000000005,
         "bullpen_score": 55.0,
         "defense_score": 50.0,
         "weather_park_score": 67.0,
@@ -976,14 +976,14 @@
         "market_value_score": 0.1,
         "situational_score": 0.05
       },
-      "sp_score": 96.19,
-      "offense_score": 63.04495000000001,
+      "sp_score": 99.32999999999998,
+      "offense_score": 62.257000000000005,
       "bullpen_score": 55.0,
       "defense_score": 50.0,
       "weather_park_score": 67.0,
       "market_value_score": 50.0,
       "situational_score": 55.0,
-      "final_edge_score": 69.17,
+      "final_edge_score": 69.95,
       "minimum_edge_score": 82.0,
       "engine_decision": "PASS",
       "confidence": "PASS",
@@ -992,16 +992,16 @@
       "details": {
         "sp_score": {
           "side_scores": {
-            "away": 80.02000000000001,
-            "home": 38.83000000000001
+            "away": 81.77,
+            "home": 37.44000000000001
           },
           "available_fields": 12,
           "possible_fields": 12
         },
         "offense_score": {
           "side_scores": {
-            "away": 48.6875,
-            "home": 56.73245000000001
+            "away": 49.126549999999995,
+            "home": 56.38355
           },
           "available_fields": 8,
           "possible_fields": 8
@@ -1038,8 +1038,8 @@
         "game_pk": 824579,
         "matchup": "Boston Red Sox @ Chicago White Sox",
         "scores": {
-          "sp_score": 96.19,
-          "offense_score": 63.04495000000001,
+          "sp_score": 99.32999999999998,
+          "offense_score": 62.257000000000005,
           "bullpen_score": 55.0,
           "defense_score": 50.0,
           "weather_park_score": 67.0,
@@ -1054,8 +1054,8 @@
       "home_team": "St. Louis Cardinals",
       "model_version": "BETGPTAI v20.0",
       "component_scores": {
-        "sp_score": 81.04999999999998,
-        "offense_score": 57.31119999999999,
+        "sp_score": 75.21,
+        "offense_score": 56.94925,
         "bullpen_score": 55.0,
         "defense_score": 50.0,
         "weather_park_score": 52.0,
@@ -1071,14 +1071,14 @@
         "market_value_score": 0.1,
         "situational_score": 0.05
       },
-      "sp_score": 81.04999999999998,
-      "offense_score": 57.31119999999999,
+      "sp_score": 75.21,
+      "offense_score": 56.94925,
       "bullpen_score": 55.0,
       "defense_score": 50.0,
       "weather_park_score": 52.0,
       "market_value_score": 50.0,
       "situational_score": 55.0,
-      "final_edge_score": 61.98,
+      "final_edge_score": 60.15,
       "minimum_edge_score": 82.0,
       "engine_decision": "PASS",
       "confidence": "PASS",
@@ -1087,16 +1087,16 @@
       "details": {
         "sp_score": {
           "side_scores": {
-            "away": 71.14999999999999,
-            "home": 45.1
+            "away": 70.08,
+            "home": 49.870000000000005
           },
           "available_fields": 12,
           "possible_fields": 12
         },
         "offense_score": {
           "side_scores": {
-            "away": 52.90325000000001,
-            "home": 55.21445
+            "away": 52.963100000000004,
+            "home": 54.91235
           },
           "available_fields": 8,
           "possible_fields": 8
@@ -1133,8 +1133,8 @@
         "game_pk": 823035,
         "matchup": "Milwaukee Brewers @ St. Louis Cardinals",
         "scores": {
-          "sp_score": 81.04999999999998,
-          "offense_score": 57.31119999999999,
+          "sp_score": 75.21,
+          "offense_score": 56.94925,
           "bullpen_score": 55.0,
           "defense_score": 50.0,
           "weather_park_score": 52.0,
@@ -1149,8 +1149,8 @@
       "home_team": "Texas Rangers",
       "model_version": "BETGPTAI v20.0",
       "component_scores": {
-        "sp_score": 60.77999999999999,
-        "offense_score": 56.93319999999999,
+        "sp_score": 59.39999999999999,
+        "offense_score": 56.8216,
         "bullpen_score": 55.0,
         "defense_score": 50.0,
         "weather_park_score": 52.0,
@@ -1166,14 +1166,14 @@
         "market_value_score": 0.1,
         "situational_score": 0.05
       },
-      "sp_score": 60.77999999999999,
-      "offense_score": 56.93319999999999,
+      "sp_score": 59.39999999999999,
+      "offense_score": 56.8216,
       "bullpen_score": 55.0,
       "defense_score": 50.0,
       "weather_park_score": 52.0,
       "market_value_score": 50.0,
       "situational_score": 55.0,
-      "final_edge_score": 55.82,
+      "final_edge_score": 55.38,
       "minimum_edge_score": 82.0,
       "engine_decision": "PASS",
       "confidence": "PASS",
@@ -1182,16 +1182,16 @@
       "details": {
         "sp_score": {
           "side_scores": {
-            "away": 76.28000000000002,
-            "home": 82.06
+            "away": 77.3,
+            "home": 81.69999999999999
           },
           "available_fields": 12,
           "possible_fields": 12
         },
         "offense_score": {
           "side_scores": {
-            "away": 51.37805,
-            "home": 53.311249999999994
+            "away": 51.2738,
+            "home": 53.0954
           },
           "available_fields": 8,
           "possible_fields": 8
@@ -1228,8 +1228,8 @@
         "game_pk": 822881,
         "matchup": "Los Angeles Angels @ Texas Rangers",
         "scores": {
-          "sp_score": 60.77999999999999,
-          "offense_score": 56.93319999999999,
+          "sp_score": 59.39999999999999,
+          "offense_score": 56.8216,
           "bullpen_score": 55.0,
           "defense_score": 50.0,
           "weather_park_score": 52.0,
@@ -1244,8 +1244,8 @@
       "home_team": "San Diego Padres",
       "model_version": "BETGPTAI v20.0",
       "component_scores": {
-        "sp_score": 57.95,
-        "offense_score": 57.00565,
+        "sp_score": 67.86000000000001,
+        "offense_score": 57.24925,
         "bullpen_score": 55.0,
         "defense_score": 50.0,
         "weather_park_score": 42.0,
@@ -1261,14 +1261,14 @@
         "market_value_score": 0.1,
         "situational_score": 0.05
       },
-      "sp_score": 57.95,
-      "offense_score": 57.00565,
+      "sp_score": 67.86000000000001,
+      "offense_score": 57.24925,
       "bullpen_score": 55.0,
       "defense_score": 50.0,
       "weather_park_score": 42.0,
       "market_value_score": 50.0,
       "situational_score": 55.0,
-      "final_edge_score": 53.99,
+      "final_edge_score": 57.01,
       "minimum_edge_score": 82.0,
       "engine_decision": "PASS",
       "confidence": "PASS",
@@ -1277,8 +1277,8 @@
       "details": {
         "sp_score": {
           "side_scores": {
-            "away": 29.139999999999993,
-            "home": 32.089999999999996
+            "away": 29.23,
+            "home": 42.09000000000002
           },
           "available_fields": 12,
           "possible_fields": 12
@@ -1286,7 +1286,7 @@
         "offense_score": {
           "side_scores": {
             "away": 50.0,
-            "home": 52.00565
+            "home": 52.24925
           },
           "available_fields": 8,
           "possible_fields": 8
@@ -1323,8 +1323,8 @@
         "game_pk": 823280,
         "matchup": "Arizona Diamondbacks @ San Diego Padres",
         "scores": {
-          "sp_score": 57.95,
-          "offense_score": 57.00565,
+          "sp_score": 67.86000000000001,
+          "offense_score": 57.24925,
           "bullpen_score": 55.0,
           "defense_score": 50.0,
           "weather_park_score": 42.0,
@@ -1339,8 +1339,8 @@
       "home_team": "San Francisco Giants",
       "model_version": "BETGPTAI v20.0",
       "component_scores": {
-        "sp_score": 72.6,
-        "offense_score": 59.1229,
+        "sp_score": 82.09,
+        "offense_score": 59.128750000000004,
         "bullpen_score": 55.0,
         "defense_score": 50.0,
         "weather_park_score": 42.0,
@@ -1356,14 +1356,14 @@
         "market_value_score": 0.1,
         "situational_score": 0.05
       },
-      "sp_score": 72.6,
-      "offense_score": 59.1229,
+      "sp_score": 82.09,
+      "offense_score": 59.128750000000004,
       "bullpen_score": 55.0,
       "defense_score": 50.0,
       "weather_park_score": 42.0,
       "market_value_score": 50.0,
       "situational_score": 55.0,
-      "final_edge_score": 58.8,
+      "final_edge_score": 61.65,
       "minimum_edge_score": 82.0,
       "engine_decision": "PASS",
       "confidence": "PASS",
@@ -1372,16 +1372,16 @@
       "details": {
         "sp_score": {
           "side_scores": {
-            "away": 81.39999999999999,
-            "home": 63.800000000000004
+            "away": 78.95000000000002,
+            "home": 51.860000000000014
           },
           "available_fields": 12,
           "possible_fields": 12
         },
         "offense_score": {
           "side_scores": {
-            "away": 46.6202,
-            "home": 50.7431
+            "away": 46.240249999999996,
+            "home": 50.369
           },
           "available_fields": 8,
           "possible_fields": 8
@@ -1418,8 +1418,8 @@
         "game_pk": 823203,
         "matchup": "Toronto Blue Jays @ San Francisco Giants",
         "scores": {
-          "sp_score": 72.6,
-          "offense_score": 59.1229,
+          "sp_score": 82.09,
+          "offense_score": 59.128750000000004,
           "bullpen_score": 55.0,
           "defense_score": 50.0,
           "weather_park_score": 42.0,
@@ -1435,7 +1435,7 @@
       "model_version": "BETGPTAI v20.0",
       "component_scores": {
         "sp_score": 100.0,
-        "offense_score": 66.86529999999999,
+        "offense_score": 66.98665,
         "bullpen_score": 55.0,
         "defense_score": 50.0,
         "weather_park_score": 52.0,
@@ -1452,13 +1452,13 @@
         "situational_score": 0.05
       },
       "sp_score": 100.0,
-      "offense_score": 66.86529999999999,
+      "offense_score": 66.98665,
       "bullpen_score": 55.0,
       "defense_score": 50.0,
       "weather_park_score": 52.0,
       "market_value_score": 50.0,
       "situational_score": 55.0,
-      "final_edge_score": 69.57,
+      "final_edge_score": 69.6,
       "minimum_edge_score": 82.0,
       "engine_decision": "PASS",
       "confidence": "PASS",
@@ -1467,16 +1467,16 @@
       "details": {
         "sp_score": {
           "side_scores": {
-            "away": 17.07,
-            "home": 73.96000000000001
+            "away": 19.909999999999997,
+            "home": 76.93
           },
           "available_fields": 12,
           "possible_fields": 12
         },
         "offense_score": {
           "side_scores": {
-            "away": 49.37585,
-            "home": 61.24115
+            "away": 49.032199999999996,
+            "home": 61.01885
           },
           "available_fields": 8,
           "possible_fields": 8
@@ -1514,7 +1514,7 @@
         "matchup": "Colorado Rockies @ Los Angeles Dodgers",
         "scores": {
           "sp_score": 100.0,
-          "offense_score": 66.86529999999999,
+          "offense_score": 66.98665,
           "bullpen_score": 55.0,
           "defense_score": 50.0,
           "weather_park_score": 52.0,

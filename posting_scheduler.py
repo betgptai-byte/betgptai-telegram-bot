@@ -33,7 +33,7 @@ from daily_workflow import (
     workflow_status,
 )
 from game_time import parse_game_time
-from lineup_verification import invalidate_scratched_props, summarize_lineups
+from lineup_verification import invalidate_scratched_props, render_prop_scratch_alert, summarize_lineups
 from best_hit_prop_image import prepare_best_hit_prop_image
 from mlb_auto_image import prepare_mlb_auto_image
 from mlb_data import get_combined_slate, get_mlb_schedule
@@ -801,13 +801,14 @@ async def _refresh_lineup_states(bot: Any, day: str, current: datetime) -> None:
             )
             admin_id = os.getenv("MY_TELEGRAM_ID", "").strip()
             if admin_id:
+                scratched["best_hit_regenerated"] = bool(
+                    image_result.get("image_path") or image_result.get("prompt_path") or image_result.get("status")
+                )
+                alert_text = render_prop_scratch_alert(scratched)
                 await _send_long(
                     bot,
                     int(admin_id),
-                    "⚠️ BETGPTAI PROP SCRATCH ALERT\n\n"
-                    f"Invalidated props: {scratched.get('invalidated')}\n"
-                    f"Players: {', '.join(scratched.get('scratched') or [])}\n\n"
-                    f"Best Hit Prop regenerated: {image_result.get('image_path') or image_result.get('prompt_path') or image_result.get('status')}",
+                    alert_text,
                 )
     except Exception as error:
         logging.exception("Lineup refresh failed")

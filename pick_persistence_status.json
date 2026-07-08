@@ -1,8 +1,8 @@
 {
-  "success": true,
-  "error": "",
-  "saved_pick_count": 1,
-  "card_date": "2099-01-01",
+  "success": false,
+  "error": "ValueError('No trackable official picks were extracted from the generated card')",
+  "saved_pick_count": 0,
+  "card_date": "",
   "path": "/Users/yamikaleman/telegram-plays-bot/picks.json",
-  "last_save_time": "2026-07-07T19:53:39-04:00"
+  "last_save_time": ""
 }

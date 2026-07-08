@@ -78,6 +78,62 @@ def _candidate_base(game: dict[str, Any], market_type: str, pick_text: str, *, l
     }
 
 
+def _record_pct(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _preferred_side(game: dict[str, Any]) -> str:
+    """Admin-only schedule/quant fallback side when market prices are absent."""
+    away_pct = _record_pct(game.get("away_record_pct"))
+    home_pct = _record_pct(game.get("home_record_pct"))
+    if home_pct or away_pct:
+        return str(game.get("home_team") if home_pct >= away_pct else game.get("away_team"))
+    return str(game.get("home_team") or game.get("away_team") or "Team")
+
+
+def _admin_market_fallback_candidates(slate: list[dict[str, Any]], market: str, limit: int = 5) -> list[dict[str, Any]]:
+    """Create admin-only leans when odds are unavailable.
+
+    These are never saved to official public picks. They keep War Room and
+    Intelligence Dashboard usable while clearly marking market value as limited.
+    """
+    rows: list[dict[str, Any]] = []
+    for game in slate:
+        quant = _dict(game.get("betgptai_quant_v20") or game.get("betgptai_internal"))
+        edge = _num(quant.get("final_edge_score"), 50)
+        side = _preferred_side(game)
+        if market == "h2h":
+            pick_text, market_type, line = f"{side} ML", "moneyline", None
+        elif market == "f5_moneyline":
+            pick_text, market_type, line = f"{side} F5 ML", "f5_moneyline", None
+        elif market == "spreads":
+            pick_text, market_type, line = f"{side} +1.5", "runline", 1.5
+        elif market == "totals":
+            total = 8.5
+            direction = "Under" if "pitcher" in str(game.get("park_factor") or "").lower() else "Over"
+            pick_text, market_type, line = f"{game.get('away_team')}/{game.get('home_team')} {direction} {total:g}", "total", total
+        elif market == "team_totals":
+            direction, line, safer = "Over", 4.5, 3.5
+            pick_text, market_type = f"{side} Team Total {direction} {line:g} | Safer Alt: {direction} {safer:g}", "team_total"
+        else:
+            continue
+        row = _candidate_base(game, market_type, pick_text, line=line, odds=None)
+        row["score"] = edge
+        row["final_edge_score"] = edge
+        row["confidence"] = quant.get("confidence") or "Admin Candidate"
+        row["risk_level"] = quant.get("risk_level") or "Medium"
+        row["data_quality_grade"] = quant.get("data_quality_grade") or "B/C"
+        row["reason"] = "Admin lean from verified schedule/model context; market value limited until odds match."
+        row["market_value_score"] = "limited"
+        row["admin_market_fallback"] = True
+        rows.append(row)
+    rows.sort(key=lambda row: _num(row.get("score")), reverse=True)
+    return rows[:limit]
+
+
 def _ranked_market_candidates(slate: list[dict[str, Any]], market: str, limit: int = 5) -> list[dict[str, Any]]:
     """Build ranked admin candidates from best_available_prices."""
     rows: list[dict[str, Any]] = []
@@ -131,7 +187,7 @@ def _ranked_market_candidates(slate: list[dict[str, Any]], market: str, limit: i
         unique.append(row)
         if len(unique) >= limit:
             break
-    return unique
+    return unique or _admin_market_fallback_candidates(slate, market, limit=limit)
 
 
 def _top_f5_candidates(slate: list[dict[str, Any]], limit: int = 5) -> list[dict[str, Any]]:
@@ -147,7 +203,7 @@ def _top_f5_candidates(slate: list[dict[str, Any]], limit: int = 5) -> list[dict
         row["risk_level"] = "Medium"
         row["data_quality_grade"] = "Admin"
         rows.append(row)
-    return rows[:limit]
+    return rows[:limit] or _admin_market_fallback_candidates(slate, "f5_moneyline", limit=limit)
 
 
 def _inferred_team_totals(slate: list[dict[str, Any]], limit: int = 5) -> list[dict[str, Any]]:
@@ -215,7 +271,7 @@ def build_mlb_top5_admin_card(
         except Exception as error:
             errors.append(f"ESPN verification unavailable: {error}")
     official_team_totals = _ranked_market_candidates(slate, "team_totals", limit=5)
-    team_totals = official_team_totals or _inferred_team_totals(slate, limit=5)
+    team_totals = official_team_totals or _inferred_team_totals(slate, limit=5) or _admin_market_fallback_candidates(slate, "team_totals", limit=5)
     top5 = {
         "moneyline": _ranked_market_candidates(slate, "h2h", limit=5),
         "f5_moneyline": _top_f5_candidates(slate, limit=5),

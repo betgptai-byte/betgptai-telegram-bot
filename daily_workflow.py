@@ -22,7 +22,7 @@ from ai_analysis import analyze_mlb_slate, get_last_analysis_metadata, upcoming_
 from best_hit_prop_image import prepare_best_hit_prop_image
 from card_time import official_sports_date
 from elite_quant_engine import build_elite_quant_slate
-from lineup_verification import invalidate_scratched_props, summarize_lineups
+from lineup_verification import invalidate_scratched_props, render_prop_scratch_alert, summarize_lineups
 from mlb_auto_image import prepare_mlb_auto_image
 from mlb_data import get_combined_slate, get_mlb_schedule
 from model_report import save_model_report
@@ -411,12 +411,10 @@ async def generate_cards_job(bot: Any, card_date: str | None = None) -> dict[str
             errors.append(f"Best hit image failed: {image_error}")
         scratched = await asyncio.to_thread(invalidate_scratched_props, selected, slate)
         if scratched.get("invalidated"):
+            alert_text = render_prop_scratch_alert(scratched)
             await _notify_admin(
                 bot,
-                "⚠️ Scratched prop detected after generation.\n\n"
-                f"Invalidated: {scratched.get('invalidated')}\n"
-                f"Players: {', '.join(scratched.get('scratched') or [])}\n\n"
-                "Best Hit Prop image should be regenerated before posting if this affected the selected prop.",
+                alert_text,
             )
     except Exception as error:
         logging.exception("T-45 generation failed")

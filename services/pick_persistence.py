@@ -211,12 +211,71 @@ def _build_official_picks(card: Any) -> tuple[str, list[dict[str, Any]]]:
         except Exception:
             # Keep save resilient; missing quant should not corrupt storage.
             pass
-    picks = rt.extract_official_picks(analysis, slate, card_date, source)
-    picks.extend(rt._approved_prop_records(card_date, source))  # approved admin props, if any
+    explicit = card.get("official_picks") if isinstance(card, dict) and isinstance(card.get("official_picks"), list) else []
+    picks = [dict(pick) for pick in explicit if isinstance(pick, dict)]
     if not picks:
+        picks = rt.extract_official_picks(analysis, slate, card_date, source)
+    picks.extend(rt._approved_prop_records(card_date, source))  # approved admin props, if any
+    had_pre_guard_picks = bool(picks)
+    if _public_market_guard_enabled(source):
+        picks = _filter_public_market_context(picks, slate)
+    if not picks:
+        if had_pre_guard_picks:
+            raise ValueError(
+                "No public picks saved because no generated picks had matched market context. "
+                "Check /odds_debug or set ADMIN_MARKET_OVERRIDE=true for owner override."
+            )
         raise ValueError("No trackable official picks were extracted from the generated card")
     normalized = [_normalize_for_contract(pick) for pick in picks]
     return card_date, normalized
+
+
+def _public_market_guard_enabled(source: str) -> bool:
+    """Public cards need market context unless owner explicitly overrides."""
+    if os.getenv("ADMIN_MARKET_OVERRIDE", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return False
+    return source in {
+        "mlb_auto",
+        "generate_today",
+        "force_generate_today",
+        "scheduled_t45_generation",
+        "scheduled_post",
+        "today",
+        "card_debug",
+        "save_today_picks",
+    }
+
+
+def _game_has_market_context(game_pk: Any, slate: list[dict[str, Any]]) -> bool:
+    if isinstance(game_pk, list):
+        return all(_game_has_market_context(item, slate) for item in game_pk)
+    for game in slate:
+        if str(game.get("game_pk") or game.get("game_id")) == str(game_pk):
+            return bool(game.get("best_available_prices"))
+    return False
+
+
+def _filter_public_market_context(picks: list[dict[str, Any]], slate: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep only public picks whose game has a matched Odds API market."""
+    filtered: list[dict[str, Any]] = []
+    skipped = 0
+    for pick in picks:
+        if _game_has_market_context(pick.get("game_pk") or pick.get("game_id"), slate):
+            filtered.append(pick)
+        else:
+            skipped += 1
+    if skipped:
+        _log_storage(
+            {
+                "component": "pick_persistence",
+                "event": "public_pick_market_context_skipped",
+                "card_date": picks[0].get("card_date") if picks else None,
+                "pick_count": skipped,
+                "save_path": str(PICKS_FILE),
+                "exception": "Skipped public picks without matched market context. Set ADMIN_MARKET_OVERRIDE=true to allow.",
+            }
+        )
+    return filtered
 
 
 def save_official_card(card: Any) -> dict[str, Any]:

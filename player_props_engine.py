@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 from hitting_streaks import get_hitting_streak, hitting_streak_score_adjustment
-from lineup_verification import verify_prop_lineup_state
+from lineup_verification import verify_pitcher_prop_start_state, verify_prop_lineup_state
 from player_verification import verify_player_team, verify_player_team_by_id
 from premium_card_formatter import render_prop_block
 from storage import data_file
@@ -373,6 +373,19 @@ def _verify_player_for_prop(
         reason = verification.get("reason") or verification.get("status") or "MLB active roster verification failed"
         _add_reason_count(reason_counts, verification.get("status") or reason)
         return False, str(reason)
+
+    pitcher_types = {"strikeouts", "pitcher_outs_recorded", "earned_runs", "hits_allowed"}
+    pitcher_check = verify_pitcher_prop_start_state(prop, slate)
+    if prop.get("prop_type") in pitcher_types:
+        prop["pitcher_verification"] = pitcher_check
+        if not pitcher_check.get("verified"):
+            reason = pitcher_check.get("reason") or "Starting pitcher verification failed"
+            _add_reason_count(reason_counts, pitcher_check.get("status") or reason)
+            return False, str(reason)
+        return True, ""
+    if pitcher_check.get("verified"):
+        prop["pitcher_verification"] = pitcher_check
+        return True, ""
 
     hitter_types = {
         "hits", "2_plus_hits", "home_runs", "rbis", "runs",

@@ -79,8 +79,13 @@ from intelligence_dashboard import (
     render_model_review,
     render_morning_report,
 )
-from lineup_verification import render_lineup_status, summarize_lineups
-from mlb_data import MLBDataError, get_combined_slate
+from lineup_verification import (
+    prop_scratch_debug_payload,
+    render_lineup_status,
+    render_prop_scratch_debug,
+    summarize_lineups,
+)
+from mlb_data import MLBDataError, get_combined_slate, odds_debug_payload
 from mlb_admin_report import (
     build_mlb_admin_report_async,
     build_mlb_top5_admin_card,
@@ -138,6 +143,7 @@ from services.pick_persistence import (
     render_save_debug,
     repair_storage as repair_pick_storage,
     save_debug as pick_persistence_debug,
+    save_official_card as persist_official_card,
 )
 from results_tracker import (
     ResultsTrackerError,
@@ -148,6 +154,7 @@ from results_tracker import (
     debug_picks_summary,
     display_date,
     eastern_today,
+    extract_official_picks,
     grade_debug_report,
     grade_mlb_picks_for_date,
     get_most_recent_featured_picks,
@@ -155,7 +162,6 @@ from results_tracker import (
     missing_results_message,
     normalize_pick_date,
     render_saved_picks_summary,
-    save_official_picks,
     save_soccer_picks,
     update_results_from_mlb,
 )
@@ -229,6 +235,8 @@ ADMIN_CALLBACKS = {
     "admin_full_mlb_card",
     "admin_mlb_top5_card",
     "admin_system_diagnostics",
+    "admin_odds_debug",
+    "admin_card_debug",
 }
 
 
@@ -465,12 +473,15 @@ def _save_official_mlb_card(
         analysis=analysis,
         slate=slate,
     )
-    saved_count = save_official_picks(
-        analysis,
-        slate,
-        card_date,
-        source_command=source_command,
-    )
+    save_result = persist_official_card({
+        "analysis": analysis,
+        "slate": slate,
+        "card_date": card_date,
+        "source_command": source_command,
+    })
+    if not save_result.get("success"):
+        raise ResultsTrackerError(str(save_result.get("error") or "Pick persistence failed"))
+    saved_count = int(save_result.get("saved_pick_count") or 0)
     summary = render_saved_picks_summary(card_date)
     if saved_count <= 0 and "Total picks saved: 0" in summary:
         raise ResultsTrackerError(
@@ -590,6 +601,15 @@ def _results_date_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         *date_rows,
         [InlineKeyboardButton("⬅️ Back", callback_data="menu:results_hub")],
+    ])
+
+
+def _system_diagnostics_markup() -> InlineKeyboardMarkup:
+    """Owner-only System Diagnostics buttons."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧪 Odds Debug", callback_data="admin_odds_debug")],
+        [InlineKeyboardButton("🧪 Card Debug", callback_data="admin_card_debug")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="admin_back")],
     ])
 
 
@@ -1336,6 +1356,8 @@ async def callback_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "admin_generate_images",
         "admin_debug_results",
         "admin_system_diagnostics",
+        "admin_odds_debug",
+        "admin_card_debug",
         "admin_back",
     ]
     await update.message.reply_text(
@@ -1632,6 +1654,30 @@ async def lineup_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(f"Unable to inspect lineup status right now.\n\nError: {error}")
 
 
+async def prop_scratch_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only diagnostics for prop scratch false-invalidation protection."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+    try:
+        slate = await asyncio.to_thread(
+            get_combined_slate,
+            os.getenv("ODDS_API_KEY", ""),
+            game_date=selected_date,
+            highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+        )
+        payload = await asyncio.to_thread(
+            prop_scratch_debug_payload,
+            selected_date,
+            upcoming_mlb_slate(slate),
+        )
+        await update.message.reply_text(render_prop_scratch_debug(payload))
+    except Exception as error:
+        logging.exception("Unexpected /prop_scratch_debug error")
+        await update.message.reply_text(f"Unable to inspect prop scratch status right now.\n\nError: {error}")
+
+
 async def post_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner-only automatic channel posting status."""
     del context
@@ -1711,13 +1757,18 @@ async def save_today_picks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         saved = 0
         for attempt in (1, 2):
             try:
-                saved = await asyncio.to_thread(
-                    save_official_picks,
-                    card,
-                    upcoming_mlb_slate(slate),
-                    selected_date,
-                    "save_today_picks",
+                save_result = await asyncio.to_thread(
+                    persist_official_card,
+                    {
+                        "analysis": card,
+                        "slate": upcoming_mlb_slate(slate),
+                        "card_date": selected_date,
+                        "source_command": "save_today_picks",
+                    },
                 )
+                if not save_result.get("success"):
+                    raise ResultsTrackerError(str(save_result.get("error") or "Pick persistence failed"))
+                saved = int(save_result.get("saved_pick_count") or 0)
                 last_error = None
                 break
             except Exception as error:
@@ -3405,6 +3456,171 @@ async def warroom_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(f"Unable to build War Room debug right now.\n\nError: {error}")
 
 
+def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> str:
+    """Render owner-only Odds API diagnostics without exposing the API key."""
+    lines = [
+        "🧪 BETGPTAI ODDS DEBUG",
+        f"📅 Date: {display_date(selected_date)}",
+        "",
+        f"ODDS_API_KEY loaded: {'yes' if payload.get('odds_api_key_loaded') else 'no'}",
+        f"Odds API status code: {payload.get('odds_api_status_code') or 'Unavailable'}",
+        f"Sports key used: {payload.get('sport_key')}",
+        f"Markets requested: {payload.get('markets_requested')}",
+        f"Games returned: {payload.get('games_returned')}",
+        f"Matched MLB games: {payload.get('matched_to_mlb_game_pk')}",
+        f"Unmatched MLB games: {len(payload.get('unmatched_mlb_games') or [])}",
+        f"Unmatched odds games: {len(payload.get('unmatched_odds_games') or [])}",
+        f"Last error: {payload.get('last_error') or 'None'}",
+        "",
+    ]
+    errors = payload.get("errors") if isinstance(payload.get("errors"), list) else []
+    if errors:
+        lines.append("Errors:")
+        lines.extend(f"- {error}" for error in errors[:8])
+        lines.append("")
+    unmatched_mlb = payload.get("unmatched_mlb_games") if isinstance(payload.get("unmatched_mlb_games"), list) else []
+    if unmatched_mlb:
+        lines.append("Sample unmatched MLB:")
+        for item in unmatched_mlb[:8]:
+            lines.append(f"- {item.get('game_pk')}: {item.get('away_team')} @ {item.get('home_team')}")
+        lines.append("")
+    unmatched_odds = payload.get("unmatched_odds_games") if isinstance(payload.get("unmatched_odds_games"), list) else []
+    if unmatched_odds:
+        lines.append("Sample unmatched odds:")
+        for item in unmatched_odds[:8]:
+            lines.append(f"- {item.get('away_team')} @ {item.get('home_team')} ({item.get('commence_time')})")
+    return "\n".join(lines).strip()
+
+
+async def odds_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: inspect The Odds API MLB fetch and game matching."""
+    del context
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id != OWNER_TELEGRAM_ID:
+        return
+    if not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+    try:
+        await update.message.reply_text("⏳ Checking MLB odds matching...")
+        payload = await asyncio.to_thread(
+            odds_debug_payload,
+            os.getenv("ODDS_API_KEY", ""),
+            selected_date,
+        )
+        await _send_long_message(update, _render_odds_debug_payload(payload, selected_date))
+    except Exception as error:
+        logging.exception("/odds_debug failed")
+        await update.message.reply_text(f"/odds_debug failed:\n{error!r}")
+
+
+async def _build_card_debug_text() -> str:
+    """Build owner-only card diagnostics shared by slash command and callback."""
+    selected_date = official_sports_date().isoformat()
+    sections: list[str] = []
+    save_result: dict[str, Any] = {}
+    skip_reason = ""
+    official_picks_count = 0
+    trackable_picks_count = 0
+    market_context_found = False
+    skipped_reasons: list[str] = []
+    slate = await asyncio.to_thread(
+        get_combined_slate,
+        os.getenv("ODDS_API_KEY", ""),
+        game_date=selected_date,
+        highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+    )
+    slate = upcoming_mlb_slate(slate)
+    market_context_found = any(bool(game.get("best_available_prices")) for game in slate)
+    if not slate:
+        raise RuntimeError("No upcoming MLB games available for card debug.")
+    try:
+        analysis = await analyze_mlb_slate(
+            slate,
+            os.getenv("OPENAI_API_KEY", ""),
+            os.getenv("ANTHROPIC_API_KEY", ""),
+        )
+    except Exception as error:
+        skip_reason = f"AI unavailable; fallback card used: {error}"
+        analysis = build_fallback_card(slate)
+    for heading in (
+        "🔥 PLAY OF THE DAY",
+        "🏆 TOP 2 MONEYLINE",
+        "🏆 TOP 5 MONEYLINE",
+        "🔥 TOP 2 F5 MONEYLINE",
+        "🔥 TOP 5 F5",
+        "📈 TOP 2 RUNLINE/SPREAD",
+        "📈 TOP 5 RUNLINE/SPREAD",
+        "🎯 TOP 2 OVER/UNDER TOTAL RUNS",
+        "🎯 TOP 5 GAME TOTALS",
+        "💰 TOP 2 TEAM TOTALS",
+        "💰 TOP 5 TEAM TOTALS",
+        "🧩 2-LEG SAFE PARLAY",
+    ):
+        if heading in analysis:
+            sections.append(heading)
+    try:
+        extracted = await asyncio.to_thread(
+            extract_official_picks,
+            analysis,
+            slate,
+            selected_date,
+            "card_debug_preview",
+        )
+        official_picks_count = len(extracted)
+        trackable_picks_count = sum(1 for pick in extracted if pick.get("game_pk") or pick.get("game_id"))
+        if not extracted:
+            skipped_reasons.append("No official picks could be extracted from generated card text.")
+        if extracted and not market_context_found:
+            skipped_reasons.append("Generated picks exist, but no matched market context was found.")
+    except Exception as extract_error:
+        skipped_reasons.append(f"Official pick extraction failed: {extract_error!r}")
+    save_result = await asyncio.to_thread(
+        persist_official_card,
+        {
+            "analysis": analysis,
+            "slate": slate,
+            "card_date": selected_date,
+            "source_command": "card_debug",
+        },
+    )
+    if not save_result.get("success"):
+        skip_reason = str(save_result.get("error") or "Pick persistence failed")
+    lines = [
+        "🧪 BETGPTAI CARD DEBUG",
+        f"📅 Date: {display_date(selected_date)}",
+        "",
+        "Generated card sections:",
+        *(f"- {section}" for section in sections),
+        "",
+        f"Official picks count: {official_picks_count}",
+        f"Trackable picks count: {trackable_picks_count}",
+        f"Market context found: {'yes' if market_context_found else 'no'}",
+        f"Trackable picks saved this run: {save_result.get('saved_pick_count', 0)}",
+        f"Save success: {'yes' if save_result.get('success') else 'no'}",
+        f"Save result: {save_result.get('error') or 'OK'}",
+        "Skipped picks and reasons:",
+        *(f"- {reason}" for reason in (skipped_reasons or [skip_reason or "No skip reason reported."])),
+    ]
+    return "\n".join(lines).strip()
+
+
+async def card_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: build a card, attempt persistence, and explain skipped picks."""
+    del context
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id != OWNER_TELEGRAM_ID:
+        return
+    if not update.message:
+        return
+    try:
+        await update.message.reply_text("⏳ Building card debug snapshot...")
+        await _send_long_message(update, await _build_card_debug_text())
+    except Exception as error:
+        logging.exception("/card_debug failed")
+        await update.message.reply_text(f"/card_debug failed:\n{error!r}")
+
+
 async def mlb_top5_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner-only Full MLB Top 5 admin card."""
     del context
@@ -4357,6 +4573,8 @@ async def inline_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "admin_generate_images",
         "admin_debug_results",
         "admin_system_diagnostics",
+        "admin_odds_debug",
+        "admin_card_debug",
     }:
         if not is_admin:
             logging.warning("Callback unauthorized user_id=%s callback_data=%s handler_matched=true execution=failure", user_id, action)
@@ -4459,10 +4677,42 @@ async def inline_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 text = f"Unable to load System Diagnostics right now.\n\nError: {error}"
             await _edit_app_message(
                 query,
-                "🔧 SYSTEM DIAGNOSTICS\n\nDiagnostics report appears below.",
-                _hub_markup("admin"),
+                "🔧 SYSTEM DIAGNOSTICS\n\nDiagnostics report appears below.\n\nChoose a debug tool:",
+                _system_diagnostics_markup(),
             )
             if query.message:
+                await query.message.reply_text(text)
+            return
+        if action == "admin_odds_debug":
+            logging.info("Callback handled user_id=%s callback_data=%s handler_matched=true execution=success", user_id, action)
+            try:
+                selected_date = official_sports_date().isoformat()
+                payload = await asyncio.to_thread(
+                    odds_debug_payload,
+                    os.getenv("ODDS_API_KEY", ""),
+                    selected_date,
+                )
+                text = _render_odds_debug_payload(payload, selected_date)
+                _log_callback_event(user_id=user_id, callback_data=action, handler_found=True, execution_success=True)
+            except Exception as error:
+                logging.exception("Inline odds debug failed")
+                text = f"/odds_debug failed:\n{error!r}"
+                _log_callback_event(user_id=user_id, callback_data=action, handler_found=True, execution_success=False, error=error)
+            await _edit_app_message(query, "🧪 ODDS DEBUG\n\nReport appears below.", _system_diagnostics_markup())
+            if query.message:
+                await query.message.reply_text(text)
+            return
+        if action == "admin_card_debug":
+            logging.info("Callback handled user_id=%s callback_data=%s handler_matched=true execution=success", user_id, action)
+            await _edit_app_message(query, "🧪 CARD DEBUG\n\nBuilding card debug snapshot below.", _system_diagnostics_markup())
+            if query.message:
+                try:
+                    text = await _build_card_debug_text()
+                    _log_callback_event(user_id=user_id, callback_data=action, handler_found=True, execution_success=True)
+                except Exception as error:
+                    logging.exception("Inline card debug failed")
+                    text = f"/card_debug failed:\n{error!r}"
+                    _log_callback_event(user_id=user_id, callback_data=action, handler_found=True, execution_success=False, error=error)
                 await query.message.reply_text(text)
             return
         if action == "admin_mission_control":
@@ -4828,6 +5078,12 @@ async def main() -> None:
     application.add_handler(CommandHandler("generate_today", mlb_auto))
     application.add_handler(CommandHandler("mlb_admin", mlb_admin))
     application.add_handler(CommandHandler("warroom_debug", warroom_debug))
+    application.add_handler(CommandHandler("odds_debug", odds_debug))
+    SYSTEM_LOG.info("Registered command: /odds_debug")
+    print("Registered command: /odds_debug", flush=True)
+    application.add_handler(CommandHandler("card_debug", card_debug))
+    SYSTEM_LOG.info("Registered command: /card_debug")
+    print("Registered command: /card_debug", flush=True)
     application.add_handler(CommandHandler("mlb_top5_admin", mlb_top5_admin))
     application.add_handler(CommandHandler("mlb_admin_image", mlb_admin_image))
     application.add_handler(CommandHandler("soccer", soccer))
@@ -4856,6 +5112,7 @@ async def main() -> None:
     application.add_handler(CommandHandler("time_debug", time_debug))
     application.add_handler(CommandHandler("scheduler_status", scheduler_status))
     application.add_handler(CommandHandler("lineup_status", lineup_status))
+    application.add_handler(CommandHandler("prop_scratch_debug", prop_scratch_debug))
     application.add_handler(CommandHandler("post_status", post_status))
     application.add_handler(CommandHandler("force_generate_today", force_generate_today))
     application.add_handler(CommandHandler("force_post_today", force_post_today))

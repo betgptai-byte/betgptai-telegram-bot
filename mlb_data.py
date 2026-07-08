@@ -36,6 +36,48 @@ REQUEST_TIMEOUT = 20
 UNAVAILABLE = "unavailable"
 
 
+TEAM_ALIASES = {
+    "arizonadiamondbacks": "diamondbacks",
+    "arizonadbacks": "diamondbacks",
+    "atlantabraves": "braves",
+    "baltimoreorioles": "orioles",
+    "bostonredsox": "redsox",
+    "chicagocubs": "cubs",
+    "chicagowhitesox": "whitesox",
+    "cincinnatireds": "reds",
+    "clevelandguardians": "guardians",
+    "coloradorockies": "rockies",
+    "detroittigers": "tigers",
+    "houstonastros": "astros",
+    "kansascityroyals": "royals",
+    "losangelesangels": "angels",
+    "laangels": "angels",
+    "losangelesdodgers": "dodgers",
+    "ladodgers": "dodgers",
+    "miamimarlins": "marlins",
+    "milwaukeebrewers": "brewers",
+    "minnesotatwins": "twins",
+    "newyorkmets": "mets",
+    "nymets": "mets",
+    "newyorkyankees": "yankees",
+    "nyyankees": "yankees",
+    "oaklandathletics": "athletics",
+    "sacramentoathletics": "athletics",
+    "athletics": "athletics",
+    "philadelphiaphillies": "phillies",
+    "pittsburghpirates": "pirates",
+    "sandiegopadres": "padres",
+    "sanfranciscogiants": "giants",
+    "seattlemariners": "mariners",
+    "stlouiscardinals": "cardinals",
+    "saintlouiscardinals": "cardinals",
+    "tampabayrays": "rays",
+    "texasrangers": "rangers",
+    "torontobluejays": "bluejays",
+    "washingtonnationals": "nationals",
+}
+
+
 def _truthy_env(name: str) -> bool:
     """Read opt-in environment flags without surprising defaults."""
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
@@ -213,8 +255,7 @@ def get_mlb_odds(odds_api_key: str) -> list[dict[str, Any]]:
 
 def _normalize_team(team_name: str) -> str:
     normalized = re.sub(r"[^a-z0-9]", "", team_name.lower())
-    return {"oaklandathletics": "athletics", "sacramentoathletics": "athletics",
-            "arizonadbacks": "arizonadiamondbacks"}.get(normalized, normalized)
+    return TEAM_ALIASES.get(normalized, normalized)
 
 
 def _game_key(away_team: str, home_team: str) -> frozenset[str]:
@@ -294,18 +335,117 @@ def combine_schedule_and_odds(schedule: list[dict[str, Any]], odds: list[dict[st
     for game in schedule:
         odds_game = _closest_odds_game(game, by_game.get(_game_key(game["away_team"], game["home_team"]), []))
         bookmakers = _clean_bookmakers(odds_game) if odds_game else []
+        best_prices = _best_available_prices(bookmakers)
         combined.append({**game, "odds_event_id": odds_game.get("id") if odds_game else None,
-                         "best_available_prices": _best_available_prices(bookmakers),
+                         "best_available_prices": best_prices,
                          "bookmakers": bookmakers,
-                         "odds_status": "available" if odds_game else UNAVAILABLE})
+                         "odds_status": "available" if odds_game else UNAVAILABLE,
+                         "market_context": _market_context_from_prices(best_prices)})
     return combined
 
 
 def _attach_unavailable_odds(slate: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for game in slate:
         game.update({"odds_event_id": None, "best_available_prices": [],
-                     "bookmakers": [], "odds_status": UNAVAILABLE})
+                     "bookmakers": [], "odds_status": UNAVAILABLE,
+                     "market_context": _market_context_from_prices([])})
     return slate
+
+
+def _market_context_from_prices(prices: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compact market summary stored on each game for admin diagnostics."""
+    context = {"ML": [], "RL": [], "total": [], "team_totals": [], "odds_found": bool(prices)}
+    for price in prices:
+        market = price.get("market")
+        label = price.get("description") or price.get("outcome")
+        point = price.get("point")
+        american = price.get("price")
+        if market == "h2h":
+            context["ML"].append({"label": label, "odds": american})
+        elif market == "spreads":
+            context["RL"].append({"label": label, "line": point, "odds": american})
+        elif market == "totals":
+            context["total"].append({"label": label, "line": point, "odds": american})
+        elif market == "team_totals":
+            context["team_totals"].append({"label": label, "line": point, "odds": american})
+    return context
+
+
+def odds_debug_payload(odds_api_key: str, selected_date: str) -> dict[str, Any]:
+    """Owner-only diagnostics for The Odds API MLB game matching."""
+    payload: dict[str, Any] = {
+        "odds_api_key_loaded": bool(str(odds_api_key or "").strip()),
+        "odds_api_status_code": None,
+        "sport_key": "baseball_mlb",
+        "markets_requested": "h2h,spreads,totals",
+        "games_returned": 0,
+        "matched_to_mlb_game_pk": 0,
+        "unmatched_odds_games": [],
+        "unmatched_mlb_games": [],
+        "last_error": "",
+        "errors": [],
+    }
+    try:
+        schedule = get_mlb_schedule(selected_date)
+    except Exception as error:
+        schedule = []
+        payload["errors"].append(f"MLB schedule unavailable: {error}")
+    try:
+        if not odds_api_key:
+            raise MLBDataError("ODDS_API_KEY is missing from .env.")
+        response = requests.get(ODDS_URL, params={
+            "apiKey": odds_api_key,
+            "regions": "us",
+            "markets": "h2h,spreads,totals",
+            "oddsFormat": "american",
+            "dateFormat": "iso",
+        }, timeout=REQUEST_TIMEOUT)
+        payload["odds_api_status_code"] = response.status_code
+        response.raise_for_status()
+        decoded = response.json()
+        if not isinstance(decoded, list):
+            raise MLBDataError("The Odds API returned an unexpected response.")
+        odds = decoded
+    except Exception as error:
+        odds = []
+        redacted_error = _redact_secret(str(error))
+        payload["last_error"] = redacted_error
+        payload["errors"].append(f"Odds fetch unavailable: {redacted_error}")
+    payload["games_returned"] = len(odds)
+    odds_keys = {
+        _game_key(odds_game.get("away_team", ""), odds_game.get("home_team", "")): odds_game
+        for odds_game in odds
+    }
+    matched_keys = set()
+    for game in schedule:
+        key = _game_key(game.get("away_team", ""), game.get("home_team", ""))
+        if key in odds_keys:
+            matched_keys.add(key)
+            payload["matched_to_mlb_game_pk"] += 1
+        else:
+            payload["unmatched_mlb_games"].append({
+                "game_pk": game.get("game_pk"),
+                "away_team": game.get("away_team"),
+                "home_team": game.get("home_team"),
+                "normalized_key": sorted(key),
+            })
+    for key, odds_game in odds_keys.items():
+        if key not in matched_keys:
+            payload["unmatched_odds_games"].append({
+                "id": odds_game.get("id"),
+                "away_team": odds_game.get("away_team"),
+                "home_team": odds_game.get("home_team"),
+                "commence_time": odds_game.get("commence_time"),
+                "normalized_key": sorted(key),
+            })
+    return payload
+
+
+def _redact_secret(text: str) -> str:
+    """Remove API key values from exception strings before admin display."""
+    text = re.sub(r"apiKey=[^&\\s]+", "apiKey=REDACTED", text)
+    text = re.sub(r"api_key=[^&\\s]+", "api_key=REDACTED", text, flags=re.I)
+    return text
 
 
 def _sportsdb_baseball_schedule(selected_date: str) -> list[dict[str, Any]]:
@@ -435,8 +575,10 @@ def get_combined_slate(
     try:
         odds = get_mlb_odds(odds_api_key)
         slate = combine_schedule_and_odds(slate, odds)
-    except Exception:
-        logging.warning("Odds unavailable; continuing with schedule data", exc_info=True)
+    except Exception as error:
+        # Do not use exc_info here: requests tracebacks include the full URL,
+        # which can expose ODDS_API_KEY in logs.
+        logging.warning("Odds unavailable; continuing with schedule data: %s", error)
         slate = _attach_unavailable_odds(slate)
     if api_sports_enabled:
         try:

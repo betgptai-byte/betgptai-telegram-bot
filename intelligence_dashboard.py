@@ -500,6 +500,12 @@ def build_intelligence_dashboard(
     hit_props = _top_props(props, "hits")
     hr_watch = _top_props(props, "home_runs")
     strikeouts = _top_props(props, "strikeouts")
+    matched_odds_games = sum(1 for game in slate if game.get("odds_status") == "available")
+    market_empty_reason = (
+        "Moneylines unavailable because Odds API returned 0 matched MLB games."
+        if slate and matched_odds_games == 0
+        else "No qualified MLB candidates available from current engines."
+    )
 
     dashboard = {
         "version": "BETGPTAI Intelligence Dashboard v1",
@@ -524,8 +530,11 @@ def build_intelligence_dashboard(
             "strikeout_props": [_strikeout_prop_line(prop) for prop in strikeouts],
             "strikeout_props_reason": "" if strikeouts else _prop_empty_reason(props, "strikeouts"),
             "team_totals": mlb_top5.get("team_totals") or _extract_saved_picks(card_date, "team_total"),
+            "team_totals_reason": "" if mlb_top5.get("team_totals") else market_empty_reason,
             "moneylines": mlb_top5.get("moneylines") or _extract_saved_picks(card_date, "moneyline"),
+            "moneylines_reason": "" if mlb_top5.get("moneylines") else market_empty_reason,
             "f5_moneylines": mlb_top5.get("f5_moneylines") or _extract_saved_picks(card_date, "f5_moneyline"),
+            "f5_moneylines_reason": "" if mlb_top5.get("f5_moneylines") else market_empty_reason,
             "top_underdogs": _top_underdogs(card_date),
         },
         # Backward-compatible key for old callers. Keep it MLB-only now.
@@ -547,6 +556,7 @@ def build_intelligence_dashboard(
             "projected_lineups_found": int(streak_debug.get("projected_lineups_count") or 0),
             "confirmed_lineups_found": int(streak_debug.get("confirmed_lineups_count") or 0),
             "props_candidates_created": int(props_debug.get("candidate_props_created") or 0),
+            "matched_odds_games": matched_odds_games,
             "props_rejected": props_debug.get("rejected_props") or [],
             "props_rejected_reason": (
                 (props_debug.get("rejected_props") or ["No rejected props logged."])[0]
@@ -616,6 +626,9 @@ def render_daily_intel(payload: dict[str, Any]) -> str:
                 "top_hit_props": "top_hit_props_reason",
                 "hr_watch": "hr_watch_reason",
                 "strikeout_props": "strikeout_props_reason",
+                "team_totals": "team_totals_reason",
+                "moneylines": "moneylines_reason",
+                "f5_moneylines": "f5_moneylines_reason",
             }.get(key)
             reason = opps.get(reason_key) if reason_key else "No qualified MLB candidates available from current engines."
             lines.append(str(reason or "No qualified MLB candidates available from current engines."))

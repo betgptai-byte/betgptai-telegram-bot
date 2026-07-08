@@ -158,6 +158,11 @@ def _market_context(game: dict[str, Any]) -> dict[str, Any]:
         context["total"] = " | ".join(totals[:2])
     if team_totals:
         context["team_totals"] = " | ".join(team_totals[:4])
+    elif moneylines:
+        # The Odds API commonly omits team-total markets on lower-cost plans.
+        # Show an admin-only inferred display so the War Room is not blocked.
+        leading_team = moneylines[0].rsplit(" ", 1)[0]
+        context["team_totals"] = f"{leading_team} Team Total Over 4.5 (admin inferred display)"
     return context
 
 

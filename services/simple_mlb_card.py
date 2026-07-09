@@ -298,6 +298,161 @@ def save_simple_mlb_card(card: dict) -> str:
     return str(path)
 
 
+# Market types gradable by the results vault. play_of_day is a moneyline lean,
+# so it is bridged as a moneyline while retaining its category for reporting.
+_BRIDGE_MARKET_TYPE = {
+    "play_of_day": "moneyline",
+    "moneyline": "moneyline",
+    "f5_moneyline": "f5_moneyline",
+    "runline": "runline",
+}
+
+
+def export_simple_card_to_official_picks(card_date: str | None = None) -> dict:
+    """Bridge a saved simple card into the normal official picks store.
+
+    Loads ``/data/simple_cards/YYYY-MM-DD.json``, converts each pick into the
+    normalized tracker format, and appends new picks to ``picks.json`` without
+    overwriting or duplicating existing (StructuredCard) data.
+    """
+    from results_tracker import (
+        PICKS_FILE,
+        _normalize_saved_pick,
+        _official_pick_id,
+        _write_json,
+        load_picks,
+    )
+
+    selected_date = card_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    path = SIMPLE_CARD_DIR / f"{selected_date}.json"
+    result: dict[str, Any] = {
+        "date": selected_date,
+        "exists": path.exists(),
+        "imported": 0,
+        "skipped": 0,
+        "simple_card_path": str(path),
+        "path": str(PICKS_FILE),
+        "error": None,
+    }
+    if not path.exists():
+        result["error"] = "simple card not found"
+        return result
+
+    try:
+        card = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as error:  # pragma: no cover - corrupt file
+        result["error"] = f"simple card unreadable: {error!r}"
+        return result
+
+    raw_picks = card.get("all_picks") or card.get("picks") or []
+    try:
+        existing = load_picks()
+    except Exception as error:  # pragma: no cover - storage unavailable
+        result["error"] = f"picks store unreadable: {error!r}"
+        return result
+
+    existing_ids = {p.get("pick_id") for p in existing if isinstance(p, dict)}
+    imported: list[dict[str, Any]] = []
+    skipped = 0
+
+    for sp in raw_picks:
+        if not isinstance(sp, dict):
+            continue
+        market = str(sp.get("market") or "")
+        market_type = _BRIDGE_MARKET_TYPE.get(market, market)
+        if not sp.get("team") or not sp.get("game_id"):
+            skipped += 1
+            continue
+        norm: dict[str, Any] = {
+            "card_date": sp.get("date") or selected_date,
+            "date": sp.get("date") or selected_date,
+            "game_pk": sp.get("game_id"),
+            "game_id": sp.get("game_id"),
+            "market_type": market_type,
+            "market": market_type,
+            "category": market or market_type,
+            "selected_team": sp.get("team"),
+            "selection": sp.get("team"),
+            "opponent": sp.get("opponent"),
+            "line": sp.get("posted_line"),
+            "market_line": sp.get("posted_line"),
+            "edge_score": sp.get("edge_score"),
+            "confidence": sp.get("confidence"),
+            "sportsbook": sp.get("sportsbook", "none"),
+            "odds_status": sp.get("odds_status", "unavailable"),
+            "market_mode": "stats_only",
+            "trackable": True,
+            "source": "simple_mlb_card_v1",
+            "snapshot_source": "simple_card_bridge",
+            "status": "pending",
+            "result": None,
+            "sport": "mlb",
+            "league": "MLB",
+            "model_version": sp.get("model_version", "BETGPTAI v21.0"),
+            "parlay_leg": bool(sp.get("parlay_leg", False)),
+            "game_time": sp.get("game_time"),
+        }
+        _normalize_saved_pick(norm)
+        pid = norm.get("pick_id") or _official_pick_id(norm)
+        if pid in existing_ids:
+            skipped += 1
+            continue
+        existing_ids.add(pid)
+        imported.append(norm)
+
+    if imported:
+        _write_json(PICKS_FILE, existing + imported)
+
+    result["imported"] = len(imported)
+    result["skipped"] = skipped
+    return result
+
+
+def simple_card_bridge_status(card_date: str | None = None) -> dict:
+    """Return diagnostic info about the simple card and its bridge state."""
+    from results_tracker import load_picks
+
+    selected_date = card_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    path = SIMPLE_CARD_DIR / f"{selected_date}.json"
+    status: dict[str, Any] = {
+        "date": selected_date,
+        "simple_card_exists": path.exists(),
+        "simple_pick_count": 0,
+        "bridged": False,
+        "results_vault_compatible": False,
+        "errors": [],
+    }
+    if not path.exists():
+        return status
+    try:
+        card = json.loads(path.read_text(encoding="utf-8"))
+        raw_picks = card.get("all_picks") or card.get("picks") or []
+        status["simple_pick_count"] = len(raw_picks)
+        # Compatible when every pick maps to a vault-gradable market type.
+        compatible = all(
+            isinstance(p, dict) and bool(p.get("team")) and bool(p.get("game_id"))
+            and _BRIDGE_MARKET_TYPE.get(str(p.get("market") or ""), str(p.get("market") or ""))
+            in {"moneyline", "f5_moneyline", "runline"}
+            for p in raw_picks
+        )
+        status["results_vault_compatible"] = bool(raw_picks) and compatible
+    except Exception as error:  # pragma: no cover - corrupt file
+        status["errors"].append(f"simple card unreadable: {error!r}")
+        return status
+
+    try:
+        picks = load_picks()
+        status["bridged"] = any(
+            isinstance(p, dict)
+            and p.get("source") == "simple_mlb_card_v1"
+            and str(p.get("card_date") or p.get("date")) == selected_date
+            for p in picks
+        )
+    except Exception as error:  # pragma: no cover - storage unavailable
+        status["errors"].append(f"picks store unreadable: {error!r}")
+    return status
+
+
 def _display_date(card_date: str) -> str:
     try:
         return datetime.strptime(card_date, "%Y-%m-%d").strftime("%m/%d/%Y")

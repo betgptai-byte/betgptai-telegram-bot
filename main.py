@@ -41,8 +41,10 @@ from ai_analysis import (
 )
 from services.simple_mlb_card import (
     build_simple_mlb_card,
+    export_simple_card_to_official_picks,
     post_simple_mlb_card,
     save_simple_mlb_card,
+    simple_card_bridge_status,
 )
 from ai_learning_engine import (
     approve_weight_update as approve_learning_weight_update,
@@ -4714,6 +4716,58 @@ async def simple_post_today(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text(f"❌ Simple post failed:\n{error!r}")
 
 
+async def bridge_simple_card_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: bridge today's simple card into the Results Vault / picks.json."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+    await update.message.reply_text("⏳ Bridging simple card to Results Vault...")
+    try:
+        result = await asyncio.to_thread(export_simple_card_to_official_picks, selected_date)
+        if not result.get("exists"):
+            await update.message.reply_text(
+                f"❌ Cannot bridge: simple card not found at {result.get('simple_card_path')}.\n"
+                "Run /simple_generate_today first."
+            )
+            return
+        await update.message.reply_text(
+            "✅ Simple card bridged to Results Vault.\n"
+            f"Imported picks: {result.get('imported', 0)}\n"
+            f"Skipped duplicates: {result.get('skipped', 0)}\n"
+            f"Path: {result.get('path')}"
+        )
+    except Exception as error:
+        logging.exception("/bridge_simple_card_today failed")
+        await update.message.reply_text(f"❌ Bridge failed:\n{error!r}")
+
+
+async def simple_results_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: show simple-card bridge and Results Vault compatibility."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+    await update.message.reply_text("⏳ Checking simple card bridge status...")
+    try:
+        status = await asyncio.to_thread(simple_card_bridge_status, selected_date)
+        lines = [
+            "🧪 SIMPLE CARD → RESULTS VAULT",
+            f"📅 Date: {selected_date}",
+            "",
+            f"Simple card exists: {'YES' if status.get('simple_card_exists') else 'NO'}",
+            f"Simple pick count: {status.get('simple_pick_count', 0)}",
+            f"Bridged: {'YES' if status.get('bridged') else 'NO'}",
+            f"Results Vault compatible: {'YES' if status.get('results_vault_compatible') else 'NO'}",
+        ]
+        if status.get("errors"):
+            lines += ["", "Errors:"] + [f"- {e}" for e in status["errors"]]
+        await _send_long_message(update, "\n".join(lines))
+    except Exception as error:
+        logging.exception("/simple_results_debug failed")
+        await update.message.reply_text(f"❌ Simple results debug failed:\n{error!r}")
+
+
 def services_simple_path(card_date: str) -> str:
     """Return the expected saved path for a simple card (mirrors simple_mlb_card)."""
     from storage import DATA_DIR
@@ -6204,6 +6258,12 @@ async def main() -> None:
     application.add_handler(CommandHandler("simple_post_today", simple_post_today))
     SYSTEM_LOG.info("Registered command: /simple_post_today")
     print("Registered command: /simple_post_today", flush=True)
+    application.add_handler(CommandHandler("bridge_simple_card_today", bridge_simple_card_today))
+    SYSTEM_LOG.info("Registered command: /bridge_simple_card_today")
+    print("Registered command: /bridge_simple_card_today", flush=True)
+    application.add_handler(CommandHandler("simple_results_debug", simple_results_debug))
+    SYSTEM_LOG.info("Registered command: /simple_results_debug")
+    print("Registered command: /simple_results_debug", flush=True)
     application.add_handler(CommandHandler("workflow_debug", workflow_debug_handler))
     SYSTEM_LOG.info("Registered command: /workflow_debug")
     print("Registered command: /workflow_debug", flush=True)

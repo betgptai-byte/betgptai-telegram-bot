@@ -2351,8 +2351,13 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🟢 OPTIONAL\n\n"
         f"Highlightly: {optional_configured('HIGHLIGHTLY_API_KEY')}\n"
         f"SerpApi: {serpapi_status}\n"
-        f"Sharp API (primary): {core_configured('SHARP_API_KEY')}\n"
-        f"Odds API (backup): {optional_configured('ODDS_API_KEY')}\n"
+        "── Sharp API (multi-sport) ──\n"
+        f"MLB: {'✅ Supported' if os.getenv('SHARP_API_KEY', '').strip() else '❌ No key'}\n"
+        f"Soccer: {'✅ Supported' if os.getenv('SHARP_API_KEY', '').strip() else '❌ No key'}\n"
+        f"NBA: {'✅ Supported' if os.getenv('SHARP_API_KEY', '').strip() else '❌ No key'}\n"
+        f"NFL: {'✅ Supported' if os.getenv('SHARP_API_KEY', '').strip() else '❌ No key'}\n"
+        f"NHL: {'✅ Supported' if os.getenv('SHARP_API_KEY', '').strip() else '❌ No key'}\n"
+        f"Odds API (backup, MLB only): {optional_configured('ODDS_API_KEY')}\n"
         f"API-Sports Baseball: {api_sports_baseball_status}\n"
         f"Player Props Engine: {props_engine_status}\n\n"
         f"TheSportsDB Base URL: {sportsdb_url}\n\n"
@@ -3651,9 +3656,15 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
     sharp = payload.get("sharp_api_health") or {}
     cache_age = sharp.get("cache_age_seconds")
     cache_str = f"{cache_age:.0f}s" if cache_age is not None else "N/A"
+    sport = payload.get("sport", "mlb")
+    league = payload.get("league") or ""
+    sport_label = sport.upper() if sport != "mlb" else "MLB"
+    if league:
+        sport_label = f"{sport_label} ({league})"
     lines = [
         "🧪 BETGPTAI ODDS DEBUG",
         f"📅 Date: {display_date(selected_date)}",
+        f"🏅 Sport: {sport_label}",
         "",
         "── Sharp API ──",
         f"Enabled: {'yes' if payload.get('sharp_api_enabled') else 'no'}",
@@ -3668,12 +3679,17 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
         f"Active provider: {payload.get('provider') or 'None'}",
         f"Markets: {payload.get('markets_requested')}",
         f"Games returned: {payload.get('games_returned')}",
-        f"Matched MLB games: {payload.get('matched_to_mlb_game_pk')}",
-        f"Unmatched MLB: {len(payload.get('unmatched_mlb_games') or [])}",
-        f"Unmatched odds: {len(payload.get('unmatched_odds_games') or [])}",
+    ]
+    if sport == "mlb":
+        lines.extend([
+            f"Matched MLB games: {payload.get('matched_to_mlb_game_pk')}",
+            f"Unmatched MLB: {len(payload.get('unmatched_mlb_games') or [])}",
+            f"Unmatched odds: {len(payload.get('unmatched_odds_games') or [])}",
+        ])
+    lines.extend([
         f"Last error: {payload.get('last_error') or 'None'}",
         "",
-    ]
+    ])
     errors = payload.get("errors") if isinstance(payload.get("errors"), list) else []
     if errors:
         lines.append("Errors:")
@@ -3694,20 +3710,37 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
 
 
 async def odds_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Owner-only: inspect all odds provider MLB fetch and game matching."""
-    del context
+    """Owner-only: inspect odds provider fetch and game matching per sport.
+
+    Usage: /odds_debug [sport] [league]
+    Sport: mlb (default), soccer, nba, nfl, nhl
+    League: e.g. MLS, EPL, La Liga, Bundesliga, Serie A, Liga MX (soccer only)
+    """
     user_id = update.effective_user.id if update.effective_user else None
     if user_id != OWNER_TELEGRAM_ID:
         return
     if not update.message:
         return
+    sport = "mlb"
+    league: str | None = None
+    if context.args:
+        arg = context.args[0].strip().lower()
+        if arg in ("mlb", "soccer", "nba", "nfl", "nhl"):
+            sport = arg
+    if sport == "soccer" and len(context.args or []) > 1:
+        league = " ".join(context.args[1:]).strip()
     selected_date = official_sports_date().isoformat()
+    sport_label = sport.upper() if sport != "mlb" else "MLB"
+    if league:
+        sport_label = f"{sport_label} ({league})"
     try:
-        await update.message.reply_text("⏳ Checking MLB odds matching (Sharp + Odds API)...")
+        await update.message.reply_text(f"⏳ Checking {sport_label} odds matching (Sharp + Odds API)...")
         payload = await asyncio.to_thread(
             odds_debug_payload,
             os.getenv("ODDS_API_KEY", ""),
             selected_date,
+            sport,
+            league,
         )
         await _send_long_message(update, _render_odds_debug_payload(payload, selected_date))
     except Exception as error:

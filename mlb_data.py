@@ -390,19 +390,30 @@ def _market_context_from_prices(prices: list[dict[str, Any]]) -> dict[str, Any]:
     return context
 
 
-def odds_debug_payload(odds_api_key: str, selected_date: str) -> dict[str, Any]:
-    """Owner-only diagnostics for all odds providers."""
-    from api.sharp_odds_client import health as sharp_health, sharp_api_enabled, sharp_api_key
+def odds_debug_payload(
+    odds_api_key: str,
+    selected_date: str,
+    sport: str = "mlb",
+    league: str | None = None,
+) -> dict[str, Any]:
+    """Owner-only diagnostics for odds providers by sport."""
+    from api.sharp_odds_client import SHARP_SPORT_MAP, health as sharp_health, sharp_api_enabled, sharp_api_key
     from services.odds_provider_router import provider_status as router_status
 
+    sport_lower = sport.lower()
+    cfg = SHARP_SPORT_MAP.get(sport_lower, {})
+    markets_requested = cfg.get("markets", "h2h,spreads,totals")
+
     payload: dict[str, Any] = {
+        "sport": sport_lower,
+        "league": league,
         "odds_api_key_loaded": bool(str(odds_api_key or "").strip()),
         "odds_api_status_code": None,
         "sharp_api_enabled": sharp_api_enabled(),
         "sharp_api_key_loaded": bool(sharp_api_key()),
-        "sharp_api_health": sharp_health(),
-        "sport_key": "baseball_mlb",
-        "markets_requested": "h2h,spreads,totals,team_totals",
+        "sharp_api_health": sharp_health(sport=sport_lower),
+        "sport_key": cfg.get("cache_key", "baseball_mlb"),
+        "markets_requested": markets_requested,
         "provider": None,
         "games_returned": 0,
         "matched_to_mlb_game_pk": 0,
@@ -410,22 +421,28 @@ def odds_debug_payload(odds_api_key: str, selected_date: str) -> dict[str, Any]:
         "unmatched_mlb_games": [],
         "last_error": "",
         "errors": [],
-        "provider_status": router_status(),
+        "provider_status": router_status(sport=sport_lower),
     }
-    try:
-        schedule = get_mlb_schedule(selected_date)
-    except Exception as error:
-        schedule = []
-        payload["errors"].append(f"MLB schedule unavailable: {error}")
+
+    schedule: list[dict[str, Any]] = []
+    if sport_lower == "mlb":
+        try:
+            schedule = get_mlb_schedule(selected_date)
+        except Exception as error:
+            payload["errors"].append(f"MLB schedule unavailable: {error}")
 
     odds: list[dict[str, Any]] = []
     try:
         from services.odds_provider_router import fetch_odds
-        odds = fetch_odds()
+        kwargs: dict[str, Any] = {"sport": sport_lower}
+        if league:
+            kwargs["league"] = league
+        odds = fetch_odds(**kwargs)
         payload["provider"] = _detect_odds_provider(odds)
-        payload["odds_api_status_code"] = 200
+        if odds:
+            payload["odds_api_status_code"] = 200
     except Exception as error:
-        if not odds and odds_api_key:
+        if not odds and odds_api_key and sport_lower == "mlb":
             try:
                 response = requests.get(ODDS_URL, params={
                     "apiKey": odds_api_key,
@@ -447,32 +464,33 @@ def odds_debug_payload(odds_api_key: str, selected_date: str) -> dict[str, Any]:
     if not odds:
         payload["errors"].append("No odds data returned from any provider.")
     payload["games_returned"] = len(odds)
-    odds_keys = {
-        _game_key(odds_game.get("away_team", ""), odds_game.get("home_team", "")): odds_game
-        for odds_game in odds
-    }
-    matched_keys = set()
-    for game in schedule:
-        key = _game_key(game.get("away_team", ""), game.get("home_team", ""))
-        if key in odds_keys:
-            matched_keys.add(key)
-            payload["matched_to_mlb_game_pk"] += 1
-        else:
-            payload["unmatched_mlb_games"].append({
-                "game_pk": game.get("game_pk"),
-                "away_team": game.get("away_team"),
-                "home_team": game.get("home_team"),
-                "normalized_key": sorted(key),
-            })
-    for key, odds_game in odds_keys.items():
-        if key not in matched_keys:
-            payload["unmatched_odds_games"].append({
-                "id": odds_game.get("id"),
-                "away_team": odds_game.get("away_team"),
-                "home_team": odds_game.get("home_team"),
-                "commence_time": odds_game.get("commence_time"),
-                "normalized_key": sorted(key),
-            })
+    if schedule:
+        odds_keys = {
+            _game_key(odds_game.get("away_team", ""), odds_game.get("home_team", "")): odds_game
+            for odds_game in odds
+        }
+        matched_keys = set()
+        for game in schedule:
+            key = _game_key(game.get("away_team", ""), game.get("home_team", ""))
+            if key in odds_keys:
+                matched_keys.add(key)
+                payload["matched_to_mlb_game_pk"] += 1
+            else:
+                payload["unmatched_mlb_games"].append({
+                    "game_pk": game.get("game_pk"),
+                    "away_team": game.get("away_team"),
+                    "home_team": game.get("home_team"),
+                    "normalized_key": sorted(key),
+                })
+        for key, odds_game in odds_keys.items():
+            if key not in matched_keys:
+                payload["unmatched_odds_games"].append({
+                    "id": odds_game.get("id"),
+                    "away_team": odds_game.get("away_team"),
+                    "home_team": odds_game.get("home_team"),
+                    "commence_time": odds_game.get("commence_time"),
+                    "normalized_key": sorted(key),
+                })
     return payload
 
 

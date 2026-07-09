@@ -154,27 +154,49 @@ def _merge_suggestions(items: list[dict[str, dict[str, Any]]]) -> dict[str, dict
 
 
 def run_learning_review(card_date: str) -> dict[str, Any]:
-    """Review graded picks for one card date and save Phase 6 suggestions."""
+    """Review graded picks for one card date and save learning suggestions.
+
+    Learns from wins, losses, pushes, CLV, and edge-score bucket performance.
+    """
     ensure_model_weights()
     picks = _today_picks(card_date)
     graded = [pick for pick in picks if pick.get("result") in FINAL_RESULTS]
     losses = [pick for pick in graded if pick.get("result") == "loss"]
     wins = [pick for pick in graded if pick.get("result") == "win"]
+    pushes = [pick for pick in graded if pick.get("result") == "push"]
     games = _game_index(card_date)
     props = _props_index(card_date)
     model_report = load_model_report(card_date) or {}
 
     reviewed_losses: list[dict[str, Any]] = []
+    reviewed_wins: list[dict[str, Any]] = []
     suggestion_parts: list[dict[str, dict[str, Any]]] = []
     tag_counter: Counter[str] = Counter()
     missing_data: list[str] = []
+    edge_bucket_performance: dict[str, dict[str, float]] = {}
+    clv_records: list[dict[str, Any]] = []
 
-    for pick in losses:
+    # Learn from every graded pick — wins, losses, and pushes
+    for pick in graded:
         game_pk = str(pick.get("game_pk") or pick.get("game_id") or "")
         game_context = games.get(game_pk, {})
         props_context = _matching_prop_context(pick, props)
         if not game_context:
             missing_data.append(f"{pick.get('pick_id')}: MLB game context missing")
+
+        edge = pick.get("edge_score") or pick.get("final_edge_score") or 50
+        try:
+            bucket = round(float(edge) / 10) * 10
+            bucket_key = f"{bucket}-{bucket+10}"
+        except (TypeError, ValueError):
+            bucket_key = "unknown"
+
+        if bucket_key not in edge_bucket_performance:
+            edge_bucket_performance[bucket_key] = {"wins": 0, "losses": 0, "pushes": 0}
+        result = pick.get("result", "pending")
+        if result in edge_bucket_performance[bucket_key]:
+            edge_bucket_performance[bucket_key][result] += 1
+
         classification = classify_loss(
             pick,
             game_context=game_context,
@@ -182,39 +204,77 @@ def run_learning_review(card_date: str) -> dict[str, Any]:
             props_context=props_context,
         )
         tags = classification["loss_reason_tags"]
-        loss_reason_confidence = 50 if tags == ["unknown_variance"] else 75
         tag_counter.update(tags)
-        suggestions = suggested_weight_changes_from_tags(tags)
-        suggestion_parts.append(suggestions)
-        reviewed_losses.append(
-            {
-                "pick_id": pick.get("pick_id"),
-                "card_date": pick.get("card_date") or pick.get("date"),
-                "market_type": pick.get("market_type") or pick.get("pick_type"),
-                "pick_text": pick.get("pick_text") or pick.get("selection"),
-                "game_pk": pick.get("game_pk") or pick.get("game_id"),
-                "selected_team_player": pick.get("selected_team") or pick.get("player_name"),
-                "result": pick.get("result"),
-                "loss_reason_tags": tags,
-                "loss_reason_confidence": loss_reason_confidence,
-                "confidence_before": pick.get("confidence_grade") or pick.get("risk_grade"),
-                "model_factors_used": _model_factors_used(pick, tags),
-                "notes": classification["notes"],
-                "suggested_weight_changes": suggestions,
-            }
-        )
+
+        learning_obj = {
+            "pick_id": pick.get("pick_id"),
+            "card_date": pick.get("card_date") or pick.get("date"),
+            "market_type": pick.get("market_type") or pick.get("pick_type"),
+            "market_line": pick.get("market_line") or pick.get("line"),
+            "pick_text": pick.get("pick_text") or pick.get("selection"),
+            "game_pk": game_pk,
+            "selected_team_player": pick.get("selected_team") or pick.get("player_name"),
+            "odds": pick.get("odds"),
+            "result": result,
+            "edge_score": edge,
+            "edge_bucket": bucket_key,
+            "confidence": pick.get("confidence") or pick.get("confidence_grade"),
+            "units": pick.get("units") or pick.get("units_risked", 1),
+            "profit_units": pick.get("profit_units") or pick.get("units_won", 0),
+            "closing_line": pick.get("closing_line"),
+            "clv": pick.get("clv"),
+            "loss_reason_tags": tags,
+            "model_factors_used": _model_factors_used(pick, tags),
+            "notes": classification["notes"],
+        }
+        if pick.get("closing_line") or pick.get("clv"):
+            clv_records.append(learning_obj)
+
+        if result == "loss":
+            loss_confidence = 50 if tags == ["unknown_variance"] else 75
+            learning_obj["loss_reason_confidence"] = loss_confidence
+            suggestions = suggested_weight_changes_from_tags(tags)
+            suggestion_parts.append(suggestions)
+            reviewed_losses.append(learning_obj)
+        elif result == "win":
+            # Wins confirm current weights — reinforce with small positive signal
+            win_suggestions = {}
+            for factor in _model_factors_used(pick, tags):
+                win_suggestions[factor] = {
+                    "suggested_change": 0.005,
+                    "reason_tags": ["confirmed_win"],
+                    "reason": f"Win confirms factor {factor}",
+                }
+            suggestion_parts.append(win_suggestions)
+            reviewed_wins.append(learning_obj)
+
+    # Calculate edge-bucket ROI
+    edge_roi: dict[str, float] = {}
+    for bucket, counts in edge_bucket_performance.items():
+        total = counts["wins"] + counts["losses"] + counts["pushes"]
+        if total > 0:
+            win_rate = counts["wins"] / total * 100
+            edge_roi[bucket] = round(win_rate, 1)
 
     merged_suggestions = _merge_suggestions(suggestion_parts)
     unknown_variance = tag_counter.get("unknown_variance", 0)
     actionable_losses = max(0, len(losses) - unknown_variance)
+
+    # CLV performance: compare picks with positive vs negative CLV
+    positive_clv = sum(1 for c in clv_records if float(c.get("clv") or 0) > 0 and c["result"] == "win")
+    negative_clv = sum(1 for c in clv_records if float(c.get("clv") or 0) <= 0 and c["result"] == "win")
+    total_clv_graded = len(clv_records)
+
     report = {
         "engine": "BETGPTAI AI Learning Engine Phase 6",
         "card_date": card_date,
         "display_date": _display_date(card_date),
         "created_at": datetime.now(EASTERN).isoformat(timespec="seconds"),
         "auto_apply": False,
+        "total_graded": len(graded),
         "losses_reviewed": len(losses),
         "wins_reviewed": len(wins),
+        "pushes_reviewed": len(pushes),
         "unknown_variance": unknown_variance,
         "actionable_losses": actionable_losses,
         "top_loss_reasons": tag_counter.most_common(10),
@@ -223,6 +283,15 @@ def run_learning_review(card_date: str) -> dict[str, Any]:
             default=0.0,
         ) if reviewed_losses else 100.0,
         "reviewed_losses": reviewed_losses,
+        "reviewed_wins": reviewed_wins[:50],
+        "edge_bucket_performance": {k: v for k, v in sorted(edge_bucket_performance.items())},
+        "edge_bucket_roi": edge_roi,
+        "clv_performance": {
+            "total_clv_records": total_clv_graded,
+            "wins_with_positive_clv": positive_clv,
+            "wins_with_negative_clv": negative_clv,
+            "clv_records": clv_records[:50],
+        },
         "suggested_adjustments": merged_suggestions,
         "missing_data": missing_data,
     }
@@ -250,12 +319,14 @@ def render_learning_report(report: dict[str, Any]) -> str:
     """Render the owner-only Phase 6 report."""
     reasons = report.get("top_loss_reasons") or []
     suggestions = report.get("suggested_adjustments") or {}
+    edge_roi = report.get("edge_bucket_roi") or {}
+    clv = report.get("clv_performance") or {}
     lines = [
         "🧠 BETGPTAI AI LEARNING REPORT",
         f"📅 Date: {report.get('display_date')}",
         "",
-        f"Losses Reviewed: {report.get('losses_reviewed', 0)}",
-        f"Wins Reviewed: {report.get('wins_reviewed', 0)}",
+        f"Total Graded: {report.get('total_graded', 0)}",
+        f"Wins: {report.get('wins_reviewed', 0)} / Losses: {report.get('losses_reviewed', 0)} / Pushes: {report.get('pushes_reviewed', 0)}",
         f"Unknown Variance: {report.get('unknown_variance', 0)}",
         f"Actionable Losses: {report.get('actionable_losses', 0)}",
         "",
@@ -267,6 +338,16 @@ def render_learning_report(report: dict[str, Any]) -> str:
             lines.append(f"{index}. {tag} ({count})")
     else:
         lines.append("1. None yet")
+    if edge_roi:
+        lines.extend(["", "Edge Bucket Win Rate:"])
+        for bucket in sorted(edge_roi):
+            lines.append(f"- {bucket}: {edge_roi[bucket]}%")
+    if clv.get("total_clv_records", 0) > 0:
+        lines.extend([
+            "", "CLV Performance:",
+            f"- Positive CLV wins: {clv.get('wins_with_positive_clv', 0)}",
+            f"- Negative CLV wins: {clv.get('wins_with_negative_clv', 0)}",
+        ])
     lines.extend(["", "Suggested Adjustments:"])
     if suggestions:
         for factor, item in suggestions.items():

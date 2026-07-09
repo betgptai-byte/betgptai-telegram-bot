@@ -287,7 +287,7 @@ def _filter_public_market_context(picks: list[dict[str, Any]], slate: list[dict[
 
 
 def save_official_card(card: Any) -> dict[str, Any]:
-    """Save an official generated card to picks.json.
+    """Save an official generated card to picks.json, then trigger daily snapshot.
 
     Returns:
         {"success": bool, "error": str, "saved_pick_count": int}
@@ -318,6 +318,49 @@ def save_official_card(card: Any) -> dict[str, Any]:
                     "exception": "",
                 }
             )
+            # Trigger immutable daily snapshot after successful save
+            try:
+                from services.daily_snapshot import save_daily_snapshot
+
+                slate = []
+                if isinstance(card, dict):
+                    raw_slate = card.get("slate")
+                    if isinstance(raw_slate, list):
+                        slate = raw_slate
+                source = str(card.get("source_command", "structured_card")) if isinstance(card, dict) else "structured_card"
+                snapshot_result = save_daily_snapshot(
+                    card_date=card_date,
+                    picks=existing + saved,
+                    slate=slate,
+                    source=source,
+                )
+                if snapshot_result.get("success"):
+                    _log_storage({
+                        "component": "pick_persistence",
+                        "event": "daily_snapshot_created",
+                        "card_date": card_date,
+                        "snapshot_path": snapshot_result.get("path"),
+                    })
+                elif snapshot_result.get("reason") == "already_exists":
+                    _log_storage({
+                        "component": "pick_persistence",
+                        "event": "daily_snapshot_skipped_exists",
+                        "card_date": card_date,
+                    })
+                else:
+                    _log_storage({
+                        "component": "pick_persistence",
+                        "event": "daily_snapshot_failed",
+                        "card_date": card_date,
+                        "error": snapshot_result.get("error"),
+                    })
+            except Exception as snap_error:
+                _log_storage({
+                    "component": "pick_persistence",
+                    "event": "daily_snapshot_error",
+                    "card_date": card_date,
+                    "error": repr(snap_error),
+                })
             status = {
                 "success": True,
                 "error": "",

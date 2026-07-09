@@ -1268,10 +1268,20 @@ async def debug_soccer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def results(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Display today's official-card results only."""
+    """Display today's official-card results from the vault."""
     del context
     if not update.message:
         return
+
+    target_date = eastern_today().isoformat()
+    try:
+        from services.results_vault import render_daily_results
+        dashboard = await asyncio.to_thread(render_daily_results, target_date)
+        if dashboard and "No official snapshot" not in dashboard:
+            await update.message.reply_text(dashboard)
+            return
+    except Exception:
+        pass
 
     try:
         dashboard = await asyncio.to_thread(build_daily_results_dashboard)
@@ -1293,11 +1303,19 @@ async def results_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def results_yesterday(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Display yesterday's official-card results."""
+    """Display yesterday's official-card results from the vault."""
     del context
     if not update.message:
         return
     target_date = (eastern_today() - timedelta(days=1)).isoformat()
+    try:
+        from services.results_vault import render_daily_results
+        dashboard = await asyncio.to_thread(render_daily_results, target_date)
+        if dashboard and "No official snapshot" not in dashboard:
+            await update.message.reply_text(dashboard)
+            return
+    except Exception:
+        pass
     text, markup = await asyncio.to_thread(_results_dashboard_or_picker, target_date)
     await update.message.reply_text(text, reply_markup=markup)
 
@@ -1523,12 +1541,23 @@ async def grade_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "Unable to grade today’s picks right now. Check the terminal and try again."
         )
         return
+    vault_msg = ""
+    try:
+        from services.results_vault import grade_snapshot_date
+        vault = await asyncio.to_thread(grade_snapshot_date, selected_date)
+        if vault.get("success"):
+            vault_msg = f"Vault saved: {vault.get('path')}"
+        else:
+            vault_msg = f"Vault: {vault.get('error', 'unknown')}"
+    except Exception:
+        vault_msg = "Vault save unavailable"
     await update.message.reply_text(
         "✅ RESULTS UPDATE COMPLETE\n\n"
         f"Newly Graded: {summary.get('newly_graded', 0)}\n"
         f"Still Pending: {summary.get('pending', 0)}\n"
         f"Missing Metadata: {summary.get('missing_metadata', 0)}\n"
-        f"Errors: {summary.get('errors', 0)}"
+        f"Errors: {summary.get('errors', 0)}\n"
+        f"{vault_msg}"
     )
     try:
         learning_report = await asyncio.to_thread(run_learning_review, selected_date)
@@ -1557,13 +1586,24 @@ async def grade_yesterday(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "Unable to grade yesterday’s picks right now. Check the terminal and try again."
         )
         return
+    vault_msg = ""
+    try:
+        from services.results_vault import grade_snapshot_date
+        vault = await asyncio.to_thread(grade_snapshot_date, selected_date)
+        if vault.get("success"):
+            vault_msg = f"Vault saved: {vault.get('path')}"
+        else:
+            vault_msg = f"Vault: {vault.get('error', 'unknown')}"
+    except Exception:
+        vault_msg = "Vault save unavailable"
     await update.message.reply_text(
         "✅ RESULTS UPDATE COMPLETE\n\n"
         f"Date: {display_date(selected_date)}\n"
         f"Newly Graded: {summary.get('newly_graded', 0)}\n"
         f"Still Pending: {summary.get('pending', 0)}\n"
         f"Missing Metadata: {summary.get('missing_metadata', 0)}\n"
-        f"Errors: {summary.get('errors', 0)}"
+        f"Errors: {summary.get('errors', 0)}\n"
+        f"{vault_msg}"
     )
 
 
@@ -1598,6 +1638,107 @@ async def force_grade_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         f"Errors: {summary.get('errors', 0)}"
     )
 
+
+# ── Daily Snapshot Commands ───────────────────────────────────────────────
+
+async def snapshot_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: show daily snapshot status for today or a given date."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id != OWNER_TELEGRAM_ID:
+        return
+    if not update.message:
+        return
+    args = context.args or []
+    target = args[0] if args else eastern_today().isoformat()
+    try:
+        from services.daily_snapshot import snapshot_status as _snap_status, render_snapshot_status
+        payload = await asyncio.to_thread(_snap_status, target)
+        await update.message.reply_text(render_snapshot_status(payload))
+    except Exception as error:
+        logging.exception("/snapshot_status failed")
+        await update.message.reply_text(f"/snapshot_status failed: {error!r}")
+
+
+async def snapshot_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: show detailed snapshot debug info."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id != OWNER_TELEGRAM_ID:
+        return
+    if not update.message:
+        return
+    args = context.args or []
+    target = args[0] if args else eastern_today().isoformat()
+    try:
+        from services.daily_snapshot import snapshot_debug as _snap_debug, render_snapshot_debug
+        payload = await asyncio.to_thread(_snap_debug, target)
+        await update.message.reply_text(render_snapshot_debug(payload))
+    except Exception as error:
+        logging.exception("/snapshot_debug failed")
+        await update.message.reply_text(f"/snapshot_debug failed: {error!r}")
+
+
+async def snapshot_regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: regenerate snapshot for a date. Must include --confirm."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id != OWNER_TELEGRAM_ID:
+        return
+    if not update.message:
+        return
+    args = context.args or []
+    if "--confirm" not in args:
+        await update.message.reply_text("Usage: /snapshot_regenerate YYYY-MM-DD --confirm\nAdd --confirm to force regeneration.")
+        return
+    date_args = [a for a in args if a != "--confirm"]
+    if not date_args:
+        await update.message.reply_text("Usage: /snapshot_regenerate YYYY-MM-DD --confirm")
+        return
+    target = normalize_pick_date(date_args[0])
+    if not target:
+        await update.message.reply_text("Invalid date format. Use YYYY-MM-DD.")
+        return
+    try:
+        from services.daily_snapshot import regenerate_snapshot, load_snapshot
+        from results_tracker import load_picks
+
+        all_picks = await asyncio.to_thread(load_picks)
+        todays = [p for p in all_picks if isinstance(p, dict) and str(p.get("card_date") or p.get("date") or "") == target]
+        slate = []
+        try:
+            from mlb_data import get_combined_slate
+            slate = await asyncio.to_thread(get_combined_slate, os.getenv("ODDS_API_KEY", ""), game_date=target)
+        except Exception:
+            pass
+        result = await asyncio.to_thread(regenerate_snapshot, target, todays, slate)
+        if result.get("success"):
+            await update.message.reply_text(f"✅ Snapshot regenerated for {target} at {result.get('path')}")
+        else:
+            await update.message.reply_text(f"❌ Snapshot regeneration failed: {result.get('error')}")
+    except Exception as error:
+        logging.exception("/snapshot_regenerate failed")
+        await update.message.reply_text(f"/snapshot_regenerate failed: {error!r}")
+
+
+# ── Vault Commands ────────────────────────────────────────────────────────
+
+async def vault_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: show vault debug info for a date."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id != OWNER_TELEGRAM_ID:
+        return
+    if not update.message:
+        return
+    args = context.args or []
+    target = args[0] if args else eastern_today().isoformat()
+    try:
+        from services.results_vault import vault_debug as _vault_debug, render_vault_debug
+        payload = await asyncio.to_thread(_vault_debug, target)
+        await update.message.reply_text(render_vault_debug(payload))
+    except Exception as error:
+        logging.exception("/vault_debug failed")
+        await update.message.reply_text(f"/vault_debug failed: {error!r}")
+
+
+# ── Grade Commands ────────────────────────────────────────────────────────
 
 async def grade_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner-only command to inspect MLB grading decisions for one date."""
@@ -5566,6 +5707,18 @@ async def main() -> None:
     application.add_handler(CommandHandler("grade_yesterday", grade_yesterday))
     application.add_handler(CommandHandler("force_grade_date", force_grade_date))
     application.add_handler(CommandHandler("grade_debug", grade_debug))
+    application.add_handler(CommandHandler("snapshot_status", snapshot_status))
+    SYSTEM_LOG.info("Registered command: /snapshot_status")
+    print("Registered command: /snapshot_status", flush=True)
+    application.add_handler(CommandHandler("snapshot_debug", snapshot_debug))
+    SYSTEM_LOG.info("Registered command: /snapshot_debug")
+    print("Registered command: /snapshot_debug", flush=True)
+    application.add_handler(CommandHandler("snapshot_regenerate", snapshot_regenerate))
+    SYSTEM_LOG.info("Registered command: /snapshot_regenerate")
+    print("Registered command: /snapshot_regenerate", flush=True)
+    application.add_handler(CommandHandler("vault_debug", vault_debug))
+    SYSTEM_LOG.info("Registered command: /vault_debug")
+    print("Registered command: /vault_debug", flush=True)
     application.add_handler(CommandHandler("results_auto_status", results_auto_status))
     application.add_handler(CommandHandler("time_debug", time_debug))
     application.add_handler(CommandHandler("scheduler_status", scheduler_status))

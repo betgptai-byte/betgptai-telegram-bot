@@ -29,6 +29,8 @@ MISSING_FIELDS_QUALITY = {
     6: "C",
 }
 
+_GAME_PK_MISMATCH_WARNINGS: list[str] = []
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -128,8 +130,41 @@ def _is_hitter_park(park: str) -> bool:
     return any(word in park for word in ("hitter", "hr", "extreme", "friendly"))
 
 
-def _data_quality(missing_count: int) -> str:
+def _normalize_edge(value: Any) -> float:
+    """Ensure an edge score is 0–100.  If > 100, treat as already-multiplied value and divide by 100."""
+    v = _num(value)
+    if v > 100:
+        v = v / 100.0
+    return max(0.0, min(100.0, v))
+
+
+def _data_quality(missing_count: int, hitters_scanned: int = 0) -> str:
+    """Return data quality grade.
+
+    If hitters_scanned is 0, grade is always C or D (never A).
+    """
+    if hitters_scanned == 0:
+        return "D"
     return MISSING_FIELDS_QUALITY.get(missing_count, "C")
+
+
+def _validate_game_pk(game_pk: Any, pitcher_side: str, game: dict[str, Any]) -> bool:
+    """Validate that pitcher metrics belong to the same game_pk.
+
+    Logs a warning if game_pk mismatches on the pitcher side so it is not reused
+    from another game.
+    """
+    pitcher_game_pk = game.get(f"{pitcher_side}_pitcher_game_pk") or game.get("game_pk") or game.get("game_id")
+    expected = game.get("game_pk") or game.get("game_id")
+    if pitcher_game_pk and expected and str(pitcher_game_pk) != str(expected):
+        msg = (
+            f"Pitcher game_pk mismatch: {pitcher_side} pitcher belongs to game "
+            f"{pitcher_game_pk} but current game is {expected} — skipping matchup"
+        )
+        _GAME_PK_MISMATCH_WARNINGS.append(msg)
+        logger.warning(msg)
+        return False
+    return True
 
 
 # ── Scoring functions ──────────────────────────────────────────────────────
@@ -313,11 +348,11 @@ def _build_hitter_matchup(
     park: str,
 ) -> dict[str, Any]:
     """Build a single per-hitter-vs-SP matchup dict."""
-    contact = _contact_edge(batter, pitcher)
-    power = _power_edge(batter, pitcher)
-    k_risk = _strikeout_risk(batter, pitcher)
-    pitch_type = _pitch_type_edge(pitcher_arsenal)
-    platoon = _platoon_edge(batter, pitcher, team_splits)
+    contact = _normalize_edge(_contact_edge(batter, pitcher))
+    power = _normalize_edge(_power_edge(batter, pitcher))
+    k_risk = _normalize_edge(_strikeout_risk(batter, pitcher))
+    pitch_type = _normalize_edge(_pitch_type_edge(pitcher_arsenal))
+    platoon = _normalize_edge(_platoon_edge(batter, pitcher, team_splits))
 
     total_bases = _total_bases_score(contact, power, lineup_spot)
 
@@ -342,7 +377,7 @@ def _build_hitter_matchup(
 
     risk = "Low" if k_risk < 40 else "Medium" if k_risk < 65 else "High"
     missing = _missing_fields_list(batter, pitcher)
-    dq = _data_quality(len(missing))
+    dq = _data_quality(len(missing), hitters_scanned=1)
 
     reasons = []
     if contact >= 70:
@@ -389,8 +424,26 @@ def _game_team_side_matchup(
     batter_side: str,
     pitcher_side: str,
     lineup_label: str,
+    game_pk: Any = None,
 ) -> dict[str, Any]:
     """Build matchup output for one side (away hitters vs home SP, etc.)."""
+    if game_pk is not None and not _validate_game_pk(game_pk, pitcher_side, game):
+        return {
+            "side": batter_side,
+            "team": _safe(game.get(f"{batter_side}_team"), "Team"),
+            "opposing_pitcher": "MISMATCH",
+            "hitters_scanned": 0,
+            "hitters_qualified": 0,
+            "top_hit_edges": [],
+            "top_hr_edges": [],
+            "top_total_bases_edges": [],
+            "rejected_hitters": [],
+            "team_contact_advantage": 0,
+            "team_power_advantage": 0,
+            "team_k_risk": 0,
+            "recommended_team_total_side": "pass",
+            "data_quality_grade": "D",
+        }
     pitcher = _pitcher_metrics(game, pitcher_side)
     batters = _batter_metrics(game, batter_side)
     arsenal = _pitch_type_matchup(game, pitcher_side, batter_side)
@@ -444,7 +497,7 @@ def _game_team_side_matchup(
 
     all_missing = sum(len(mu.get("missing_fields", [])) for mu in hit_edges)
     total_possible = n * 14  # 14 checked fields per hitter
-    dq = _data_quality(all_missing // max(1, n)) if n else "C"
+    dq = _data_quality(all_missing // max(1, n), hitters_scanned=len(batters)) if n else "D"
 
     return {
         "side": batter_side,
@@ -470,10 +523,12 @@ def build_sp_batter_matchups(game: dict[str, Any]) -> dict[str, Any]:
     """Build SP vs Batter matchup output for one game.
 
     Returns a dict with ``away_vs_home_sp``, ``home_vs_away_sp``, and
-    ``game_level`` summaries.
+    ``game_level`` summaries.  Validates that pitcher metrics belong to the
+    same game_pk and never reuses pitcher_context from another game.
     """
-    away = _game_team_side_matchup(game, "away", "home", "Away Hitters vs Home SP")
-    home = _game_team_side_matchup(game, "home", "away", "Home Hitters vs Away SP")
+    game_pk = game.get("game_pk") or game.get("game_id")
+    away = _game_team_side_matchup(game, "away", "home", "Away Hitters vs Home SP", game_pk=game_pk)
+    home = _game_team_side_matchup(game, "home", "away", "Home Hitters vs Away SP", game_pk=game_pk)
 
     # Game total: combine both sides
     game_total_side = "pass"
@@ -512,6 +567,7 @@ def build_slate_matchups(slate: list[dict[str, Any]]) -> dict[str, Any]:
         debug — aggregated debug counters
     """
     games = []
+    _GAME_PK_MISMATCH_WARNINGS.clear()
     debug = {
         "games_scanned": 0,
         "hitters_scanned": 0,
@@ -521,6 +577,7 @@ def build_slate_matchups(slate: list[dict[str, Any]]) -> dict[str, Any]:
         "pitch_type_matchups_found": 0,
         "missing_fields_total": 0,
         "rejected_hitters": [],
+        "game_pk_mismatches": _GAME_PK_MISMATCH_WARNINGS,
     }
     for game in slate:
         result = build_sp_batter_matchups(game)

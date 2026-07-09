@@ -3766,15 +3766,19 @@ async def odds_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def sp_batter_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Owner-only: show SP vs Batter matchup engine diagnostics.
+    """Owner-only: SP vs Batter matchup engine diagnostics.
 
-    Usage: /sp_batter_debug
+    Usage:
+      /sp_batter_debug           — compact summary
+      /sp_batter_debug full      — per-game technical detail
     """
     user_id = update.effective_user.id if update.effective_user else None
     if user_id != OWNER_TELEGRAM_ID:
         return
     if not update.message:
         return
+    args = context.args or []
+    full_mode = "full" in args
     selected_date = official_sports_date().isoformat()
     try:
         await update.message.reply_text("⏳ Running SP vs Batter Matchup Engine...")
@@ -3790,47 +3794,174 @@ async def sp_batter_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         games = result.get("games", [])
         display_date_str = datetime.fromisoformat(selected_date).strftime("%m/%d/%Y")
         lines = [
-            "🧪 BETGPTAI SP vs BATTER DEBUG",
+            "🧪 BETGPTAI SP vs BATTER MATCHUP ENGINE",
             f"📅 Date: {display_date_str}",
             f"Games scanned: {debug.get('games_scanned', 0)}",
             f"Hitters scanned: {debug.get('hitters_scanned', 0)}",
             f"Hitters qualified: {debug.get('hitters_qualified', 0)}",
-            f"Pitcher metrics found: {debug.get('pitcher_metrics_found', 0)}",
-            f"Batter metrics found: {debug.get('batter_metrics_found', 0)}",
-            f"Pitch-type matchups found: {debug.get('pitch_type_matchups_found', 0)}",
-            f"Total missing fields: {debug.get('missing_fields_total', 0)}",
+            f"Missing fields total: {debug.get('missing_fields_total', 0)}",
             "",
         ]
+        def _score_line(mu, label=""):
+            return (
+                f"  {mu.get('player_name', '?')} (spot {mu.get('lineup_spot', '?')}) "
+                f"— contact {mu.get('contact_edge_score', '?')} / "
+                f"power {mu.get('power_edge_score', '?')} / "
+                f"Krisk {mu.get('strikeout_risk_score', '?')} — "
+                f"{mu.get('best_market', '?')}"
+            )
+        hit_edges = []
+        hr_edges = []
+        tb_edges = []
+        k_risks = []
         for g in games:
-            gl = g.get("game_level") or {}
-            lines.append(f"── {gl.get('matchup', 'Game')} ──")
-            lines.append(f"  PK: {g.get('game_pk')}")
-            lines.append(f"  Contact adv: {gl.get('combined_contact_advantage', 'N/A')}")
-            lines.append(f"  Power adv: {gl.get('combined_power_advantage', 'N/A')}")
-            lines.append(f"  Game total side: {gl.get('recommended_game_total_side', 'N/A')}")
-            lines.append(f"  DQ: {gl.get('data_quality_grade', 'N/A')}")
-            for side_key, side_label in (("away_vs_home_sp", "Away→SP"), ("home_vs_away_sp", "Home→SP")):
+            for side_key in ("away_vs_home_sp", "home_vs_away_sp"):
                 side = g.get(side_key) or {}
-                top = side.get("top_hit_edges") or []
-                if top:
-                    lines.append(f"  Top {side_label}:")
-                    for mu in top[:3]:
-                        lines.append(
-                            f"    {mu.get('player_name')} (spot {mu.get('lineup_spot')}) — "
-                            f"contact {mu.get('contact_edge_score')} / "
-                            f"power {mu.get('power_edge_score')} / "
-                            f"Krisk {mu.get('strikeout_risk_score')} — "
-                            f"{mu.get('best_market')}"
-                        )
-            lines.append("")
-        rejected = debug.get("rejected_hitters") or []
-        if rejected:
-            lines.append(f"Rejected hitters ({len(rejected)}):")
-            lines.extend(f"- {r}" for r in rejected[:15])
+                hit_edges.extend(side.get("top_hit_edges") or [])
+                hr_edges.extend(side.get("top_hr_edges") or [])
+                tb_edges.extend(side.get("top_total_bases_edges") or [])
+                k_risks.extend(side.get("top_hit_edges") or [])
+        hit_edges.sort(key=lambda mu: mu.get("overall_hit_score", 0), reverse=True)
+        hr_edges.sort(key=lambda mu: mu.get("overall_hr_score", 0), reverse=True)
+        tb_edges.sort(key=lambda mu: mu.get("total_bases_score", 0), reverse=True)
+        k_risks.sort(key=lambda mu: mu.get("strikeout_risk_score", 0), reverse=True)
+
+        def _top_n(edges, key, n=10):
+            return [e for e in edges if e.get(key, 0) >= 40][:n] or edges[:n]
+
+        lines.extend([
+            "── TOP 10 HIT EDGES ──",
+            *[_score_line(mu) for mu in _top_n(hit_edges, "overall_hit_score")[:10]],
+            "",
+            "── TOP 10 HR EDGES ──",
+            *[_score_line(mu) for mu in _top_n(hr_edges, "overall_hr_score")[:10]],
+            "",
+            "── TOP 10 TOTAL BASES EDGES ──",
+            *[_score_line(mu) for mu in _top_n(tb_edges, "total_bases_score")[:10]],
+            "",
+            "── TOP 10 K RISK SPOTS ──",
+            *[_score_line(mu) for mu in _top_n(k_risks, "strikeout_risk_score")[:10]],
+            "",
+        ])
+        if full_mode:
+            lines.append("── PER-GAME DETAIL ──")
+            for g in games:
+                gl = g.get("game_level") or {}
+                lines.append(f"── {gl.get('matchup', 'Game')} ──")
+                lines.append(f"  PK: {g.get('game_pk')}")
+                lines.append(f"  Contact adv: {gl.get('combined_contact_advantage', 'N/A')}")
+                lines.append(f"  Power adv: {gl.get('combined_power_advantage', 'N/A')}")
+                lines.append(f"  Game total side: {gl.get('recommended_game_total_side', 'N/A')}")
+                lines.append(f"  DQ: {gl.get('data_quality_grade', 'N/A')}")
+                for side_key, side_label in (("away_vs_home_sp", "Away→SP"), ("home_vs_away_sp", "Home→SP")):
+                    side = g.get(side_key) or {}
+                    top = side.get("top_hit_edges") or []
+                    if top:
+                        lines.append(f"  Top {side_label}:")
+                        for mu in top[:3]:
+                            lines.append(
+                                f"    {mu.get('player_name')} (spot {mu.get('lineup_spot')}) — "
+                                f"contact {mu.get('contact_edge_score')} / "
+                                f"power {mu.get('power_edge_score')} / "
+                                f"Krisk {mu.get('strikeout_risk_score')} — "
+                                f"{mu.get('best_market')}"
+                            )
+                lines.append("")
+            rejected = debug.get("rejected_hitters") or []
+            if rejected:
+                lines.append(f"Rejected hitters ({len(rejected)}):")
+                lines.extend(f"- {r}" for r in rejected[:15])
+        else:
+            lines.append("── GAME SUMMARY ──")
+            for g in games:
+                gl = g.get("game_level") or {}
+                lines.append(f"{gl.get('matchup', 'Game')} — PK {g.get('game_pk')} — Contact {gl.get('combined_contact_advantage', '?')} / Power {gl.get('combined_power_advantage', '?')} / total {gl.get('recommended_game_total_side', '?')} / DQ {gl.get('data_quality_grade', '?')}")
         await _send_long_message(update, "\n".join(lines).strip())
     except Exception as error:
         logging.exception("/sp_batter_debug failed")
         await update.message.reply_text(f"/sp_batter_debug failed:\n{error!r}")
+
+
+async def official_card_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: official card diagnostics.
+
+    Shows market context availability, Sharp games matched, quant
+    candidates, official picks count, skipped reasons, and save result.
+    """
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id != OWNER_TELEGRAM_ID:
+        return
+    if not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+    try:
+        await update.message.reply_text("⏳ Building official card diagnostics...")
+        from mlb_admin_report import build_mlb_admin_report
+
+        report = await asyncio.to_thread(
+            build_mlb_admin_report,
+            selected_date,
+            odds_api_key=os.getenv("ODDS_API_KEY", ""),
+            openai_api_key=os.getenv("OPENAI_API_KEY", ""),
+            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
+            highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+            save_picks=False,
+        )
+        official = report.get("official_card") or {}
+        slate = []
+        try:
+            from mlb_data import get_combined_slate
+            slate = await asyncio.to_thread(
+                get_combined_slate,
+                os.getenv("ODDS_API_KEY", ""),
+                game_date=selected_date,
+                highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+            )
+        except Exception:
+            pass
+        matched_odds = sum(
+            1 for g in slate
+            if g.get("odds_status") == "available"
+            or isinstance(g.get("best_available_prices"), list) and len(g["best_available_prices"]) > 0
+        )
+        display_str = datetime.fromisoformat(selected_date).strftime("%m/%d/%Y")
+        lines = [
+            "🧪 BETGPTAI OFFICIAL CARD DEBUG",
+            f"📅 Date: {display_str}",
+            "",
+            f"Market context available: {'yes' if matched_odds > 0 else 'no'}",
+            f"Sharp games matched: {matched_odds} / {len(slate) if slate else 0}",
+            f"Quant candidates created: {len(official.get('top_moneylines', []))}",
+            f"Official picks count: {official.get('saved_pick_count', 0)}",
+            f"Card source: {official.get('source', 'none')}",
+            f"Unavailable reason: {_safe(report.get('official_card_unavailable_reason'), 'N/A')}",
+            f"Saved picks in report: {report.get('saved_picks', 0)}",
+            "",
+        ]
+        skipped = []
+        if not slate:
+            skipped.append("Slate unavailable — no MLB games for this date")
+        if matched_odds == 0:
+            skipped.append("Odds market context unavailable — Sharp/Odds API returned 0 matched games")
+        if not report.get("official_card_text"):
+            skipped.append("AI analysis card not generated")
+        if not official.get("top_moneylines"):
+            skipped.append("No edge above threshold — admin Top5 produced zero qualified moneyline candidates")
+        if official.get("saved_pick_count", 0) == 0:
+            skipped.append("StructuredCard official_picks empty")
+        if skipped:
+            lines.append("Skipped reasons:")
+            lines.extend(f"- {s}" for s in skipped)
+            lines.append("")
+        save_result = report.get("save_result") or {}
+        if save_result:
+            lines.append(f"Save result: {'success' if save_result.get('success') else 'failed'}")
+            if save_result.get("error"):
+                lines.append(f"Save error: {save_result.get('error')}")
+        await _send_long_message(update, "\n".join(lines).strip())
+    except Exception as error:
+        logging.exception("/official_card_debug failed")
+        await update.message.reply_text(f"/official_card_debug failed:\n{error!r}")
 
 
 async def _build_card_debug_text() -> str:
@@ -5402,6 +5533,9 @@ async def main() -> None:
     application.add_handler(CommandHandler("sp_batter_debug", sp_batter_debug))
     SYSTEM_LOG.info("Registered command: /sp_batter_debug")
     print("Registered command: /sp_batter_debug", flush=True)
+    application.add_handler(CommandHandler("official_card_debug", official_card_debug))
+    SYSTEM_LOG.info("Registered command: /official_card_debug")
+    print("Registered command: /official_card_debug", flush=True)
     application.add_handler(CommandHandler("card_debug", card_debug))
     SYSTEM_LOG.info("Registered command: /card_debug")
     print("Registered command: /card_debug", flush=True)

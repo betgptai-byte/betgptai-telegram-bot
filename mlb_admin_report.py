@@ -32,6 +32,17 @@ EASTERN = ZoneInfo("America/New_York")
 DIVIDER = "━━━━━━━━━━━━━━"
 
 
+def _normalize_edge_score(value: Any) -> int:
+    """Ensure an edge score is 0–100.
+
+    If > 100 it has already been multiplied by 100 and must be divided back.
+    """
+    v = _num(value)
+    if v > 100:
+        v = v / 100.0
+    return int(round(max(0.0, min(100.0, v))))
+
+
 def _implied_probability(american_odds: Any) -> float:
     """Convert American odds to implied probability for internal ranking."""
     price = _num(american_odds)
@@ -124,7 +135,7 @@ def _admin_market_fallback_candidates(slate: list[dict[str, Any]], market: str, 
             continue
         row = _candidate_base(game, market_type, pick_text, line=line, odds=None)
         row["score"] = edge
-        row["final_edge_score"] = edge
+        row["final_edge_score"] = _normalize_edge_score(edge)
         row["confidence"] = quant.get("confidence") or "Admin Candidate"
         row["risk_level"] = quant.get("risk_level") or "Medium"
         row["data_quality_grade"] = quant.get("data_quality_grade") or "B/C"
@@ -173,7 +184,7 @@ def _ranked_market_candidates(slate: list[dict[str, Any]], market: str, limit: i
                 line = point
             candidate = _candidate_base(game, market_type, pick_text, line=line, odds=price)
             candidate["score"] = _implied_probability(price)
-            candidate["final_edge_score"] = round(candidate["score"] * 100)
+            candidate["final_edge_score"] = _normalize_edge_score(candidate["score"] * 100)
             candidate["confidence"] = "Admin Candidate"
             candidate["risk_level"] = "Medium"
             candidate["data_quality_grade"] = "Admin"
@@ -308,7 +319,7 @@ def _compute_team_totals(
                     row["inferred_line_admin_only"] = True
                 edge = _team_total_edge_score(game, side, direction)
                 row["score"] = edge / 100.0
-                row["final_edge_score"] = round(edge)
+                row["final_edge_score"] = _normalize_edge_score(edge)
                 row["team_side"] = side
                 row["direction"] = direction
                 candidates.append(row)
@@ -327,7 +338,7 @@ def _top_f5_candidates(slate: list[dict[str, Any]], limit: int = 5) -> list[dict
         pick_text = f"{base} F5 ML"
         row = _candidate_base(game, "f5_moneyline", pick_text, line=None, odds=None)
         row["score"] = candidate.get("score", 0)
-        row["final_edge_score"] = round((row["score"] or 0.86) * 100)
+        row["final_edge_score"] = _normalize_edge_score((row["score"] or 0.86) * 100)
         row["confidence"] = "Admin Candidate"
         row["risk_level"] = "Medium"
         row["data_quality_grade"] = "Admin"
@@ -436,7 +447,7 @@ def _ranked_market_candidates_v2(
             market_debug["candidates_scanned"] += 1
             candidate = _candidate_base(game, market_type, pick_text, line=line, odds=price)
             candidate["score"] = _implied_probability(price)
-            candidate["final_edge_score"] = round(candidate["score"] * 100)
+            candidate["final_edge_score"] = _normalize_edge_score(candidate["score"] * 100)
             candidate["confidence"] = "Admin Candidate"
             candidate["risk_level"] = "Medium"
             candidate["data_quality_grade"] = "Admin"
@@ -456,8 +467,8 @@ def _ranked_market_candidates_v2(
                             f"{team_name} ML — quant edge {qe:.0f} below threshold {edge_threshold:.0f}"
                         )
                         continue
-                    candidate["quant_edge_score"] = round(qe)
-                    candidate["final_edge_score"] = round(qe)
+                    candidate["quant_edge_score"] = _normalize_edge_score(qe)
+                    candidate["final_edge_score"] = _normalize_edge_score(qe)
                     candidate["score"] = qe / 100.0
 
             rows.append(candidate)
@@ -993,26 +1004,103 @@ def _underdogs(card_date: str, limit: int = 10) -> list[str]:
     return [label for _odds, label in sorted(rows, reverse=True)[:limit]]
 
 
-def _official_card_summary(card: str, card_date: str) -> dict[str, Any]:
-    return {
-        "play_of_the_day": _extract_section(card, "🔥 PLAY OF THE DAY"),
-        "safe_parlay": _extract_section(card, "🧩 2-LEG SAFE PARLAY"),
-        "value_parlay": "Unavailable in free-card feed",
-        "core_five": _pick_lines(card_date, "moneyline", 2)
-        + _pick_lines(card_date, "f5_moneyline", 1)
-        + _pick_lines(card_date, "runline", 1)
-        + _pick_lines(card_date, "total", 1),
+def _official_card_unavailable_reason(
+    card_text: str,
+    slate: list[dict[str, Any]],
+    top5_moneylines: list[dict[str, Any]],
+    top5_team_totals: list[dict[str, Any]],
+    saved_pick_count: int,
+) -> str:
+    """Return the exact reason the official card / picks are unavailable."""
+    if not slate:
+        return "Slate unavailable — no MLB games for this date."
+    matched_odds = sum(
+        1 for g in slate
+        if g.get("odds_status") == "available"
+        or isinstance(g.get("best_available_prices"), list) and len(g["best_available_prices"]) > 0
+    )
+    if matched_odds == 0:
+        return "Odds market context unavailable — Sharp/Odds API returned 0 matched games."
+    if not card_text:
+        return "AI analysis card not generated — no edge above threshold or AI unavailable."
+    has_sections = "🔥" in card_text or "🏆" in card_text
+    if not has_sections:
+        return "AI card generated but no structured sections found — formatted card may be empty."
+    if not top5_moneylines and not top5_team_totals:
+        return "No edge above threshold — admin Top5 produced zero qualified candidates."
+    if saved_pick_count == 0:
+        return "StructuredCard official_picks empty — AI analysis did not produce trackable picks."
+    return "Official card available."
+
+
+def _build_official_card_from_top5(
+    top5_moneylines: list[dict[str, Any]],
+    top5_runlines: list[dict[str, Any]],
+    top5_f5: list[dict[str, Any]],
+    top5_totals: list[dict[str, Any]],
+    top5_team_totals: list[dict[str, Any]],
+    card_text: str,
+    saved_pick_count: int,
+) -> dict[str, Any]:
+    """Build the Official Betting Card sections, falling back to admin Top5 when AI card is absent."""
+    card = {
+        "play_of_the_day": None,
+        "top_moneylines": [],
+        "top_runlines": [],
+        "top_f5": [],
+        "top_totals": [],
+        "top_team_totals": [],
+        "safe_parlay": None,
+        "source": "admin_top5",
+        "saved_pick_count": saved_pick_count,
     }
+    # Try to extract from AI card text first
+    if card_text:
+        for heading, key in (
+            ("🔥 PLAY OF THE DAY", "play_of_the_day"),
+        ):
+            start = card_text.find(heading)
+            if start >= 0:
+                end = card_text.find(DIVIDER, start)
+                if end < 0:
+                    end = card_text.find("━━━━━━━━━━━━", start)
+                if end < 0:
+                    end = len(card_text)
+                card[key] = card_text[start:end].strip()
+        start = card_text.find("🧩 2-LEG SAFE PARLAY")
+        if start >= 0:
+            end = card_text.find(DIVIDER, start)
+            if end < 0:
+                end = card_text.find("━━━━━━━━━━━━", start)
+            if end < 0:
+                end = len(card_text)
+            card["safe_parlay"] = card_text[start:end].strip()
 
+    # Fall back to admin Top5 for market sections
+    if not card["top_moneylines"]:
+        card["top_moneylines"] = [
+            _compact_pick_text(item) for item in top5_moneylines[:5] if isinstance(item, dict)
+        ]
+    if not card["top_runlines"]:
+        card["top_runlines"] = [
+            _compact_pick_text(item) for item in top5_runlines[:5] if isinstance(item, dict)
+        ]
+    if not card["top_f5"]:
+        card["top_f5"] = [
+            _compact_pick_text(item) for item in top5_f5[:5] if isinstance(item, dict)
+        ]
+    if not card["top_totals"]:
+        card["top_totals"] = [
+            _compact_pick_text(item) for item in top5_totals[:5] if isinstance(item, dict)
+        ]
+    if not card["top_team_totals"]:
+        card["top_team_totals"] = [
+            _compact_pick_text(item) for item in top5_team_totals[:5] if isinstance(item, dict)
+        ]
 
-def _extract_section(card: str, heading: str) -> str:
-    start = card.find(heading)
-    if start < 0:
-        return "Unavailable"
-    end = card.find(DIVIDER, start)
-    if end < 0:
-        end = card.find("━━━━━━━━━━━━", start)
-    return card[start:end if end >= 0 else len(card)].strip()
+    if card["play_of_the_day"] or card["top_moneylines"]:
+        card["source"] = "ai" if card["play_of_the_day"] else "admin_top5"
+    return card
 
 
 def build_mlb_admin_report(
@@ -1053,10 +1141,25 @@ def build_mlb_admin_report(
                     raise RuntimeError(save_result.get("error") or "Pick persistence failed")
                 saved_picks = int(save_result.get("saved_pick_count") or 0)
         except RuntimeError:
-            # If already inside an event loop, caller should pass through async wrapper.
             official_card = ""
         except Exception:
             official_card = ""
+
+    # Build admin Top5 for official card fallback
+    try:
+        top5_card = build_mlb_top5_admin_card(
+            card_date,
+            odds_api_key=odds_api_key,
+            highlightly_api_key=highlightly_api_key,
+        )
+        top5 = top5_card.get("top5") or {}
+    except Exception:
+        top5 = {}
+    top5_ml = _list(top5.get("moneyline"))
+    top5_rl = _list(top5.get("runline"))
+    top5_f5 = _list(top5.get("f5_moneyline"))
+    top5_totals = _list(top5.get("game_totals"))
+    top5_tt = _list(top5.get("team_totals"))
 
     games = [_game_report(game, props_payload) for game in slate]
     top_lists = {
@@ -1070,8 +1173,12 @@ def build_mlb_admin_report(
         "top_10_strikeout_props": _top_props(props_payload, "strikeouts"),
         "top_10_underdogs": _underdogs(card_date),
     }
+    official_card_data = _build_official_card_from_top5(
+        top5_ml, top5_rl, top5_f5, top5_totals, top5_tt,
+        official_card, saved_picks,
+    )
     report = {
-        "version": "Official MLB War Room v1",
+        "version": "Official MLB War Room v2",
         "card_date": card_date,
         "display_date": _display_date(card_date),
         "created_at": datetime.now(EASTERN).isoformat(timespec="seconds"),
@@ -1079,8 +1186,11 @@ def build_mlb_admin_report(
         "verification_score": average_verification_score(slate),
         "games": games,
         "top_lists": top_lists,
-        "todays_official_card": _official_card_summary(official_card, card_date),
+        "official_card": official_card_data,
         "official_card_text": official_card,
+        "official_card_unavailable_reason": _official_card_unavailable_reason(
+            official_card, slate, top5_ml, top5_tt, saved_picks,
+        ),
         "admin_only": True,
     }
     path = _admin_dir(card_date) / "mlb_admin_report.json"
@@ -1141,6 +1251,22 @@ async def build_mlb_admin_report_async(
                 saved_picks = int(save_result.get("saved_pick_count") or 0)
             except Exception as error:
                 errors.append(f"Pick saving failed: {error}")
+    # Build admin Top5 for official card fallback
+    try:
+        top5_card = build_mlb_top5_admin_card(
+            card_date,
+            odds_api_key=odds_api_key,
+            highlightly_api_key=highlightly_api_key,
+        )
+        top5 = top5_card.get("top5") or {}
+    except Exception:
+        top5 = {}
+    top5_ml = _list(top5.get("moneyline"))
+    top5_rl = _list(top5.get("runline"))
+    top5_f5 = _list(top5.get("f5_moneyline"))
+    top5_totals = _list(top5.get("game_totals"))
+    top5_tt = _list(top5.get("team_totals"))
+
     games = [_game_report(game, props_payload) for game in slate]
     top_lists = {
         "top_10_moneylines": _pick_lines(card_date, "moneyline"),
@@ -1153,8 +1279,12 @@ async def build_mlb_admin_report_async(
         "top_10_strikeout_props": _top_props(props_payload, "strikeouts"),
         "top_10_underdogs": _underdogs(card_date),
     }
+    official_card_data = _build_official_card_from_top5(
+        top5_ml, top5_rl, top5_f5, top5_totals, top5_tt,
+        official_card, saved_picks,
+    )
     report = {
-        "version": "Official MLB War Room v1",
+        "version": "Official MLB War Room v2",
         "card_date": card_date,
         "display_date": _display_date(card_date),
         "created_at": datetime.now(EASTERN).isoformat(timespec="seconds"),
@@ -1162,8 +1292,11 @@ async def build_mlb_admin_report_async(
         "verification_score": average_verification_score(slate),
         "games": games,
         "top_lists": top_lists,
-        "todays_official_card": _official_card_summary(official_card, card_date),
+        "official_card": official_card_data,
         "official_card_text": official_card,
+        "official_card_unavailable_reason": _official_card_unavailable_reason(
+            official_card, slate, top5_ml, top5_tt, saved_picks,
+        ),
         "errors": errors,
         "admin_only": True,
     }
@@ -1198,40 +1331,70 @@ def render_mlb_admin_report(report: dict[str, Any], *, full: bool = True) -> str
     for game in report.get("games", []) if isinstance(report.get("games"), list) else []:
         lines.extend(_render_game(game, full=full))
     top_lists = _dict(report.get("top_lists"))
-    lines.extend(["", DIVIDER, "BOTTOM BOARD", ""])
-    labels = [
-        ("🔥 TOP 10 Moneylines", "top_10_moneylines"),
-        ("🔥 TOP 10 Runlines", "top_10_runlines"),
-        ("🔥 TOP 10 Totals", "top_10_totals"),
-        ("🔥 TOP 10 Team Totals (team total average 4.5 or 5.5)", "top_10_team_totals"),
-        ("🔥 TOP 10 F5", "top_10_f5"),
+    lines.extend(["", DIVIDER, "═ BOTTOM BOARD (Admin Edge Rankings)", ""])
+    bottom_labels = [
+        ("🔥 Moneylines", "top_10_moneylines", "unavailable — odds/market context not matched"),
+        ("🔥 Runlines", "top_10_runlines", "unavailable — no qualifying edge above threshold"),
+        ("🔥 Game Totals", "top_10_totals", "unavailable — odds/market context not matched"),
+        ("💰 Team Totals", "top_10_team_totals", "unavailable — team-total market missing; inferred admin-only lines available in intel"),
+        ("🔥 F5", "top_10_f5", "unavailable — no qualifying edge above threshold"),
+        ("🔥 Underdogs", "top_10_underdogs", "unavailable — no qualifying underdog edge"),
+    ]
+    for label, key, unavailable_reason in bottom_labels:
+        values = top_lists.get(key) or []
+        lines.append(label)
+        if values:
+            lines.extend(f"{idx}. {value}" for idx, value in enumerate(values[:10], start=1))
+        else:
+            lines.append(f": {unavailable_reason}")
+        lines.append("")
+    lines.extend(["", DIVIDER, "═ PROPS LAB (Admin Research — Not Official Picks)", ""])
+    props_labels = [
         ("🔥 TOP 10 Hit Props", "top_10_hit_props"),
         ("🔥 TOP 10 HR Props", "top_10_hr_props"),
         ("🔥 TOP 10 Strikeout Props", "top_10_strikeout_props"),
-        ("🔥 TOP 10 Underdogs", "top_10_underdogs"),
     ]
-    for label, key in labels:
+    for label, key in props_labels:
         values = top_lists.get(key) or ["Unavailable"]
         lines.append(label)
         lines.extend(f"{idx}. {value}" for idx, value in enumerate(values[:10], start=1))
         lines.append("")
-    official = _dict(report.get("todays_official_card"))
-    lines.extend([
-        DIVIDER,
-        "Today's Official Card",
-        "",
-        "Play of the Day:",
-        _safe(official.get("play_of_the_day")),
-        "",
-        "Safe Parlay:",
-        _safe(official.get("safe_parlay")),
-        "",
-        "Value Parlay:",
-        _safe(official.get("value_parlay")),
-        "",
-        "Core Five:",
-    ])
-    lines.extend(f"- {item}" for item in (official.get("core_five") or ["Unavailable"]))
+    # Official Betting Card
+    lines.extend([DIVIDER, "═ OFFICIAL BETTING CARD (Saved Trackable Picks)", ""])
+    official = _dict(report.get("official_card"))
+    source = official.get("source", "none")
+    reason = _safe(report.get("official_card_unavailable_reason"), "")
+    if not any(official.get(k) for k in ("play_of_the_day", "top_moneylines", "top_runlines", "top_f5", "top_totals", "top_team_totals", "safe_parlay")):
+        lines.append("Official Card Unavailable:")
+        lines.append(str(reason))
+        lines.append("")
+    else:
+        if official.get("play_of_the_day"):
+            lines.extend(["🔥 PLAY OF THE DAY", _safe(official["play_of_the_day"]), ""])
+        if official.get("top_moneylines"):
+            lines.append("🔥 TOP MONEYLINES")
+            lines.extend(f"{i}. {item}" for i, item in enumerate(official["top_moneylines"][:5], 1))
+            lines.append("")
+        if official.get("top_runlines"):
+            lines.append("📈 TOP RUNLINE")
+            lines.extend(f"{i}. {item}" for i, item in enumerate(official["top_runlines"][:5], 1))
+            lines.append("")
+        if official.get("top_f5"):
+            lines.append("⚾ TOP F5")
+            lines.extend(f"{i}. {item}" for i, item in enumerate(official["top_f5"][:5], 1))
+            lines.append("")
+        if official.get("top_totals"):
+            lines.append("📊 TOP TOTALS")
+            lines.extend(f"{i}. {item}" for i, item in enumerate(official["top_totals"][:5], 1))
+            lines.append("")
+        if official.get("top_team_totals"):
+            lines.append("💰 TOP TEAM TOTALS")
+            lines.extend(f"{i}. {item}" for i, item in enumerate(official["top_team_totals"][:5], 1))
+            lines.append("")
+        if official.get("safe_parlay"):
+            lines.extend(["🧩 SAFE 2-LEG PARLAY", _safe(official["safe_parlay"]), ""])
+    lines.append(f"Card source: {source}")
+    lines.append(f"Saved picks: {official.get('saved_pick_count', 0)}")
     lines.extend(["", f"Saved JSON: {report.get('report_path')}"])
     return "\n".join(str(line) for line in lines).strip()
 
@@ -1367,14 +1530,29 @@ def _render_game(game: dict[str, Any], *, full: bool) -> list[str]:
         "",
         DIVIDER,
         "Matchup Edge",
-        f"Pitch-type advantages: {_dict(game.get('matchup_edge')).get('pitch_type_advantages')}",
-        f"BvP: {_dict(game.get('matchup_edge')).get('bvp')}",
-        f"Statcast: {_dict(game.get('matchup_edge')).get('statcast')}",
-        f"Hard Hit%: {_dict(game.get('matchup_edge')).get('hard_hit_pct')}",
-        f"Barrel%: {_dict(game.get('matchup_edge')).get('barrel_pct')}",
-        f"xBA: {_dict(game.get('matchup_edge')).get('expected_batting_average')}",
-        f"xSLG: {_dict(game.get('matchup_edge')).get('expected_slugging')}",
-        "",
+    ])
+    # Render pitch-type advantages as a clean summary, not raw dict
+    pt = _dict(game.get("matchup_edge")).get("pitch_type_advantages")
+    if isinstance(pt, dict):
+        for pt_side in ("away_pitcher_vs_home", "home_pitcher_vs_away"):
+            side_pt = _dict(pt.get(pt_side))
+            arsenal = side_pt.get("arsenal") if isinstance(side_pt.get("arsenal"), list) else []
+            if arsenal:
+                top3 = sorted(arsenal, key=lambda p: _num(p.get("usage_count") or p.get("usage") or 0), reverse=True)[:3]
+                pt_summary = " / ".join(
+                    f"{p.get('tag', '?')} {_num(p.get('usage_count') or p.get('usage') or 0):.0f}%"
+                    for p in top3
+                )
+                label = "Away→Home" if "away" in pt_side else "Home→Away"
+                lines.append(f"Pitch-Type Matchup ({label}): {pt_summary}")
+    else:
+        lines.append("Pitch-Type Matchup: Unavailable")
+    me = _dict(game.get("matchup_edge"))
+    for label, key in (("Hard Hit%:", "hard_hit_pct"), ("Barrel%:", "barrel_pct"), ("xBA:", "expected_batting_average"), ("xSLG:", "expected_slugging")):
+        val = me.get(key)
+        lines.append(f"{label} {val}" if not isinstance(val, dict) else f"{label} Away {_safe(val.get('away_pitcher'))} / Home {_safe(val.get('home_pitcher'))}")
+    lines.append("")
+    lines.extend([
         DIVIDER,
         "Weather",
         f"Wind: {_na(weather.get('wind'))}",
@@ -1405,27 +1583,32 @@ def _render_game(game: dict[str, Any], *, full: bool) -> list[str]:
         *[f"- {item}" for item in notes.get("risk_factors", [])],
         "",
     ])
-    # SP vs Batter Matchup section
-    for side_key, side_label in (("away_vs_home_sp", "Away Hitters vs Home SP"), ("home_vs_away_sp", "Home Hitters vs Away SP")):
+    # SP vs Batter Matchup section — compact with recommendation
+    for side_key, side_label in (("away_vs_home_sp", "Away→SP"), ("home_vs_away_sp", "Home→SP")):
         side = _dict(sp_matchup.get(side_key))
-        if not side:
+        if not side or side.get("hitters_scanned", 0) == 0:
             continue
         lines.extend([DIVIDER, f"SP vs Batter: {side_label}"])
-        lines.append(f"Opposing SP: {_safe(side.get('opposing_pitcher'), 'TBD')}")
-        lines.append(f"Hitters scanned: {side.get('hitters_scanned', 0)}")
-        lines.append(f"Team contact adv: {side.get('team_contact_advantage', 'N/A')}")
-        lines.append(f"Team power adv: {side.get('team_power_advantage', 'N/A')}")
-        lines.append(f"Team K risk: {side.get('team_k_risk', 'N/A')}")
-        lines.append(f"Data quality: {_safe(side.get('data_quality_grade'), 'N/A')}")
+        lines.append(f"SP: {_safe(side.get('opposing_pitcher'), 'TBD')}")
+        lines.append(f"Team Contact Edge: {side.get('team_contact_advantage', 'N/A')}")
+        lines.append(f"Team Power Edge: {side.get('team_power_advantage', 'N/A')}")
+        lines.append(f"Team K Risk: {side.get('team_k_risk', 'N/A')}")
         top_edges = side.get("top_hit_edges") or []
         if top_edges:
-            lines.append("Top hitter edges:")
+            lines.append("Top 3 qualified hitter edges:")
             for mu in top_edges[:3]:
                 lines.append(
-                    f"- {mu.get('player_name')} (spot {mu.get('lineup_spot')}) "
-                    f"contact {mu.get('contact_edge_score')} power {mu.get('power_edge_score')} "
-                    f"market {mu.get('best_market')} — DQ {mu.get('data_quality_grade')}"
+                    f"  {mu.get('player_name', '?')} (spot {mu.get('lineup_spot', '?')}) — "
+                    f"contact {mu.get('contact_edge_score', '?')} / power {mu.get('power_edge_score', '?')} / "
+                    f"Krisk {mu.get('strikeout_risk_score', '?')} — {mu.get('best_market', '?')}"
                 )
+        rec = side.get("recommended_team_total_side", "pass")
+        if rec == "over":
+            lines.append("Recommendation: Hit prop / HR watch / Total bases")
+        elif rec == "under":
+            lines.append("Recommendation: Pass — team scoring suppressed")
+        else:
+            lines.append("Recommendation: Pass")
         lines.append("")
     return lines
 

@@ -368,15 +368,15 @@ def _resolve_destination(channel: str) -> int | str:
     return numeric
 
 
-def post_simple_mlb_card(card: dict, channel: str, bot: Any = None) -> bool:
-    """Post a rendered simple card to FREE_CHANNEL_ID (or given channel).
+async def post_simple_mlb_card(card: dict, bot: Any, channel_id: str) -> bool:
+    """Post a rendered simple card to a resolved Telegram channel id.
 
-    ``bot`` is required to send.  Returns True if at least one chunk posted.
+    ``bot`` is the async Telegram bot and ``channel_id`` must already be resolved
+    (e.g. via ``_resolve_destination``).  Returns True if at least one message sent.
     """
     if bot is None:
         return False
     text = render_simple_mlb_card(card)
-    chat_id = _resolve_destination(channel)
     remaining = text.strip()
     posted = False
     while remaining:
@@ -389,6 +389,11 @@ def post_simple_mlb_card(card: dict, channel: str, bot: Any = None) -> bool:
             if split_at < 1:
                 split_at = 3900
             chunk, remaining = remaining[:split_at], remaining[split_at:].lstrip()
-        bot.send_message(chat_id=chat_id, text=chunk)
+        await bot.send_message(
+            chat_id=channel_id,
+            text=chunk,
+            parse_mode=None,
+            disable_web_page_preview=True,
+        )
         posted = True
     return posted

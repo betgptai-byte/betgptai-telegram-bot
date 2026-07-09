@@ -4688,7 +4688,6 @@ async def simple_generate_today(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def simple_post_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner-only: load (or build+save) the simple card and post to FREE_CHANNEL_ID."""
-    del context
     if not await _require_admin(update) or not update.message:
         return
     selected_date = official_sports_date().isoformat()
@@ -4701,12 +4700,14 @@ async def simple_post_today(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         else:
             card = await asyncio.to_thread(build_simple_mlb_card, selected_date)
             path = await asyncio.to_thread(save_simple_mlb_card, card)
-        channel = os.getenv("FREE_CHANNEL_ID", "")
-        posted = await asyncio.to_thread(post_simple_mlb_card, card, channel, context.bot)
+        channel_id = _telegram_destination(os.getenv("FREE_CHANNEL_ID", ""))
+        posted = await post_simple_mlb_card(card, context.bot, channel_id)
+        saved = card.get("counts", {}).get("total", 0)
+        source = card.get("source", "simple_mlb_card_v1")
         await update.message.reply_text(
-            f"{'✅ Simple card posted to FREE channel.' if posted else '❌ Post failed (check FREE_CHANNEL_ID).'}\n"
-            f"Saved picks: {card.get('counts', {}).get('total', 0)}\n"
-            f"Path: {path}"
+            f"{'✅ Simple MLB card posted to free channel.' if posted else '❌ Simple post failed (check FREE_CHANNEL_ID).'}\n"
+            f"Saved picks: {saved}\n"
+            f"Tracked source: {source}"
         )
     except Exception as error:
         logging.exception("/simple_post_today failed")

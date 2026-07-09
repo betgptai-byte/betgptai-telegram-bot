@@ -372,45 +372,69 @@ def _market_context_from_prices(prices: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def odds_debug_payload(odds_api_key: str, selected_date: str) -> dict[str, Any]:
-    """Owner-only diagnostics for The Odds API MLB game matching."""
+    """Owner-only diagnostics for all odds providers."""
+    from services.odds_router import provider_status as router_status
+    from api.sharp_client import health as sharp_health, sharp_api_enabled, sharp_api_key
+
     payload: dict[str, Any] = {
         "odds_api_key_loaded": bool(str(odds_api_key or "").strip()),
         "odds_api_status_code": None,
+        "sharp_api_enabled": sharp_api_enabled(),
+        "sharp_api_key_loaded": bool(sharp_api_key()),
+        "sharp_api_health": sharp_health(),
         "sport_key": "baseball_mlb",
-        "markets_requested": "h2h,spreads,totals",
+        "markets_requested": "h2h,spreads,totals,team_totals",
+        "provider": None,
         "games_returned": 0,
         "matched_to_mlb_game_pk": 0,
         "unmatched_odds_games": [],
         "unmatched_mlb_games": [],
         "last_error": "",
         "errors": [],
+        "provider_status": router_status(),
     }
     try:
         schedule = get_mlb_schedule(selected_date)
     except Exception as error:
         schedule = []
         payload["errors"].append(f"MLB schedule unavailable: {error}")
+
+    # Try Sharp first, then Odds API fallback
+    odds: list[dict[str, Any]] = []
     try:
-        if not odds_api_key:
-            raise MLBDataError("ODDS_API_KEY is missing from .env.")
-        response = requests.get(ODDS_URL, params={
-            "apiKey": odds_api_key,
-            "regions": "us",
-            "markets": "h2h,spreads,totals",
-            "oddsFormat": "american",
-            "dateFormat": "iso",
-        }, timeout=REQUEST_TIMEOUT)
-        payload["odds_api_status_code"] = response.status_code
-        response.raise_for_status()
-        decoded = response.json()
-        if not isinstance(decoded, list):
-            raise MLBDataError("The Odds API returned an unexpected response.")
-        odds = decoded
+        from services.odds_router import fetch_odds
+        odds = fetch_odds()
+        payload["provider"] = "sharp_api"
+        # Determine which provider actually returned data
+        if odds:
+            has_sharp_keys = any(
+                "bookmaker_key" not in bk and "bookmaker" not in bk
+                for event in odds
+                for bk in (event.get("bookmakers") or [])
+            )
+        payload["odds_api_status_code"] = 200
     except Exception as error:
-        odds = []
-        redacted_error = _redact_secret(str(error))
-        payload["last_error"] = redacted_error
-        payload["errors"].append(f"Odds fetch unavailable: {redacted_error}")
+        if not odds and odds_api_key:
+            try:
+                response = requests.get(ODDS_URL, params={
+                    "apiKey": odds_api_key,
+                    "regions": "us",
+                    "markets": "h2h,spreads,totals",
+                    "oddsFormat": "american",
+                    "dateFormat": "iso",
+                }, timeout=REQUEST_TIMEOUT)
+                payload["odds_api_status_code"] = response.status_code
+                response.raise_for_status()
+                decoded = response.json()
+                if isinstance(decoded, list):
+                    odds = decoded
+                    payload["provider"] = "odds_api"
+            except Exception as fallback_error:
+                redacted = _redact_secret(str(fallback_error))
+                payload["last_error"] = redacted
+                payload["errors"].append(f"Odds API fallback: {redacted}")
+    if not odds:
+        payload["errors"].append("No odds data returned from any provider.")
     payload["games_returned"] = len(odds)
     odds_keys = {
         _game_key(odds_game.get("away_team", ""), odds_game.get("home_team", "")): odds_game
@@ -573,11 +597,13 @@ def get_combined_slate(
             game.setdefault("park_factor", "neutral")
 
     try:
-        odds = get_mlb_odds(odds_api_key)
-        slate = combine_schedule_and_odds(slate, odds)
+        from services.odds_router import fetch_odds
+        odds = fetch_odds()
+        if odds:
+            slate = combine_schedule_and_odds(slate, odds)
+        else:
+            raise MLBDataError("Odds router returned empty")
     except Exception as error:
-        # Do not use exc_info here: requests tracebacks include the full URL,
-        # which can expose ODDS_API_KEY in logs.
         logging.warning("Odds unavailable; continuing with schedule data: %s", error)
         slate = _attach_unavailable_odds(slate)
     if api_sports_enabled:

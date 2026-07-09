@@ -55,7 +55,7 @@ from ai_learning_engine import (
 )
 from elite_quant_engine import build_elite_quant_slate
 from edge_database import MODEL_VERSION as QUANT_MODEL_VERSION, current_quant_weights
-from mission_control import ai_learning_auto_apply_line
+from mission_control import ai_learning_auto_apply_line, sharp_api_status_line
 from anime_magazine_generator import (
     generate_daily_magazine_prompts,
     save_magazine_prompts,
@@ -2257,6 +2257,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🟢 OPTIONAL\n\n"
         f"Highlightly: {optional_configured('HIGHLIGHTLY_API_KEY')}\n"
         f"SerpApi: {serpapi_status}\n"
+        f"Sharp API: {core_configured('SHARP_API_KEY')}\n"
         f"Odds API: {optional_configured('ODDS_API_KEY')}\n"
         f"API-Sports Baseball: {api_sports_baseball_status}\n"
         f"Player Props Engine: {props_engine_status}\n\n"
@@ -2510,6 +2511,7 @@ async def _mission_control_health_text() -> str:
     ready_games = sum(1 for item in quant_payload if item.get("game_status") == "ready")
     quant_weights = await asyncio.to_thread(current_quant_weights)
     verification_score = average_verification_score(slate)
+    sharp_line = await asyncio.to_thread(sharp_api_status_line)
     weights_text = (
         f"SP {quant_weights['sp_score']:.0%} / "
         f"Offense {quant_weights['offense_score']:.0%} / "
@@ -2529,6 +2531,7 @@ async def _mission_control_health_text() -> str:
         "API Status: Use /status for full provider detail\n"
         f"Today's Games: {len(slate)}\n"
         f"Verification Score: {verification_score}/100\n"
+        f"Satchel Sharp: {sharp_line}\n"
         f"v20 Engine: {'✅ Available' if v20_games else '➖ No slate scored yet'}\n"
         f"v20 Model: {QUANT_MODEL_VERSION}\n"
         f"v20 Qualified Edges: {v20_qualified}/{len(v20_games)}\n"
@@ -3550,19 +3553,30 @@ async def warroom_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> str:
-    """Render owner-only Odds API diagnostics without exposing the API key."""
+    """Render owner-only odds diagnostics without exposing API keys."""
+    sharp = payload.get("sharp_api_health") or {}
+    cache_age = sharp.get("cache_age_seconds")
+    cache_str = f"{cache_age:.0f}s" if cache_age is not None else "N/A"
     lines = [
         "🧪 BETGPTAI ODDS DEBUG",
         f"📅 Date: {display_date(selected_date)}",
         "",
-        f"ODDS_API_KEY loaded: {'yes' if payload.get('odds_api_key_loaded') else 'no'}",
-        f"Odds API status code: {payload.get('odds_api_status_code') or 'Unavailable'}",
-        f"Sports key used: {payload.get('sport_key')}",
-        f"Markets requested: {payload.get('markets_requested')}",
+        "── Sharp API ──",
+        f"Enabled: {'yes' if payload.get('sharp_api_enabled') else 'no'}",
+        f"Key loaded: {'yes' if payload.get('sharp_api_key_loaded') else 'no'}",
+        f"Cache age: {cache_str}",
+        f"Cache fresh: {'yes' if sharp.get('cache_fresh') else 'no'}",
+        "",
+        "── The Odds API ──",
+        f"Key loaded: {'yes' if payload.get('odds_api_key_loaded') else 'no'}",
+        f"Status code: {payload.get('odds_api_status_code') or 'Unavailable'}",
+        "",
+        f"Active provider: {payload.get('provider') or 'None'}",
+        f"Markets: {payload.get('markets_requested')}",
         f"Games returned: {payload.get('games_returned')}",
         f"Matched MLB games: {payload.get('matched_to_mlb_game_pk')}",
-        f"Unmatched MLB games: {len(payload.get('unmatched_mlb_games') or [])}",
-        f"Unmatched odds games: {len(payload.get('unmatched_odds_games') or [])}",
+        f"Unmatched MLB: {len(payload.get('unmatched_mlb_games') or [])}",
+        f"Unmatched odds: {len(payload.get('unmatched_odds_games') or [])}",
         f"Last error: {payload.get('last_error') or 'None'}",
         "",
     ]
@@ -3586,7 +3600,7 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
 
 
 async def odds_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Owner-only: inspect The Odds API MLB fetch and game matching."""
+    """Owner-only: inspect all odds provider MLB fetch and game matching."""
     del context
     user_id = update.effective_user.id if update.effective_user else None
     if user_id != OWNER_TELEGRAM_ID:
@@ -3595,7 +3609,7 @@ async def odds_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     selected_date = official_sports_date().isoformat()
     try:
-        await update.message.reply_text("⏳ Checking MLB odds matching...")
+        await update.message.reply_text("⏳ Checking MLB odds matching (Sharp + Odds API)...")
         payload = await asyncio.to_thread(
             odds_debug_payload,
             os.getenv("ODDS_API_KEY", ""),

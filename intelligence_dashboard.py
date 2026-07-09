@@ -72,6 +72,7 @@ def _source_statuses(card_date: str, slate: list[dict[str, Any]]) -> dict[str, s
         "MLB Stats API": "✅ Available" if slate else "❌ Unavailable",
         "Baseball Savant": "✅ Used" if sources.get("baseball_savant") or any(isinstance(g.get("savant"), dict) for g in slate) else "➖ Optional unavailable",
         "Weather": "✅ Available" if any(g.get("weather") not in (None, "", UNAVAILABLE, {}) for g in slate) else "➖ Optional unavailable",
+        "Sharp API": "✅ Primary" if os.getenv("SHARP_API_KEY", "").strip() else "➖ Not configured",
         "Odds API": "✅ Available" if any(g.get("odds_status") == "available" for g in slate) else "➖ Optional unavailable",
         "OpenAI": "✅ Configured" if os.getenv("OPENAI_API_KEY", "").strip() else "❌ Missing",
         "Claude": "✅ Configured" if os.getenv("ANTHROPIC_API_KEY", "").strip() else "❌ Missing",

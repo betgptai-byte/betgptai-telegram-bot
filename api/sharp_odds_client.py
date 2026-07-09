@@ -97,6 +97,7 @@ __all__ = [
     "MLB_MAPPINGS",
     "SHARP_SPORT_MAP",
     "SHARP_ENDPOINT_BEST_ODDS",
+    "SHARP_ENDPOINT_EVENTS",
     "SHARP_ENDPOINT_ODDS",
     "SOCCER_LEAGUES",
     "build_game_market_context",
@@ -189,6 +190,14 @@ def secondary_sportsbook() -> str:
     return os.getenv("SHARP_SECONDARY_SPORTSBOOK", "fanduel").strip().lower()
 
 
+# ── Endpoint constants ──────────────────────────────────────────────────────
+# Defined before any function that uses them as defaults to avoid NameError
+# at import time (Python evaluates default argument values at definition time).
+SHARP_ENDPOINT_ODDS = "/odds"
+SHARP_ENDPOINT_BEST_ODDS = "/odds/best"
+SHARP_ENDPOINT_EVENTS = "/events"
+
+
 # ── Supported sportsbooks ───────────────────────────────────────────────────
 ALL_SPORTSBOOKS: list[str] = [
     "draftkings", "fanduel", "hardrockbet", "betmgm", "caesars", "pinnacle",
@@ -213,13 +222,14 @@ def build_sharp_odds_url(
     *,
     markets: str | None = None,
     sportsbook: str | None = None,
-    endpoint: str = SHARP_ENDPOINT_ODDS,
+    endpoint: str | None = None,
 ) -> str:
     """Build the Sharp API request URL for debug display (no key exposed).
 
     Auth is sent via X-API-Key header, not in the URL.
     ``endpoint`` controls the URL path (``/odds``, ``/odds/best``, ``/events``).
     """
+    ep = endpoint or SHARP_ENDPOINT_ODDS
     base = _base_url()
     params: dict[str, str] = {
         "sport": sport_param,
@@ -229,7 +239,7 @@ def build_sharp_odds_url(
     }
     if league:
         params["league"] = league
-    if endpoint == SHARP_ENDPOINT_ODDS:
+    if ep == SHARP_ENDPOINT_ODDS:
         params["markets"] = markets or "h2h,spreads,totals,team_totals"
         if sportsbook:
             params["sportsbook"] = sportsbook
@@ -237,7 +247,7 @@ def build_sharp_odds_url(
         params["commenceTimeFrom"] = f"{event_date}T00:00:00Z"
         params["commenceTimeTo"] = f"{event_date}T23:59:59Z"
     import urllib.parse
-    return f"{base}{endpoint}?{urllib.parse.urlencode(params)}"
+    return f"{base}{ep}?{urllib.parse.urlencode(params)}"
 
 
 def _do_sharp_request(
@@ -255,11 +265,6 @@ def _do_sharp_request(
 
 def _use_best_odds() -> bool:
     return os.getenv("SHARP_USE_BEST_ODDS", "true").strip().lower() in {"1", "true", "yes", "on"}
-
-
-SHARP_ENDPOINT_BEST_ODDS = "/odds/best"
-SHARP_ENDPOINT_ODDS = "/odds"
-SHARP_ENDPOINT_EVENTS = "/events"
 
 
 def _sharpen_request(
@@ -438,11 +443,12 @@ def _sharpen_request_for_probe(
     markets: str,
     cache_key: str,
     *,
-    endpoint: str = SHARP_ENDPOINT_ODDS,
+    endpoint: str | None = None,
     sportsbook: str | None = None,
 ) -> list[dict[str, Any]]:
     """Like _sharpen_request but caller picks the endpoint path."""
-    url = f"{base_url}{endpoint}"
+    ep = endpoint or SHARP_ENDPOINT_ODDS
+    url = f"{base_url}{ep}"
     params: dict[str, str] = {
         "sport": sport_param,
         "regions": "us",
@@ -451,7 +457,7 @@ def _sharpen_request_for_probe(
     }
     if league:
         params["league"] = league
-    if endpoint == SHARP_ENDPOINT_ODDS:
+    if ep == SHARP_ENDPOINT_ODDS:
         params["markets"] = markets
         if sportsbook:
             params["sportsbook"] = sportsbook

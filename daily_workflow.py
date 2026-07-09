@@ -212,14 +212,24 @@ async def _save_official_picks_with_retry(
     for attempt in (1, 2):
         try:
             card = build_card_from_analysis(analysis, slate, card_date, source_command)
+            builder_count = len(card.official_picks)
+            logging.info("TRACE build_card_from_analysis official_picks=%s card_date=%s", builder_count, card_date)
             card_dict = structured_card_to_dict(card)
+            dict_count = len(card_dict.get("official_picks", []))
+            logging.info("TRACE structured_card_to_dict official_picks=%s card_date=%s", dict_count, card_date)
             card_dict["analysis"] = analysis
             card_dict["slate"] = slate
             card_dict["source_command"] = source_command
+            persist_count = len(card_dict.get("official_picks", []))
+            logging.info("TRACE before persist_official_card official_picks=%s card_date=%s", persist_count, card_date)
             result = await asyncio.to_thread(persist_official_card, card_dict)
             if not result.get("success"):
                 raise RuntimeError(str(result.get("error") or "Pick persistence failed"))
             saved = int(result.get("saved_pick_count") or 0)
+            logging.info(
+                "TRACE after persist_official_card success=%s saved=%s error=%s card_date=%s",
+                result.get("success"), saved, result.get("error", ""), card_date,
+            )
             logging.info(
                 "Official picks saved card_date=%s saved=%s attempt=%s structured_card_built=true picks_count=%s",
                 card_date, saved, attempt, len(card.official_picks),

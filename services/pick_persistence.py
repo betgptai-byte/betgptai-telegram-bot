@@ -456,8 +456,7 @@ def _build_picks_from_sections(
 
         if category == "parlay":
             # Parlay legs: find ✅ lines
-            import re as _re2
-            leg_lines = _re2.findall(r"(?m)^✅\s+(.+)$", content)[:2]
+            leg_lines = re.findall(r"(?m)^✅\s+(.+)$", content)[:2]
             log["section_item_counts"][heading] = len(leg_lines)
             if len(leg_lines) == 2:
                 for leg in leg_lines:
@@ -522,8 +521,6 @@ def _build_single_stats_pick(
     line_value: float | None = None,
 ) -> dict[str, Any] | None:
     """Build a single pick dict from a selection line (stats-only, no odds required)."""
-    import hashlib
-
     selected_team: str | None = None
     opponent: str | None = None
     away = str(game.get("away_team", ""))

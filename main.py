@@ -983,6 +983,8 @@ async def mlb_auto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             card = build_card_from_analysis(
                 analysis, slate, selected_date, source_command,
             )
+            builder_count = len(card.official_picks)
+            print(f"TRACE build_card_from_analysis official_picks={builder_count} date={selected_date}", flush=True)
             _save_latest_card_snapshot(
                 card_date=selected_date,
                 source_command=source_command,
@@ -990,10 +992,21 @@ async def mlb_auto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 slate=slate,
             )
             card_dict = structured_card_to_dict(card)
+            dict_count = len(card_dict.get("official_picks", []))
+            print(f"TRACE structured_card_to_dict official_picks={dict_count} date={selected_date}", flush=True)
             card_dict["analysis"] = analysis
             card_dict["slate"] = slate
             card_dict["source_command"] = source_command
+            persist_count = len(card_dict.get("official_picks", []))
+            print(f"TRACE before persist_official_card official_picks={persist_count} date={selected_date}", flush=True)
             save_result = await asyncio.to_thread(persist_official_card, card_dict)
+            print(
+                f"TRACE after persist_official_card success={save_result.get('success')} "
+                f"saved={save_result.get('saved_pick_count')} "
+                f"error={save_result.get('error', '')} "
+                f"date={selected_date}",
+                flush=True,
+            )
             if not save_result.get("success"):
                 raise ResultsTrackerError(
                     str(save_result.get("error") or "Pick persistence failed.")
@@ -4405,10 +4418,13 @@ async def _build_card_debug_text() -> str:
     card_obj = await asyncio.to_thread(
         build_card_from_analysis, analysis, slate, selected_date, "card_debug",
     )
+    builder_count = len(card_obj.official_picks)
     card_dict = structured_card_to_dict(card_obj)
+    dict_count = len(card_dict.get("official_picks", []))
     card_dict["analysis"] = analysis
     card_dict["slate"] = slate
     card_dict["source_command"] = "card_debug"
+    persist_count = len(card_dict.get("official_picks", []))
     save_result = await asyncio.to_thread(persist_official_card, card_dict)
     if not save_result.get("success"):
         skip_reason = str(save_result.get("error") or "Pick persistence failed")
@@ -4431,6 +4447,13 @@ async def _build_card_debug_text() -> str:
         f"Trackable picks saved this run: {save_result.get('saved_pick_count', 0)}",
         f"Save success: {'yes' if save_result.get('success') else 'no'}",
         f"Save result: {save_result.get('error') or 'OK'}",
+        "",
+        "── TRACE: official_picks count ──",
+        f"After build_card_from_analysis:  {builder_count}",
+        f"After structured_card_to_dict:  {dict_count}",
+        f"Before persist_official_card:   {persist_count}",
+        f"After persist (saved):          {save_result.get('saved_pick_count', 0)}",
+        f"After persist (success):        {save_result.get('success')}",
     ]
     if stats_only and save_result.get("stats_section_debug"):
         sdb = save_result["stats_section_debug"]

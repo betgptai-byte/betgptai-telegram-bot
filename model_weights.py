@@ -34,15 +34,19 @@ WEIGHT_CEILING = 1.0
 
 
 DEFAULT_WEIGHTS = {
-    # Quant Engine v20 component weights.
-    "sp_score": 0.30,
-    "offense_score": 0.20,
+    # Quant Engine v21 component weights.
+    "sp_score": 0.25,
     "bullpen_score": 0.15,
-    "defense_score": 0.10,
+    "sp_batter_matchup_score": 0.10,
     "weather_park_score": 0.10,
     "market_value_score": 0.10,
-    "situational_score": 0.05,
-    # Phase 6 factor weights used by learning reviews and diagnostics.
+    "offense_score": 0.10,
+    "situational_score": 0.10,
+    "defense_score": 0.05,
+    "home_away_score": 0.025,
+    "travel_rest_score": 0.025,
+    "recent_form_score": 0.025,
+    "team_splits_score": 0.025,
     "starting_pitcher_edge": 0.50,
     "bullpen_edge": 0.50,
     "lineup_confirmation": 0.50,
@@ -63,12 +67,17 @@ DEFAULT_WEIGHTS = {
 
 QUANT_WEIGHT_KEYS = (
     "sp_score",
-    "offense_score",
     "bullpen_score",
-    "defense_score",
+    "sp_batter_matchup_score",
     "weather_park_score",
     "market_value_score",
+    "offense_score",
     "situational_score",
+    "defense_score",
+    "home_away_score",
+    "travel_rest_score",
+    "recent_form_score",
+    "team_splits_score",
 )
 
 LEARNING_TO_QUANT_ALIASES = {

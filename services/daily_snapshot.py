@@ -135,6 +135,12 @@ def _edge_scores_from_picks(picks: list[dict[str, Any]]) -> list[dict[str, Any]]
             "confidence": pick.get("confidence") or pick.get("confidence_grade"),
             "risk": pick.get("risk") or pick.get("risk_level"),
             "units": pick.get("units") or pick.get("units_risked", 1),
+            "opening_line": pick.get("opening_line"),
+            "posted_line": pick.get("market_line") or pick.get("line"),
+            "closing_line": pick.get("closing_line"),
+            "clv": pick.get("clv"),
+            "odds_provider": pick.get("odds_provider"),
+            "odds_timestamp": pick.get("odds_timestamp"),
         })
     return edges
 
@@ -204,6 +210,12 @@ def _build_snapshot(
         "lineup_snapshot": _lineup_snapshot(slate),
         "starting_pitchers_snapshot": _starting_pitchers_snapshot(slate),
         "market_context_snapshot": _market_context_snapshot(slate),
+        "line_snapshot": {
+            "opening_lines": {},  # filled by odds_provider_router when available
+            "posted_lines": {p.get("pick_id"): p.get("market_line") or p.get("line") for p in regular},
+            "closing_lines": {},  # filled post-game by results_vault
+            "clv_records": {},    # filled post-game by results_vault
+        },
         "weights_snapshot": weights,
     }
     return snapshot
@@ -343,6 +355,41 @@ def render_snapshot_status(payload: dict[str, Any]) -> str:
         f"- Core Five: {markets.get('core_five', 0)}\n"
         f"- Props: {markets.get('props', 0)}"
     )
+
+
+def render_clv_debug(payload: dict[str, Any]) -> str:
+    """Render CLV debug for a loaded snapshot."""
+    lines = [
+        "📊 BETGPTAI CLV DEBUG",
+        f"📅 Date: {payload.get('card_date', '?')}",
+    ]
+    scores = _list(payload.get("edge_scores", payload.get("official_picks", [])))
+    clv_picks = [p for p in scores if p.get("clv") is not None]
+    no_clv = [p for p in scores if p.get("clv") is None]
+    if not clv_picks:
+        lines.append("No CLV data found.")
+        if no_clv:
+            lines.append(f"({len(no_clv)} picks without CLV)")
+        return "\n".join(lines).strip()
+    positive = sum(1 for p in clv_picks if float(p.get("clv", 0)) > 0)
+    negative = sum(1 for p in clv_picks if float(p.get("clv", 0)) <= 0)
+    lines.extend([
+        f"Picks with CLV: {len(clv_picks)}",
+        f"Positive CLV: {positive} / Negative CLV: {negative}",
+    ])
+    for p in clv_picks[:20]:
+        clv = float(p.get("clv", 0))
+        lines.append(
+            f"  {p.get('pick_text') or p.get('selected_team', '?')} — "
+            f"CLV {clv:+.3f} — open {p.get('opening_line', '?')} "
+            f"→ posted {p.get('posted_line', '?')} → close {p.get('closing_line', '?')} — "
+            f"result {p.get('result', 'pending')}"
+        )
+    if no_clv:
+        lines.append(f"No CLV ({len(no_clv)}):")
+        for p in no_clv[:5]:
+            lines.append(f"  {p.get('pick_text') or p.get('selected_team', '?')}")
+    return "\n".join(lines).strip()
 
 
 def render_snapshot_debug(payload: dict[str, Any]) -> str:

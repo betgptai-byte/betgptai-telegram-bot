@@ -42,6 +42,7 @@ from ai_analysis import (
 from ai_learning_engine import (
     approve_weight_update as approve_learning_weight_update,
     learning_status_payload,
+    load_learning_report,
     reject_weight_update as reject_learning_weight_update,
     render_learning_auto_status,
     render_learning_report,
@@ -1883,13 +1884,23 @@ async def workflow_debug_handler(update: Update, context: ContextTypes.DEFAULT_T
         if not verification and not generation and not posting:
             await update.message.reply_text("No workflow state found for today.")
             return
+        odds_provider = verification.get("odds_provider_used", "none")
+        odds_events = verification.get("odds_events_returned", 0)
+        matched = verification.get("matched_games", 0)
+        schedule_games = verification.get("schedule_games", 0)
         lines = [
             "🔧 WORKFLOW DEBUG",
             f"Date: {display_date(selected)}",
             "",
+            "── Market Context ──",
+            f"Odds provider used: {odds_provider}",
+            f"Odds events returned: {odds_events}",
+            f"Matched games: {matched} / {schedule_games}",
+            f"Official picks skipped reason: {generation.get('last_save_exception') or verification.get('official_picks_skipped_reason', 'N/A')}",
+            "",
             "── T-50 Verification ──",
             f"Ready: {'YES' if verification.get('ready_for_image_generation') else 'NO' if verification.get('ready_for_image_generation') is False else 'Not run'}",
-            f"Games: {verification.get('schedule_games', 0)}",
+            f"Games: {schedule_games}",
             f"Odds: {verification.get('odds', 'unavailable')}",
             f"Errors: {verification.get('critical_failures', []) or 'None'}",
             "",
@@ -3803,6 +3814,9 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
     sport_label = sport.upper() if sport != "mlb" else "MLB"
     if league:
         sport_label = f"{sport_label} ({league})"
+    default_sb = payload.get("default_sportsbook", "draftkings")
+    secondary_sb = payload.get("secondary_sportsbook", "fanduel")
+    active_sb = payload.get("active_sportsbook")
     lines = [
         "🧪 BETGPTAI ODDS DEBUG",
         f"📅 Requested Date: {event_date}",
@@ -3813,24 +3827,45 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
         f"Key loaded: {'yes' if payload.get('sharp_api_key_loaded') else 'no'}",
         f"Cache age: {cache_str}",
         f"Cache fresh: {'yes' if sharp.get('cache_fresh') else 'no'}",
+        f"Sportsbook used: {active_sb or 'none'}",
+        f"DraftKings games: {payload.get('draftkings_games', 0)}",
+        f"FanDuel games: {payload.get('fanduel_games', 0)}",
+        f"Request URL: {payload.get('sharp_request_url') or 'N/A'}",
         "",
         "── The Odds API ──",
         f"Key loaded: {'yes' if payload.get('odds_api_key_loaded') else 'no'}",
         f"Status code: {payload.get('odds_api_status_code') or 'Unavailable'}",
+        f"Request URL: {payload.get('odds_api_request_url') or 'N/A'}",
         "",
         f"Active provider: {payload.get('provider') or 'None'}",
         f"Markets: {payload.get('markets_requested')}",
         f"Games returned: {payload.get('games_returned')}",
     ]
     games_returned = payload.get("games_returned", 0)
-    if games_returned == 0 and payload.get("odds_api_status_code") == 200:
-        lines.append("No odds returned. This may mean no scheduled matches for this league/date.")
+    schedule_count = payload.get("mlb_schedule_games", 0)
+    if games_returned == 0 and schedule_count > 0:
+        lines.append(f"MLB schedule has {schedule_count} games, but odds provider returned 0 events.")
+    elif games_returned == 0:
+        lines.append("Provider returned 0 events for this date/sport mapping.")
     if sport == "mlb":
         lines.extend([
             f"Matched MLB games: {payload.get('matched_to_mlb_game_pk')}",
             f"Unmatched MLB: {len(payload.get('unmatched_mlb_games') or [])}",
             f"Unmatched odds: {len(payload.get('unmatched_odds_games') or [])}",
         ])
+    # Sharp MLB mapping probes
+    probes = payload.get("sharp_mlb_probes")
+    if isinstance(probes, list) and len(probes) > 0:
+        lines.append("")
+        lines.append("── Sharp MLB Mapping Probes ──")
+        for p in probes:
+            status = p.get("status_code") or "—"
+            count = p.get("games_count", 0)
+            err = p.get("error") or ""
+            sp = p.get("sport_param")
+            lg = p.get("league") or "none"
+            sb = p.get("sportsbook") or "none"
+            lines.append(f"  sport={sp} league={lg} book={sb} → HTTP {status} games={count}{f' error={err}' if err else ''}")
     lines.append(f"Last error: {payload.get('last_error') or 'None'}")
     errors = payload.get("errors") if isinstance(payload.get("errors"), list) else []
     if errors:
@@ -3904,6 +3939,87 @@ async def odds_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except Exception as error:
         logging.exception("/odds_debug failed")
         await update.message.reply_text(f"/odds_debug failed:\n{error!r}")
+
+
+async def odds_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: test all provider mappings and show results."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id != OWNER_TELEGRAM_ID:
+        return
+    if not update.message:
+        return
+    args = context.args or []
+    sport = "mlb"
+    event_date: str | None = None
+    if args and args[0].strip().lower() in ("mlb", "soccer", "nba", "nfl", "nhl"):
+        sport = args[0].strip().lower()
+    date_args = [a for a in args if re.fullmatch(r"\d{4}-\d{2}-\d{2}", a)]
+    if date_args:
+        event_date = date_args[-1]
+    target = event_date or official_sports_date().isoformat()
+    try:
+        await update.message.reply_text(f"⏳ Probing {sport.upper()} odds provider mappings...")
+        payload = await asyncio.to_thread(
+            odds_debug_payload,
+            os.getenv("ODDS_API_KEY", ""),
+            target,
+            sport,
+            None,
+            event_date,
+        )
+        lines = [
+            "🔍 BETGPTAI ODDS PROBE",
+            f"📅 Date: {target}",
+            f"🏅 Sport: {sport.upper()}",
+            "",
+            "── Sharp API Probes ──",
+        ]
+        sharp_url = payload.get("sharp_request_url") or "N/A"
+        lines.append(f"Primary URL: {sharp_url}")
+        lines.append(f"Default sportsbook: {payload.get('default_sportsbook', 'draftkings')}")
+        lines.append(f"Secondary sportsbook: {payload.get('secondary_sportsbook', 'fanduel')}")
+        lines.append(f"Active sportsbook: {payload.get('active_sportsbook') or 'none'}")
+        probes = payload.get("sharp_mlb_probes")
+        if isinstance(probes, list):
+            for p in probes:
+                sp = p.get("sport_param")
+                lg = p.get("league") or "none"
+                sb = p.get("sportsbook") or "none"
+                status = p.get("status_code") or "—"
+                count = p.get("games_count", 0)
+                err = p.get("error") or ""
+                lines.append(f"  sport={sp} league={lg} sportsbook={sb}")
+                lines.append(f"    URL: {p.get('url', '?')}")
+                lines.append(f"    HTTP {status} — {count} games{f' — {err}' if err else ''}")
+                if count > 0:
+                    lines.append(f"    First game: {p.get('first_matchup', 'N/A')}")
+        else:
+            lines.append("  (No probe data for this sport)")
+        lines.append("")
+        lines.append("── The Odds API ──")
+        odds_url = payload.get("odds_api_request_url") or "N/A"
+        lines.append(f"URL: {odds_url}")
+        odds_status = payload.get("odds_api_status_code") or "Unavailable"
+        lines.append(f"Status: {odds_status}")
+        games_ret = payload.get("games_returned", 0)
+        lines.append(f"Games returned: {games_ret}")
+        sched_cnt = payload.get("mlb_schedule_games", 0)
+        if sport == "mlb" and sched_cnt > 0:
+            lines.append(f"MLB schedule games: {sched_cnt}")
+        if games_ret == 0 and sched_cnt > 0:
+            lines.append("MLB schedule has games, but odds provider returned 0 events.")
+        elif games_ret == 0:
+            lines.append("Provider returned 0 events for this date/sport mapping.")
+        active = payload.get("provider") or "none"
+        lines.append(f"Active provider: {active}")
+        errors = payload.get("errors") if isinstance(payload.get("errors"), list) else []
+        if errors:
+            lines.append("")
+            lines.extend(f"- {e}" for e in errors[:8])
+        await _send_long_message(update, "\n".join(lines).strip())
+    except Exception as error:
+        logging.exception("/odds_probe failed")
+        await update.message.reply_text(f"/odds_probe failed:\n{error!r}")
 
 
 async def sp_batter_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4105,6 +4221,89 @@ async def official_card_debug(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"/official_card_debug failed:\n{error!r}")
 
 
+async def clv_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: show CLV data for a snapshot date."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id != OWNER_TELEGRAM_ID:
+        return
+    if not update.message:
+        return
+    args = context.args or []
+    target = args[0] if args else eastern_today().isoformat()
+    try:
+        from services.daily_snapshot import load_snapshot, render_clv_debug
+        snapshot = await asyncio.to_thread(load_snapshot, target)
+        if not snapshot:
+            await update.message.reply_text(f"No snapshot for {target}.")
+            return
+        text = render_clv_debug(snapshot)
+        await _send_long_message(update, text)
+    except Exception as error:
+        logging.exception("/clv_debug failed")
+        await update.message.reply_text(f"/clv_debug failed: {error!r}")
+
+
+async def bullpen_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: show bullpen engine v2 debug for today's slate."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id != OWNER_TELEGRAM_ID:
+        return
+    if not update.message:
+        return
+    try:
+        await update.message.reply_text("⏳ Running Bullpen Engine v2...")
+        from services.bullpen_engine import render_bullpen_debug
+        from mlb_data import get_combined_slate
+        slate = await asyncio.to_thread(
+            get_combined_slate,
+            os.getenv("ODDS_API_KEY", ""),
+            game_date=official_sports_date().isoformat(),
+            highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+        )
+        text = await asyncio.to_thread(render_bullpen_debug, slate)
+        await _send_long_message(update, text)
+    except Exception as error:
+        logging.exception("/bullpen_debug failed")
+        await update.message.reply_text(f"/bullpen_debug failed: {error!r}")
+
+
+async def learning_roi_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: show AI learning ROI breakdown."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id != OWNER_TELEGRAM_ID:
+        return
+    if not update.message:
+        return
+    args = context.args or []
+    target = args[0] if args else eastern_today().isoformat()
+    try:
+        report = await asyncio.to_thread(load_learning_report, target)
+        if not report.get("roi_by_market"):
+            await update.message.reply_text(f"No ROI data in learning report for {target}.\nRun /grade_today or /grade_yesterday first.")
+            return
+        text = render_learning_report(report)
+        await _send_long_message(update, text)
+    except Exception as error:
+        logging.exception("/learning_roi_debug failed")
+        await update.message.reply_text(f"/learning_roi_debug failed: {error!r}")
+
+
+async def confidence_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: show confidence calibration data."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id != OWNER_TELEGRAM_ID:
+        return
+    if not update.message:
+        return
+    try:
+        from services.confidence_calibration import render_confidence_debug
+        text = await asyncio.to_thread(render_confidence_debug)
+        await _send_long_message(update, text)
+    except Exception as error:
+        logging.exception("/confidence_debug failed")
+        await update.message.reply_text(f"/confidence_debug failed: {error!r}")
+
+
 async def _build_card_debug_text() -> str:
     """Build owner-only card diagnostics shared by slash command and callback."""
     selected_date = official_sports_date().isoformat()
@@ -4115,6 +4314,9 @@ async def _build_card_debug_text() -> str:
     trackable_picks_count = 0
     market_context_found = False
     skipped_reasons: list[str] = []
+    odds_events_returned = 0
+    odds_provider_used = "none"
+    matched_odds_games = 0
     slate = await asyncio.to_thread(
         get_combined_slate,
         os.getenv("ODDS_API_KEY", ""),
@@ -4122,6 +4324,11 @@ async def _build_card_debug_text() -> str:
         highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
     )
     slate = upcoming_mlb_slate(slate)
+    if slate:
+        odds_events_returned = sum(1 for g in slate if g.get("odds_status") == "available")
+        matched_odds_games = odds_events_returned
+        first_ctx = slate[0].get("market_context", {})
+        odds_provider_used = first_ctx.get("provider", "none") if first_ctx else "none"
     market_context_found = any(bool(game.get("best_available_prices")) for game in slate)
     if not slate:
         raise RuntimeError("No upcoming MLB games available for card debug.")
@@ -4183,15 +4390,20 @@ async def _build_card_debug_text() -> str:
         "Generated card sections:",
         *(f"- {section}" for section in sections),
         "",
+        f"Market context available: {'yes' if market_context_found else 'no'}",
+        f"Odds provider used: {odds_provider_used}",
+        f"Odds events returned: {odds_events_returned}",
+        f"Matched games: {matched_odds_games} / {len(slate)}",
         f"Official picks count: {official_picks_count}",
         f"Trackable picks count: {trackable_picks_count}",
-        f"Market context found: {'yes' if market_context_found else 'no'}",
         f"Trackable picks saved this run: {save_result.get('saved_pick_count', 0)}",
         f"Save success: {'yes' if save_result.get('success') else 'no'}",
         f"Save result: {save_result.get('error') or 'OK'}",
         "Skipped picks and reasons:",
         *(f"- {reason}" for reason in (skipped_reasons or [skip_reason or "No skip reason reported."])),
     ]
+    if skip_reason and not skipped_reasons:
+        lines.append(f"Official picks skipped reason: {skip_reason}")
     return "\n".join(lines).strip()
 
 
@@ -5671,6 +5883,9 @@ async def main() -> None:
     application.add_handler(CommandHandler("odds_debug", odds_debug))
     SYSTEM_LOG.info("Registered command: /odds_debug")
     print("Registered command: /odds_debug", flush=True)
+    application.add_handler(CommandHandler("odds_probe", odds_probe))
+    SYSTEM_LOG.info("Registered command: /odds_probe")
+    print("Registered command: /odds_probe", flush=True)
     application.add_handler(CommandHandler("sp_batter_debug", sp_batter_debug))
     SYSTEM_LOG.info("Registered command: /sp_batter_debug")
     print("Registered command: /sp_batter_debug", flush=True)
@@ -5769,6 +5984,18 @@ async def main() -> None:
     application.add_handler(CommandHandler("toggle_learning_auto_apply", toggle_learning_auto_apply_command))
     application.add_handler(CommandHandler("weights_admin", weights_admin))
     application.add_handler(CommandHandler("weight_history_admin", weight_history_admin))
+    application.add_handler(CommandHandler("clv_debug", clv_debug))
+    SYSTEM_LOG.info("Registered command: /clv_debug")
+    print("Registered command: /clv_debug", flush=True)
+    application.add_handler(CommandHandler("bullpen_debug", bullpen_debug))
+    SYSTEM_LOG.info("Registered command: /bullpen_debug")
+    print("Registered command: /bullpen_debug", flush=True)
+    application.add_handler(CommandHandler("learning_roi_debug", learning_roi_debug))
+    SYSTEM_LOG.info("Registered command: /learning_roi_debug")
+    print("Registered command: /learning_roi_debug", flush=True)
+    application.add_handler(CommandHandler("confidence_debug", confidence_debug))
+    SYSTEM_LOG.info("Registered command: /confidence_debug")
+    print("Registered command: /confidence_debug", flush=True)
     application.add_handler(CommandHandler("hr_admin", hr_admin))
     application.add_handler(CommandHandler("strikeouts_admin", strikeouts_admin))
     application.add_handler(CommandHandler("props_images_admin", props_images_admin))

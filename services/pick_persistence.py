@@ -227,12 +227,33 @@ def _build_official_picks(card: Any) -> tuple[str, list[dict[str, Any]]]:
     if _public_market_guard_enabled(source):
         picks = _filter_public_market_context(picks, slate)
     if not picks:
+        # Build odds-unavailable context from slate
+        odds_provider = "unknown"
+        odds_events = 0
+        matched_games = 0
+        if slate:
+            odds_events = sum(1 for g in slate if g.get("odds_status") == "available")
+            matched_games = odds_events
+            odds_provider = str(slate[0].get("market_context", {}).get("provider", "unknown")) if slate else "unknown"
+        odds_context = f"odds_provider={odds_provider} odds_events_returned={matched_games} matched_games={matched_games} schedule_games={len(slate)}"
         if had_pre_guard_picks:
             raise ValueError(
-                "No public picks saved because no generated picks had matched market context. "
-                "Check /odds_debug or set ADMIN_MARKET_OVERRIDE=true for owner override."
+                f"Odds unavailable: providers returned {len(slate) - matched_games} MLB events with no market context for schedule with {len(slate)} games. "
+                f"({odds_context}) "
+                "Set ADMIN_MARKET_OVERRIDE=true to force save."
             )
-        raise ValueError("No trackable official picks were extracted from the generated card")
+        # Only raise generic no-picks error if StructuredCard actually had picks
+        card_picks = card.get("official_picks") if isinstance(card, dict) and isinstance(card.get("official_picks"), list) else []
+        if card_picks:
+            raise ValueError(
+                f"No trackable official picks could be extracted from the generated card with {len(card_picks)} StructuredCard picks. "
+                f"({odds_context})"
+            )
+        raise ValueError(
+            f"No official picks: StructuredCard official_picks is empty. "
+            f"AI analysis may have failed or odds were unavailable. "
+            f"({odds_context})"
+        )
     normalized = [_normalize_for_contract(pick) for pick in picks]
     return card_date, normalized
 

@@ -18,6 +18,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from loss_reason_classifier import classify_loss, suggested_weight_changes_from_tags
+from services.confidence_calibration import record_result
 from mlb_data import get_mlb_schedule
 from model_report import load_model_report
 from model_weights import (
@@ -197,6 +198,8 @@ def run_learning_review(card_date: str) -> dict[str, Any]:
         if result in edge_bucket_performance[bucket_key]:
             edge_bucket_performance[bucket_key][result] += 1
 
+        record_result(float(edge), result)
+
         classification = classify_loss(
             pick,
             game_context=game_context,
@@ -265,6 +268,79 @@ def run_learning_review(card_date: str) -> dict[str, Any]:
     negative_clv = sum(1 for c in clv_records if float(c.get("clv") or 0) <= 0 and c["result"] == "win")
     total_clv_graded = len(clv_records)
 
+    # ── ROI-by-factor analysis ──────────────────────────────────────────
+    roi_by_market: dict[str, dict[str, float]] = {}
+    roi_by_edge_bucket: dict[str, dict[str, float]] = {}
+    roi_by_confidence: dict[str, dict[str, float]] = {}
+    roi_by_clv: dict[str, dict[str, float]] = {}
+    roi_by_weather: dict[str, dict[str, float]] = {}
+
+    for pick in graded:
+        market = str(pick.get("market_type") or pick.get("market") or "unknown").lower()
+        result = pick.get("result", "pending")
+        units = _units_won(result, pick.get("odds"), pick.get("units") or pick.get("units_risked", 1))
+
+        if market not in roi_by_market:
+            roi_by_market[market] = {"wins": 0, "losses": 0, "pushes": 0, "units": 0.0}
+        if result == "win":
+            roi_by_market[market]["wins"] += 1
+        elif result == "loss":
+            roi_by_market[market]["losses"] += 1
+        elif result == "push":
+            roi_by_market[market]["pushes"] += 1
+        roi_by_market[market]["units"] += units
+
+        edge = _num(pick.get("edge_score") or pick.get("final_edge_score") or 50)
+        bucket = round(edge / 10) * 10
+        bucket_key = f"{int(bucket)}-{int(bucket + 10)}"
+        if bucket_key not in roi_by_edge_bucket:
+            roi_by_edge_bucket[bucket_key] = {"wins": 0, "losses": 0, "pushes": 0, "units": 0.0}
+        if result == "win":
+            roi_by_edge_bucket[bucket_key]["wins"] += 1
+        elif result == "loss":
+            roi_by_edge_bucket[bucket_key]["losses"] += 1
+        elif result == "push":
+            roi_by_edge_bucket[bucket_key]["pushes"] += 1
+        roi_by_edge_bucket[bucket_key]["units"] += units
+
+        conf = str(pick.get("confidence") or pick.get("confidence_grade") or "unknown").lower()
+        if conf not in roi_by_confidence:
+            roi_by_confidence[conf] = {"wins": 0, "losses": 0, "pushes": 0, "units": 0.0}
+        if result == "win":
+            roi_by_confidence[conf]["wins"] += 1
+        elif result == "loss":
+            roi_by_confidence[conf]["losses"] += 1
+        elif result == "push":
+            roi_by_confidence[conf]["pushes"] += 1
+        roi_by_confidence[conf]["units"] += units
+
+        clv_val = pick.get("clv")
+        if clv_val is not None:
+            clv_key = "positive_clv" if float(clv_val) > 0 else "negative_clv"
+            if clv_key not in roi_by_clv:
+                roi_by_clv[clv_key] = {"wins": 0, "losses": 0, "pushes": 0, "units": 0.0}
+            if result == "win":
+                roi_by_clv[clv_key]["wins"] += 1
+            elif result == "loss":
+                roi_by_clv[clv_key]["losses"] += 1
+            elif result == "push":
+                roi_by_clv[clv_key]["pushes"] += 1
+            roi_by_clv[clv_key]["units"] += units
+
+    def _add_roi_pct(d: dict[str, Any]) -> None:
+        total_bets = d["wins"] + d["losses"] + d["pushes"]
+        d["total"] = total_bets
+        d["roi_pct"] = round((d["units"] / total_bets) * 100, 1) if total_bets > 0 else 0.0
+
+    for market_data in roi_by_market.values():
+        _add_roi_pct(market_data)
+    for bucket_data in roi_by_edge_bucket.values():
+        _add_roi_pct(bucket_data)
+    for conf_data in roi_by_confidence.values():
+        _add_roi_pct(conf_data)
+    for clv_data in roi_by_clv.values():
+        _add_roi_pct(clv_data)
+
     report = {
         "engine": "BETGPTAI AI Learning Engine Phase 6",
         "card_date": card_date,
@@ -292,6 +368,10 @@ def run_learning_review(card_date: str) -> dict[str, Any]:
             "wins_with_negative_clv": negative_clv,
             "clv_records": clv_records[:50],
         },
+        "roi_by_market": roi_by_market,
+        "roi_by_edge_bucket": roi_by_edge_bucket,
+        "roi_by_confidence": roi_by_confidence,
+        "roi_by_clv": roi_by_clv,
         "suggested_adjustments": merged_suggestions,
         "missing_data": missing_data,
     }
@@ -348,6 +428,23 @@ def render_learning_report(report: dict[str, Any]) -> str:
             f"- Positive CLV wins: {clv.get('wins_with_positive_clv', 0)}",
             f"- Negative CLV wins: {clv.get('wins_with_negative_clv', 0)}",
         ])
+
+    def _render_roi_section(label: str, data: dict[str, Any]) -> list[str]:
+        if not data:
+            return []
+        out = [f"  ROI by {label}:"]
+        for key in sorted(data):
+            d = data[key]
+            out.append(f"  - {key}: {d['wins']}W/{d['losses']}L/{d['pushes']}P ({d['total']}) — {d['roi_pct']}% ROI")
+        return out
+    roi_market = report.get("roi_by_market") or {}
+    roi_edge = report.get("roi_by_edge_bucket") or {}
+    roi_conf = report.get("roi_by_confidence") or {}
+    roi_clv = report.get("roi_by_clv") or {}
+    roi_sections = _render_roi_section("Market", roi_market) + _render_roi_section("Edge Bucket", roi_edge) + _render_roi_section("Confidence", roi_conf) + _render_roi_section("CLV", roi_clv)
+    if roi_sections:
+        lines.append("")
+        lines.extend(roi_sections)
     lines.extend(["", "Suggested Adjustments:"])
     if suggestions:
         for factor, item in suggestions.items():

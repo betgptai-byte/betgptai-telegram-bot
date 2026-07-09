@@ -243,6 +243,12 @@ def _build_results_record(card_date: str, graded_picks: list[dict[str, Any]], sn
         ]
         pending_list.extend(pending_examples[:10])
 
+    # CLV summary
+    clv_picks = [p for p in graded_picks if p.get("clv") is not None]
+    positive_clv = sum(1 for p in clv_picks if float(p.get("clv", 0)) > 0 and p.get("result") == "win")
+    negative_clv = sum(1 for p in clv_picks if float(p.get("clv", 0)) <= 0 and p.get("result") == "win")
+    no_clv = sum(1 for p in graded_picks if p.get("clv") is None)
+
     record = {
         "date": card_date,
         "created_at": _now_iso(),
@@ -255,6 +261,13 @@ def _build_results_record(card_date: str, graded_picks: list[dict[str, Any]], sn
             "total": total,
             "units": round(total_units, 2),
             "roi_pct": roi,
+        },
+        "clv_summary": {
+            "picks_with_clv": len(clv_picks),
+            "picks_without_clv": no_clv,
+            "wins_with_positive_clv": positive_clv,
+            "wins_with_negative_clv": negative_clv,
+            "clv_unavailable_reason": "closing_line unavailable" if no_clv > 0 else None,
         },
         "market_records": results_summary,
         "pending": pending_list[:50],

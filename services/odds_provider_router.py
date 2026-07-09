@@ -90,8 +90,12 @@ def fetch_odds(
             logger.warning("Odds provider router: %s", sharp_error)
 
     # ── 2. Fall back to The Odds API (MLB only) ────────────────────────
+    # Try Odds API when:
+    #   - backup_only=False (always try Odds API)
+    #   - Sharp failed (any error, including empty response)
+    #   - Sharp is disabled entirely (sharp_ok=False means no Sharp at all)
     backup_only = odds_api_backup_only()
-    if sport_lower == "mlb" and odds_ok and (not backup_only or sharp_error is not None):
+    if sport_lower == "mlb" and odds_ok and (not backup_only or sharp_error is not None or not sharp_ok):
         odds_key = os.getenv("ODDS_API_KEY", "")
         try:
             odds = odds_api_fetch(odds_key)

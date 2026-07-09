@@ -14,15 +14,20 @@ from storage import data_file
 from model_weights import load_quant_engine_weights
 
 
-MODEL_VERSION = "BETGPTAI v20.0"
+MODEL_VERSION = "BETGPTAI v21.0"
 WEIGHTS = {
-    "sp_score": 0.30,
-    "offense_score": 0.20,
+    "sp_score": 0.25,
     "bullpen_score": 0.15,
-    "defense_score": 0.10,
+    "sp_batter_matchup_score": 0.10,
     "weather_park_score": 0.10,
     "market_value_score": 0.10,
-    "situational_score": 0.05,
+    "offense_score": 0.10,
+    "situational_score": 0.10,
+    "defense_score": 0.05,
+    "home_away_score": 0.025,
+    "travel_rest_score": 0.025,
+    "recent_form_score": 0.025,
+    "team_splits_score": 0.025,
 }
 MINIMUM_EDGE_SCORE = 82.0
 

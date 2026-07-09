@@ -1202,7 +1202,18 @@ def save_official_picks(
     pick_date: str | None = None,
     source_command: str = "unknown",
 ) -> int:
-    """Save a generated card immediately through the Pick Persistence Service."""
+    """Save a generated card immediately through the Pick Persistence Service.
+
+    Deprecated: callers should use build_card_from_analysis + structured_card_to_dict
+    + persist_official_card directly.  This wrapper is kept only as fallback.
+    """
+    import logging
+    logging.warning(
+        "LEGACY_PICK_PARSER_USED: results_tracker.save_official_picks called "
+        "source=%s card_date=%s — caller should use build_card_from_analysis directly",
+        source_command,
+        pick_date,
+    )
     from services.pick_persistence import save_official_card
 
     result = save_official_card(

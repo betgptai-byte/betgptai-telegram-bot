@@ -214,6 +214,13 @@ def _build_official_picks(card: Any) -> tuple[str, list[dict[str, Any]]]:
     explicit = card.get("official_picks") if isinstance(card, dict) and isinstance(card.get("official_picks"), list) else []
     picks = [dict(pick) for pick in explicit if isinstance(pick, dict)]
     if not picks:
+        _log_storage({
+            "component": "pick_persistence",
+            "event": "LEGACY_PICK_PARSER_USED",
+            "card_date": card_date,
+            "source": source,
+            "message": "StructuredCard official_picks key absent or empty; falling back to extract_official_picks (text parsing)",
+        })
         picks = rt.extract_official_picks(analysis, slate, card_date, source)
     picks.extend(rt._approved_prop_records(card_date, source))  # approved admin props, if any
     had_pre_guard_picks = bool(picks)
@@ -238,6 +245,7 @@ def _public_market_guard_enabled(source: str) -> bool:
         "mlb_auto",
         "generate_today",
         "force_generate_today",
+        "scheduled_generate",
         "scheduled_t45_generation",
         "scheduled_post",
         "today",

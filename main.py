@@ -190,7 +190,7 @@ from posting_scheduler import (
     set_auto_results_enabled,
     time_debug_text,
 )
-from daily_workflow import force_post_free_channel_job, generate_cards_job
+from daily_workflow import force_post_free_channel_job, generate_cards_job, workflow_status
 from quality_gate import render_prepost_quality_gate, run_prepost_quality_gate
 from bot.callbacks.router import register_callback_router
 
@@ -1712,6 +1712,67 @@ async def post_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(text)
 
 
+async def workflow_debug_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only workflow state debug showing StructuredCard save details."""
+    del context
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id != OWNER_TELEGRAM_ID:
+        return
+    if not update.message:
+        return
+    try:
+        selected = official_sports_date().isoformat()
+        payload = await asyncio.to_thread(workflow_status, selected)
+        generation = payload.get("generation") if isinstance(payload.get("generation"), dict) else {}
+        verification = payload.get("verification") if isinstance(payload.get("verification"), dict) else {}
+        posting = payload.get("posting") if isinstance(payload.get("posting"), dict) else {}
+        posted_today = False
+        import json as _json
+        try:
+            log_data = _json.loads(data_file("posting_log.json").read_text(encoding="utf-8"))
+            posted_today = bool(log_data.get(f"posted_mlb_card_{selected}"))
+        except Exception:
+            pass
+        if not verification and not generation and not posting:
+            await update.message.reply_text("No workflow state found for today.")
+            return
+        lines = [
+            "🔧 WORKFLOW DEBUG",
+            f"Date: {display_date(selected)}",
+            "",
+            "── T-50 Verification ──",
+            f"Ready: {'YES' if verification.get('ready_for_image_generation') else 'NO' if verification.get('ready_for_image_generation') is False else 'Not run'}",
+            f"Games: {verification.get('schedule_games', 0)}",
+            f"Odds: {verification.get('odds', 'unavailable')}",
+            f"Errors: {verification.get('critical_failures', []) or 'None'}",
+            "",
+            "── T-45 Generation ──",
+            f"Card Complete: {'YES' if generation.get('card_generation_complete') else 'NO'}",
+            f"Picks Saved: {'YES' if generation.get('picks_saved') else 'NO'}",
+            f"Saved Count: {generation.get('saved_picks', 0)}",
+            f"Images: {'YES' if generation.get('image_generation_complete') else 'NO'}",
+            f"Last Generation Error: {generation.get('generation_error') or 'None'}",
+            "",
+            "── Structured Card ──",
+            f"Built: {'YES' if generation.get('structured_card_built') else 'NO'}",
+            f"Official Picks Count: {generation.get('official_picks_count', 0)}",
+            f"Save Path: {generation.get('save_path_used', 'N/A')}",
+            f"Last Save Exception: {generation.get('last_save_exception') or 'None'}",
+            f"Source File: {generation.get('generation_source_file', 'N/A')}",
+            f"Source Function: {generation.get('generation_source_function', 'N/A')}",
+            "",
+            "── T-43 Posting ──",
+            f"Status: {posting.get('status', 'Not run')}",
+            f"Auto Post: {'ENABLED' if payload.get('auto_post_enabled') else 'DISABLED'}",
+            f"Posted Today: {'YES' if posted_today else 'NO'}",
+            f"Posting Ready: {'YES' if generation.get('card_generation_complete') and (generation.get('picks_saved') or generation.get('saved_picks', 0) > 0) and payload.get('auto_post_enabled') else 'NO'}",
+        ]
+        await update.message.reply_text("\n".join(lines))
+    except Exception as error:
+        logging.exception("/workflow_debug failed")
+        await update.message.reply_text(f"/workflow_debug failed:\n{error!r}")
+
+
 async def force_generate_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner-only manual T-45 generation run."""
     if not await _require_admin(update) or not update.message:
@@ -1778,15 +1839,15 @@ async def save_today_picks(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         saved = 0
         for attempt in (1, 2):
             try:
-                save_result = await asyncio.to_thread(
-                    persist_official_card,
-                    {
-                        "analysis": card,
-                        "slate": upcoming_mlb_slate(slate),
-                        "card_date": selected_date,
-                        "source_command": "save_today_picks",
-                    },
+                url_slate = upcoming_mlb_slate(slate)
+                card_obj = await asyncio.to_thread(
+                    build_card_from_analysis, card, url_slate, selected_date, "save_today_picks",
                 )
+                card_dict = structured_card_to_dict(card_obj)
+                card_dict["analysis"] = card
+                card_dict["slate"] = url_slate
+                card_dict["source_command"] = "save_today_picks"
+                save_result = await asyncio.to_thread(persist_official_card, card_dict)
                 if not save_result.get("success"):
                     raise ResultsTrackerError(str(save_result.get("error") or "Pick persistence failed"))
                 saved = int(save_result.get("saved_pick_count") or 0)
@@ -3682,15 +3743,14 @@ async def _build_card_debug_text() -> str:
             skipped_reasons.append("Generated picks exist, but no matched market context was found.")
     except Exception as extract_error:
         skipped_reasons.append(f"Official pick extraction failed: {extract_error!r}")
-    save_result = await asyncio.to_thread(
-        persist_official_card,
-        {
-            "analysis": analysis,
-            "slate": slate,
-            "card_date": selected_date,
-            "source_command": "card_debug",
-        },
+    card_obj = await asyncio.to_thread(
+        build_card_from_analysis, analysis, slate, selected_date, "card_debug",
     )
+    card_dict = structured_card_to_dict(card_obj)
+    card_dict["analysis"] = analysis
+    card_dict["slate"] = slate
+    card_dict["source_command"] = "card_debug"
+    save_result = await asyncio.to_thread(persist_official_card, card_dict)
     if not save_result.get("success"):
         skip_reason = str(save_result.get("error") or "Pick persistence failed")
     lines = [
@@ -3946,7 +4006,7 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/system_diagnostics · /callback_debug\n\n"
         "⏰ SCHEDULER\n"
         "/time_debug · /scheduler_status · /post_status\n"
-        "/force_generate_today · /force_post_today\n\n"
+        "/force_generate_today · /force_post_today · /workflow_debug\n\n"
         "💾 PICK PERSISTENCE\n"
         "/save_today_picks · /saved_picks_today\n"
         "/save_debug · /repair_storage\n\n"
@@ -5191,6 +5251,9 @@ async def main() -> None:
     application.add_handler(CommandHandler("card_debug", card_debug))
     SYSTEM_LOG.info("Registered command: /card_debug")
     print("Registered command: /card_debug", flush=True)
+    application.add_handler(CommandHandler("workflow_debug", workflow_debug_handler))
+    SYSTEM_LOG.info("Registered command: /workflow_debug")
+    print("Registered command: /workflow_debug", flush=True)
     application.add_handler(CommandHandler("mlb_top5_admin", mlb_top5_admin))
     application.add_handler(CommandHandler("mlb_admin_image", mlb_admin_image))
     application.add_handler(CommandHandler("soccer", soccer))

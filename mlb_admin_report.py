@@ -15,6 +15,8 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from ai_analysis import analyze_mlb_slate, build_fallback_card
+from core.builder import build_card_from_analysis
+from core.card import structured_card_to_dict
 from game_time import format_game_clock
 from mlb_data import get_combined_slate
 from openai_image_generator import generate_image_from_prompt
@@ -762,12 +764,12 @@ def build_mlb_admin_report(
                 "",
             )
             if save_picks and official_card:
-                save_result = save_official_card({
-                    "analysis": official_card,
-                    "slate": slate,
-                    "card_date": card_date,
-                    "source_command": "mlb_admin",
-                })
+                card_obj = build_card_from_analysis(official_card, slate, card_date, "mlb_admin")
+                card_dict = structured_card_to_dict(card_obj)
+                card_dict["analysis"] = official_card
+                card_dict["slate"] = slate
+                card_dict["source_command"] = "mlb_admin"
+                save_result = save_official_card(card_dict)
                 if not save_result.get("success"):
                     raise RuntimeError(save_result.get("error") or "Pick persistence failed")
                 saved_picks = int(save_result.get("saved_pick_count") or 0)
@@ -849,12 +851,12 @@ async def build_mlb_admin_report_async(
             official_card = build_fallback_card(slate)
         if save_picks and official_card:
             try:
-                save_result = save_official_card({
-                    "analysis": official_card,
-                    "slate": slate,
-                    "card_date": card_date,
-                    "source_command": "mlb_admin",
-                })
+                card_obj = build_card_from_analysis(official_card, slate, card_date, "mlb_admin")
+                card_dict = structured_card_to_dict(card_obj)
+                card_dict["analysis"] = official_card
+                card_dict["slate"] = slate
+                card_dict["source_command"] = "mlb_admin"
+                save_result = save_official_card(card_dict)
                 if not save_result.get("success"):
                     raise RuntimeError(save_result.get("error") or "Pick persistence failed")
                 saved_picks = int(save_result.get("saved_pick_count") or 0)

@@ -27,6 +27,8 @@ from mlb_auto_image import prepare_mlb_auto_image
 from mlb_data import get_combined_slate, get_mlb_schedule
 from model_report import save_model_report
 from player_props_engine import build_player_props_lab
+from core.builder import build_card_from_analysis
+from core.card import structured_card_to_dict
 from results_tracker import load_picks, save_official_picks
 from safe_parlay_formatter import render_safe_parlay
 from premium_card_formatter import (
@@ -34,6 +36,7 @@ from premium_card_formatter import (
     render_mlb_premium_card,
     render_play_of_day_card,
 )
+from services.pick_persistence import save_official_card as persist_official_card
 from storage import data_file, storage_status
 from time_utils import format_et, now_et, to_et
 
@@ -193,35 +196,49 @@ def _generation_flags(card: str, card_date: str, saved_picks: int, image_path: A
 
 
 async def _save_official_picks_with_retry(
-    card: str,
+    analysis: str,
     slate: list[dict[str, Any]],
     card_date: str,
     source_command: str,
-) -> int:
-    """Save official picks immediately, retrying once before failing T-45."""
-    last_error: Exception | None = None
+) -> dict[str, Any]:
+    """Build StructuredCard and save official picks, retrying once before failing T-45.
+
+    Returns a dict with workflow state fields including:
+      saved_count, structured_card_built, official_picks_count,
+      save_path_used, last_save_exception, generation_source_file,
+      generation_source_function
+    """
+    last_save_exception = ""
     for attempt in (1, 2):
         try:
-            saved = await asyncio.to_thread(
-                save_official_picks,
-                card,
-                slate,
-                card_date,
-                source_command,
-            )
+            card = build_card_from_analysis(analysis, slate, card_date, source_command)
+            card_dict = structured_card_to_dict(card)
+            card_dict["analysis"] = analysis
+            card_dict["slate"] = slate
+            card_dict["source_command"] = source_command
+            result = await asyncio.to_thread(persist_official_card, card_dict)
+            if not result.get("success"):
+                raise RuntimeError(str(result.get("error") or "Pick persistence failed"))
+            saved = int(result.get("saved_pick_count") or 0)
             logging.info(
-                "Official picks saved card_date=%s saved=%s attempt=%s",
-                card_date,
-                saved,
-                attempt,
+                "Official picks saved card_date=%s saved=%s attempt=%s structured_card_built=true picks_count=%s",
+                card_date, saved, attempt, len(card.official_picks),
             )
-            return saved
+            return {
+                "saved_count": saved,
+                "structured_card_built": True,
+                "official_picks_count": len(card.official_picks),
+                "save_path_used": str(data_file("picks.json")),
+                "last_save_exception": "",
+                "generation_source_file": "daily_workflow.py",
+                "generation_source_function": "_save_official_picks_with_retry",
+            }
         except Exception as error:
-            last_error = error
+            last_save_exception = str(error)
             logging.exception("Official picks save failed attempt=%s card_date=%s", attempt, card_date)
             if attempt == 1:
                 await asyncio.sleep(0.5)
-    raise RuntimeError(f"Could not save official picks after retry: {last_error}")
+    raise RuntimeError(f"Could not save official picks after retry: {last_save_exception}")
 
 
 def _auto_post_enabled() -> bool:
@@ -367,6 +384,7 @@ async def generate_cards_job(bot: Any, card_date: str | None = None) -> dict[str
     slate: list[dict[str, Any]] = []
     card = ""
     saved_picks = 0
+    save_result: dict[str, Any] = {}
     image_path = None
     best_hit_image = None
     generation_error = ""
@@ -386,7 +404,8 @@ async def generate_cards_job(bot: Any, card_date: str | None = None) -> dict[str
             os.getenv("ANTHROPIC_API_KEY", ""),
         )
         await asyncio.to_thread(save_model_report, selected, slate, card, get_last_analysis_metadata())
-        saved_picks = await _save_official_picks_with_retry(card, slate, selected, "scheduled_generate")
+        save_result = await _save_official_picks_with_retry(card, slate, selected, "scheduled_generate")
+        saved_picks = int(save_result.get("saved_count") or 0)
         try:
             image_result = await asyncio.to_thread(
                 prepare_mlb_auto_image,
@@ -441,6 +460,12 @@ async def generate_cards_job(bot: Any, card_date: str | None = None) -> dict[str
         "best_hit_image": best_hit_image,
         "generation_error": generation_error,
         "errors": errors,
+        "structured_card_built": bool(save_result.get("structured_card_built", False)),
+        "official_picks_count": int(save_result.get("official_picks_count", 0)),
+        "save_path_used": str(save_result.get("save_path_used", "")),
+        "last_save_exception": str(save_result.get("last_save_exception", "")),
+        "generation_source_file": str(save_result.get("generation_source_file", "")),
+        "generation_source_function": str(save_result.get("generation_source_function", "")),
     }
     if card:
         (output_dir / "mlb_card.txt").write_text(card, encoding="utf-8")

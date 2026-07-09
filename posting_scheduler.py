@@ -24,6 +24,8 @@ import requests
 from ai_analysis import analyze_mlb_slate, get_last_analysis_metadata
 from ai_learning_engine import render_auto_apply_notification, render_learning_report, run_learning_review
 from card_time import EASTERN, official_sports_date
+from core.builder import build_card_from_analysis
+from core.card import structured_card_to_dict
 from daily_workflow import (
     generate_cards_job,
     post_cards_job,
@@ -43,9 +45,9 @@ from results_tracker import (
     display_date,
     grade_mlb_picks_for_date,
     load_picks,
-    save_official_picks,
     saved_picks_summary,
 )
+from services.pick_persistence import save_official_card as persist_official_card
 from soccer_analysis import analyze_soccer_slate
 from soccer_data import get_soccer_schedule, get_soccer_slate
 from storage import data_file
@@ -185,7 +187,15 @@ async def _mlb_card(day: str) -> tuple[str, list[dict[str, Any]]]:
     await asyncio.to_thread(
         save_model_report, day, slate, card, get_last_analysis_metadata()
     )
-    saved = await asyncio.to_thread(save_official_picks, card, slate, day)
+    card_obj = await asyncio.to_thread(
+        build_card_from_analysis, card, slate, day, "scheduled_post",
+    )
+    card_dict = structured_card_to_dict(card_obj)
+    card_dict["analysis"] = card
+    card_dict["slate"] = slate
+    card_dict["source_command"] = "scheduled_post"
+    result = await asyncio.to_thread(persist_official_card, card_dict)
+    saved = int(result.get("saved_pick_count") or 0)
     summary = saved_picks_summary(day)
     if saved <= 0 and int(summary.get("total") or 0) <= 0:
         raise RuntimeError(f"No official picks were saved for {day}; scheduled posting aborted.")
@@ -675,8 +685,17 @@ def post_status_text(day: str | None = None) -> str:
         and not posted_today
     )
     scheduler_payload = log.get("scheduler", {}) if isinstance(log.get("scheduler"), dict) else {}
+    structured_card_built = bool(generation.get("structured_card_built", False))
+    official_picks_count = int(generation.get("official_picks_count", 0))
+    save_path_used = str(generation.get("save_path_used", ""))
+    last_save_exception = str(generation.get("last_save_exception", ""))
     return (
         "📡 BETGPTAI POST STATUS\n\n"
+        "── Structured Card ──\n"
+        f"Built:\n{'Yes ✅' if structured_card_built else 'No ❌'}\n"
+        f"Official Picks Count:\n{official_picks_count}\n"
+        f"Save Path:\n{save_path_used}\n"
+        f"Last Save Exception:\n{last_save_exception or 'None'}\n\n"
         f"Auto Posting:\n{'Enabled ✅' if payload.get('auto_post_enabled') else 'Disabled ❌'}\n\n"
         f"Verification:\n{'Passed ✅' if verification.get('ready_for_image_generation') else 'Failed/Pending ❌'}\n\n"
         f"T-45 Card Generated:\n{'Yes ✅' if card_generated else 'No/Pending ❌'}\n\n"

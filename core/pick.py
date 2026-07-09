@@ -33,6 +33,14 @@ class OfficialPick:
     status: str = "pending"
     result: str | None = None
     model_version: str = "BETGPTAI v20.0"
+    # Stats-only card mode fields
+    market_mode: str | None = None
+    odds_status: str | None = None
+    market_context_status: str | None = None
+    sportsbook: str | None = None
+    posted_line: float | None = None
+    line_verified: bool | None = None
+    official_pick_source: str | None = None
 
 
 def official_pick_to_dict(pick: OfficialPick) -> dict[str, Any]:

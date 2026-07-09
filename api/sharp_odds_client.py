@@ -90,13 +90,17 @@ SOCCER_LEAGUES: set[str] = {
 }
 
 __all__ = [
+    "ALL_SPORTSBOOKS",
     "SharpAPIError",
     "SharpRateLimitError",
     "MarketContext",
     "MLB_MAPPINGS",
     "SHARP_SPORT_MAP",
+    "SHARP_ENDPOINT_BEST_ODDS",
+    "SHARP_ENDPOINT_ODDS",
     "SOCCER_LEAGUES",
     "build_game_market_context",
+    "build_sharp_odds_url",
     "clear_cache",
     "default_sportsbook",
     "fetch_mlb_odds",
@@ -108,6 +112,8 @@ __all__ = [
     "odds_api_enabled",
     "sharp_api_enabled",
     "sharp_api_key",
+    "_active_endpoint",
+    "_use_best_odds",
 ]
 
 
@@ -183,16 +189,20 @@ def secondary_sportsbook() -> str:
     return os.getenv("SHARP_SECONDARY_SPORTSBOOK", "fanduel").strip().lower()
 
 
+# ── Supported sportsbooks ───────────────────────────────────────────────────
+ALL_SPORTSBOOKS: list[str] = [
+    "draftkings", "fanduel", "hardrockbet", "betmgm", "caesars", "pinnacle",
+]
+
+
 # ── MLB mapping fallbacks ───────────────────────────────────────────────────
 # Each mapping includes sport_param, optional league, and optional sportsbook.
-# The production request tries: default sportsbook → secondary → no sportsbook.
+# The production request tries: best-odds → default sportsbook → secondary → probe all sportsbooks.
 MLB_MAPPINGS: list[dict[str, str | None]] = [
-    {"sport_param": "baseball", "league": "MLB", "sportsbook": "draftkings"},
-    {"sport_param": "baseball", "league": "MLB", "sportsbook": "fanduel"},
+    {"sport_param": "baseball", "league": "MLB", "sportsbook": sb}
+    for sb in ALL_SPORTSBOOKS
+] + [
     {"sport_param": "baseball", "league": "MLB", "sportsbook": None},
-    {"sport_param": "mlb", "league": None, "sportsbook": None},
-    {"sport_param": "baseball", "league": None, "sportsbook": None},
-    {"sport_param": "baseball", "league": "Major League Baseball", "sportsbook": None},
 ]
 
 
@@ -203,28 +213,31 @@ def build_sharp_odds_url(
     *,
     markets: str | None = None,
     sportsbook: str | None = None,
+    endpoint: str = SHARP_ENDPOINT_ODDS,
 ) -> str:
     """Build the Sharp API request URL for debug display (no key exposed).
 
     Auth is sent via X-API-Key header, not in the URL.
+    ``endpoint`` controls the URL path (``/odds``, ``/odds/best``, ``/events``).
     """
     base = _base_url()
     params: dict[str, str] = {
         "sport": sport_param,
         "regions": "us",
-        "markets": markets or "h2h,spreads,totals,team_totals",
         "oddsFormat": "american",
         "dateFormat": "iso",
     }
     if league:
         params["league"] = league
-    if sportsbook:
-        params["sportsbook"] = sportsbook
+    if endpoint == SHARP_ENDPOINT_ODDS:
+        params["markets"] = markets or "h2h,spreads,totals,team_totals"
+        if sportsbook:
+            params["sportsbook"] = sportsbook
     if event_date:
         params["commenceTimeFrom"] = f"{event_date}T00:00:00Z"
         params["commenceTimeTo"] = f"{event_date}T23:59:59Z"
     import urllib.parse
-    return f"{base}/odds?{urllib.parse.urlencode(params)}"
+    return f"{base}{endpoint}?{urllib.parse.urlencode(params)}"
 
 
 def _do_sharp_request(
@@ -240,6 +253,15 @@ def _do_sharp_request(
         raise SharpAPIError(f"Sharp API request failed: {exc}") from exc
 
 
+def _use_best_odds() -> bool:
+    return os.getenv("SHARP_USE_BEST_ODDS", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
+SHARP_ENDPOINT_BEST_ODDS = "/odds/best"
+SHARP_ENDPOINT_ODDS = "/odds"
+SHARP_ENDPOINT_EVENTS = "/events"
+
+
 def _sharpen_request(
     sport_param: str,
     league: str | None,
@@ -253,39 +275,40 @@ def _sharpen_request(
 ) -> list[dict[str, Any]]:
     """Make one Sharp API request and return normalized events.
 
-    Auth: X-API-Key header (primary).  If Sharp responds 401 with
-    ``missing_api_key``, falls back once to ``api_key`` query param."""
+    Uses ``SHARP_USE_BEST_ODDS`` env var:
+      - ``true`` (default): calls ``/odds/best`` (no sportsbook filter, all markets).
+      - ``false``: calls ``/odds`` with optional sportsbook filter.
+
+    Auth: ``X-API-Key`` header only — no query-param fallback."""
     cached = _cache_read(cache_key)
     if cached is not None:
         logger.debug("Sharp cache HIT for %s", cache_key)
         return cached
 
-    url = f"{base_url}/odds"
+    if _use_best_odds():
+        endpoint = SHARP_ENDPOINT_BEST_ODDS
+    else:
+        endpoint = SHARP_ENDPOINT_ODDS
+    url = f"{base_url}{endpoint}"
     params: dict[str, str] = {
         "sport": sport_param,
         "regions": "us",
-        "markets": markets,
         "oddsFormat": "american",
         "dateFormat": "iso",
     }
     if league:
         params["league"] = league
-    if sportsbook:
-        params["sportsbook"] = sportsbook
+    # Only send markets and sportsbook for /odds endpoint, not /odds/best
+    if endpoint == SHARP_ENDPOINT_ODDS:
+        params["markets"] = markets
+        if sportsbook:
+            params["sportsbook"] = sportsbook
     if event_date:
         params["commenceTimeFrom"] = f"{event_date}T00:00:00Z"
         params["commenceTimeTo"] = f"{event_date}T23:59:59Z"
 
-    # Primary: X-API-Key header
     headers = {"X-API-Key": api_key}
     resp = _do_sharp_request(url, params, headers)
-
-    # Fallback: if 401 missing_api_key, try api_key query param
-    if resp.status_code == 401 and "missing_api_key" in (resp.text or "").lower():
-        logger.warning("Sharp X-API-Key header rejected (401) — falling back to api_key query param")
-        params["api_key"] = api_key
-        headers = None
-        resp = _do_sharp_request(url, params, headers)
 
     if resp.status_code == 429:
         raise SharpRateLimitError("Sharp API rate limit hit (429)")
@@ -310,48 +333,50 @@ def _sharpen_request(
 def probe_sharp_mlb(
     event_date: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Test all MLB sport/league/sportsbook mappings in order.
+    """Test all MLB mappings: best-odds first, then each sportsbook.
 
     Returns a list of result dicts, one per mapping:
-      {sport_param, league, sportsbook, status_code, games_count, error, first_matchup}.
-    The first mapping that returns games is saved to cache as 'baseball_mlb'.
+      {endpoint, sport_param, league, sportsbook, status_code, games_count, error, first_matchup}.
     """
     api_key = sharp_api_key()
     if not api_key:
         raise SharpAPIError("SHARP_API_KEY is missing from .env.")
     base_url = _base_url()
     cfg = SHARP_SPORT_MAP["mlb"]
+    sp = cfg["sport_param"]
+    lg = "MLB"
     markets = cfg["markets"]
 
     results: list[dict[str, Any]] = []
-    for mapping in MLB_MAPPINGS:
-        sp = mapping["sport_param"]
-        lg = mapping["league"]
-        sb = mapping.get("sportsbook")
-        ck = f"probe_{sp}"
-        if lg:
-            ck += f"_{lg.replace(' ', '_')}"
-        if sb:
-            ck += f"_{sb}"
+
+    # 1. Best-odds probe (no sportsbook filter)
+    for endpoint_label, endpoint_path, sb_val in [
+        ("/odds/best", SHARP_ENDPOINT_BEST_ODDS, None),
+    ]:
+        ck = f"probe_best"
         if event_date:
             ck += f"_{event_date}"
         result: dict[str, Any] = {
+            "endpoint": endpoint_label,
             "sport_param": sp,
             "league": lg,
-            "sportsbook": sb,
+            "sportsbook": sb_val,
             "status_code": None,
             "games_count": 0,
             "error": None,
             "first_matchup": None,
         }
         try:
-            odds = _sharpen_request(sp, lg, event_date, api_key, base_url, markets, ck, sportsbook=sb)
+            odds = _sharpen_request_for_probe(
+                sp, lg, event_date, api_key, base_url, markets, ck,
+                endpoint=endpoint_path, sportsbook=sb_val,
+            )
             result["games_count"] = len(odds)
             result["status_code"] = 200
             if odds:
                 first = odds[0]
                 result["first_matchup"] = f"{first.get('away_team')} @ {first.get('home_team')} [{first.get('commence_time', '')}]"
-        except SharpRateLimitError as exc:
+        except SharpRateLimitError:
             result["status_code"] = 429
             result["error"] = "Rate limited (429)"
         except SharpAPIError as exc:
@@ -360,10 +385,107 @@ def probe_sharp_mlb(
         except Exception as exc:
             result["error"] = str(exc)[:200]
         results.append(result)
-        # If this mapping worked, cache it as the primary key
+
+    # 2. Each sportsbook via /odds
+    for mapping in MLB_MAPPINGS:
+        sp_m = mapping["sport_param"]
+        lg_m = mapping["league"]
+        sb_m = mapping.get("sportsbook")
+        ck = f"probe_{sp_m}"
+        if lg_m:
+            ck += f"_{lg_m.replace(' ', '_')}"
+        if sb_m:
+            ck += f"_{sb_m}"
+        if event_date:
+            ck += f"_{event_date}"
+        result = {
+            "endpoint": "/odds",
+            "sport_param": sp_m,
+            "league": lg_m,
+            "sportsbook": sb_m,
+            "status_code": None,
+            "games_count": 0,
+            "error": None,
+            "first_matchup": None,
+        }
+        try:
+            odds = _sharpen_request(sp_m, lg_m, event_date, api_key, base_url, markets, ck, sportsbook=sb_m)
+            result["games_count"] = len(odds)
+            result["status_code"] = 200
+            if odds:
+                first = odds[0]
+                result["first_matchup"] = f"{first.get('away_team')} @ {first.get('home_team')} [{first.get('commence_time', '')}]"
+        except SharpRateLimitError:
+            result["status_code"] = 429
+            result["error"] = "Rate limited (429)"
+        except SharpAPIError as exc:
+            result["status_code"] = getattr(exc, "status_code", None)
+            result["error"] = str(exc)[:200]
+        except Exception as exc:
+            result["error"] = str(exc)[:200]
+        results.append(result)
         if result["games_count"] > 0 and not _cache_read("baseball_mlb"):
             _cache_write("baseball_mlb", odds)
     return results
+
+
+def _sharpen_request_for_probe(
+    sport_param: str,
+    league: str | None,
+    event_date: str | None,
+    api_key: str,
+    base_url: str,
+    markets: str,
+    cache_key: str,
+    *,
+    endpoint: str = SHARP_ENDPOINT_ODDS,
+    sportsbook: str | None = None,
+) -> list[dict[str, Any]]:
+    """Like _sharpen_request but caller picks the endpoint path."""
+    url = f"{base_url}{endpoint}"
+    params: dict[str, str] = {
+        "sport": sport_param,
+        "regions": "us",
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+    }
+    if league:
+        params["league"] = league
+    if endpoint == SHARP_ENDPOINT_ODDS:
+        params["markets"] = markets
+        if sportsbook:
+            params["sportsbook"] = sportsbook
+    if event_date:
+        params["commenceTimeFrom"] = f"{event_date}T00:00:00Z"
+        params["commenceTimeTo"] = f"{event_date}T23:59:59Z"
+
+    headers = {"X-API-Key": api_key}
+    resp = _do_sharp_request(url, params, headers)
+
+    if resp.status_code == 429:
+        raise SharpRateLimitError("Sharp API rate limit hit (429)")
+    if resp.status_code != 200:
+        raise SharpAPIError(
+            f"Sharp API returned HTTP {resp.status_code}: {resp.text[:500]}"
+        )
+
+    try:
+        data = resp.json()
+    except Exception as exc:
+        raise SharpAPIError(f"Sharp API invalid JSON: {exc}") from exc
+    if not isinstance(data, list):
+        raise SharpAPIError(f"Sharp API unexpected response type: {type(data).__name__}")
+
+    from api.sharp_client import _normalize_sharp_event
+    normalized = [_normalize_sharp_event(event) for event in data]
+    return normalized
+
+
+def _active_endpoint() -> str:
+    """Return the endpoint path currently in use based on SHARP_USE_BEST_ODDS."""
+    if _use_best_odds():
+        return SHARP_ENDPOINT_BEST_ODDS
+    return SHARP_ENDPOINT_ODDS
 
 
 def get_odds(
@@ -373,9 +495,13 @@ def get_odds(
 ) -> list[dict[str, Any]]:
     """Fetch odds for any supported sport from the Sharp API.
 
-    For MLB, tries sport_param/baseball + league MLB with default sportsbook
-    first, then secondary sportsbook, then no sportsbook, then fallback
-    sport/league mappings.
+    Flow (MLB):
+      1. If ``SHARP_USE_BEST_ODDS=true`` (default), call ``/odds/best``
+         (covers all sportsbooks).  If it returns games, done.
+      2. Fallback: try ``/odds`` with default sportsbook, then secondary,
+         then probe all known sportsbooks.
+
+    Non-MLB sports use ``/odds`` with the mapped sport_param.
 
     Args:
         sport: One of ``mlb``, ``soccer``, ``nba``, ``nfl``, ``nhl``.
@@ -398,11 +524,42 @@ def get_odds(
         raise SharpAPIError("SHARP_API_KEY is missing from .env.")
     base_url = _base_url()
 
-    # ── MLB: try default sportsbook → secondary → none → probe ───────────
+    # ── MLB: best-odds → sportsbook fallback → probe ─────────────────────
     if sport_lower == "mlb":
+        # Step 1: /odds/best (no sportsbook filter, uses SHARP_USE_BEST_ODDS)
+        if _use_best_odds():
+            ck_best = f"{cfg['cache_key']}_best"
+            if event_date:
+                ck_best = f"{ck_best}_{event_date}"
+            cached = _cache_read(ck_best)
+            if cached is not None:
+                return cached
+            try:
+                odds = _sharpen_request(
+                    cfg["sport_param"], league or cfg["league"], event_date,
+                    api_key, base_url, cfg["markets"], ck_best,
+                    sportsbook=None,
+                )
+                if odds:
+                    logger.info(
+                        "Sharp API /odds/best fetched %d MLB odds events",
+                        len(odds),
+                    )
+                    return odds
+            except (SharpAPIError, SharpRateLimitError):
+                logger.warning("Sharp /odds/best failed — falling back to /odds")
+
+        # Step 2: /odds with sportsbook filter (default → secondary → probe all)
         default_sb = default_sportsbook()
         secondary_sb = secondary_sportsbook()
-        sportsbooks_to_try = [default_sb, secondary_sb, None]
+        sportsbooks_to_try: list[str | None] = [default_sb, secondary_sb]
+        # Add remaining sportsbooks not already tried
+        sportsbooks_to_try.extend(
+            sb for sb in ALL_SPORTSBOOKS
+            if sb not in (default_sb, secondary_sb)
+        )
+        sportsbooks_to_try.append(None)
+
         for sb in sportsbooks_to_try:
             ck = cfg["cache_key"]
             if league:
@@ -428,24 +585,6 @@ def get_odds(
                     return odds
             except (SharpAPIError, SharpRateLimitError):
                 logger.warning("Sharp MLB mapping failed (sportsbook=%s)", sb)
-        # All sportsbook attempts returned 0 — probe full mapping table
-        logger.info("Sharp 0 events for all MLB sportsbook combos — probing full fallbacks...")
-        probe_results = probe_sharp_mlb(event_date=event_date)
-        for pr in probe_results:
-            if pr["games_count"] > 0:
-                sb_param = pr.get("sportsbook") or default_sb
-                ck_final = cfg["cache_key"]
-                if pr["league"]:
-                    ck_final = f"{ck_final}_{pr['league']}"
-                if sb_param:
-                    ck_final = f"{ck_final}_{sb_param}"
-                if event_date:
-                    ck_final = f"{ck_final}_{event_date}"
-                return _sharpen_request(
-                    pr["sport_param"], pr["league"], event_date,
-                    api_key, base_url, cfg["markets"], ck_final,
-                    sportsbook=sb_param,
-                )
         return []
 
     # ── Non-MLB sports ────────────────────────────────────────────────────

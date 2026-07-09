@@ -1888,11 +1888,14 @@ async def workflow_debug_handler(update: Update, context: ContextTypes.DEFAULT_T
         odds_events = verification.get("odds_events_returned", 0)
         matched = verification.get("matched_games", 0)
         schedule_games = verification.get("schedule_games", 0)
+        stats_only = os.getenv("STATS_ONLY_CARD_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
+        market_mode = "Stats Only" if stats_only else "Normal"
         lines = [
             "🔧 WORKFLOW DEBUG",
             f"Date: {display_date(selected)}",
             "",
             "── Market Context ──",
+            f"Market Mode: {market_mode}",
             f"Odds provider used: {odds_provider}",
             f"Odds events returned: {odds_events}",
             f"Matched games: {matched} / {schedule_games}",
@@ -3817,6 +3820,10 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
     default_sb = payload.get("default_sportsbook", "draftkings")
     secondary_sb = payload.get("secondary_sportsbook", "fanduel")
     active_sb = payload.get("active_sportsbook")
+    endpoint = payload.get("endpoint_used", "/odds")
+    use_best = payload.get("use_best_odds", True)
+    auth = payload.get("auth_method", "X-API-Key header only")
+    sb_counts: dict[str, int] = payload.get("sportsbook_game_counts") or {}
     lines = [
         "🧪 BETGPTAI ODDS DEBUG",
         f"📅 Requested Date: {event_date}",
@@ -3825,12 +3832,17 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
         "── Sharp API ──",
         f"Enabled: {'yes' if payload.get('sharp_api_enabled') else 'no'}",
         f"Key loaded: {'yes' if payload.get('sharp_api_key_loaded') else 'no'}",
-        f"Auth method: X-API-Key header (fallback: api_key query param)",
+        f"Auth method: {auth}",
+        f"SHARP_USE_BEST_ODDS: {'yes' if use_best else 'no'}",
+        f"Endpoint: {endpoint}",
         f"Cache age: {cache_str}",
         f"Cache fresh: {'yes' if sharp.get('cache_fresh') else 'no'}",
         f"Sportsbook used: {active_sb or 'none'}",
-        f"DraftKings games: {payload.get('draftkings_games', 0)}",
-        f"FanDuel games: {payload.get('fanduel_games', 0)}",
+    ]
+    if sb_counts:
+        for sb_name, sb_count in sb_counts.items():
+            lines.append(f"  {sb_name}: {sb_count} games")
+    lines += [
         f"Request URL: {payload.get('sharp_request_url') or 'N/A'}",
         "",
         "── The Odds API ──",
@@ -3863,10 +3875,11 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
             status = p.get("status_code") or "—"
             count = p.get("games_count", 0)
             err = p.get("error") or ""
+            ep = p.get("endpoint", "/odds")
             sp = p.get("sport_param")
             lg = p.get("league") or "none"
             sb = p.get("sportsbook") or "none"
-            lines.append(f"  sport={sp} league={lg} book={sb} → HTTP {status} games={count}{f' error={err}' if err else ''}")
+            lines.append(f"  endpoint={ep} sport={sp} league={lg} book={sb} → HTTP {status} games={count}{f' error={err}' if err else ''}")
     lines.append(f"Last error: {payload.get('last_error') or 'None'}")
     errors = payload.get("errors") if isinstance(payload.get("errors"), list) else []
     if errors:
@@ -3968,29 +3981,40 @@ async def odds_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             None,
             event_date,
         )
+        endpoint = payload.get("endpoint_used", "/odds")
+        use_best = payload.get("use_best_odds", True)
+        auth = payload.get("auth_method", "X-API-Key header only")
         lines = [
             "🔍 BETGPTAI ODDS PROBE",
             f"📅 Date: {target}",
             f"🏅 Sport: {sport.upper()}",
             "",
-            "── Sharp API Probes ──",
+            "── Sharp API ──",
+            f"Auth method: {auth}",
+            f"SHARP_USE_BEST_ODDS: {'yes' if use_best else 'no'}",
+            f"Endpoint: {endpoint}",
+            f"Default sportsbook: {payload.get('default_sportsbook', 'draftkings')}",
+            f"Secondary sportsbook: {payload.get('secondary_sportsbook', 'fanduel')}",
+            f"Active sportsbook: {payload.get('active_sportsbook') or 'none'}",
         ]
+        sb_counts: dict[str, int] = payload.get("sportsbook_game_counts") or {}
+        if sb_counts:
+            lines.append("Sportsbook game counts:")
+            for sb_name, sb_count in sb_counts.items():
+                lines.append(f"  {sb_name}: {sb_count}")
         sharp_url = payload.get("sharp_request_url") or "N/A"
-        lines.append(f"Primary URL: {sharp_url}")
-        lines.append(f"Auth method: X-API-Key header (fallback: api_key query param)")
-        lines.append(f"Default sportsbook: {payload.get('default_sportsbook', 'draftkings')}")
-        lines.append(f"Secondary sportsbook: {payload.get('secondary_sportsbook', 'fanduel')}")
-        lines.append(f"Active sportsbook: {payload.get('active_sportsbook') or 'none'}")
+        lines.append(f"Request URL: {sharp_url}")
         probes = payload.get("sharp_mlb_probes")
         if isinstance(probes, list):
             for p in probes:
+                ep = p.get("endpoint", "/odds")
                 sp = p.get("sport_param")
                 lg = p.get("league") or "none"
                 sb = p.get("sportsbook") or "none"
                 status = p.get("status_code") or "—"
                 count = p.get("games_count", 0)
                 err = p.get("error") or ""
-                lines.append(f"  sport={sp} league={lg} sportsbook={sb}")
+                lines.append(f"  endpoint={ep} sport={sp} league={lg} book={sb}")
                 lines.append(f"    URL: {p.get('url', '?')}")
                 lines.append(f"    HTTP {status} — {count} games{f' — {err}' if err else ''}")
                 if count > 0:
@@ -4184,10 +4208,13 @@ async def official_card_debug(update: Update, context: ContextTypes.DEFAULT_TYPE
             or isinstance(g.get("best_available_prices"), list) and len(g["best_available_prices"]) > 0
         )
         display_str = datetime.fromisoformat(selected_date).strftime("%m/%d/%Y")
+        stats_only = os.getenv("STATS_ONLY_CARD_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
+        market_mode = "Stats Only" if stats_only else "Normal"
         lines = [
             "🧪 BETGPTAI OFFICIAL CARD DEBUG",
             f"📅 Date: {display_str}",
             "",
+            f"Market Mode: {market_mode}",
             f"Market context available: {'yes' if matched_odds > 0 else 'no'}",
             f"Sharp games matched: {matched_odds} / {len(slate) if slate else 0}",
             f"Quant candidates created: {len(official.get('top_moneylines', []))}",
@@ -4385,6 +4412,8 @@ async def _build_card_debug_text() -> str:
     save_result = await asyncio.to_thread(persist_official_card, card_dict)
     if not save_result.get("success"):
         skip_reason = str(save_result.get("error") or "Pick persistence failed")
+    stats_only = os.getenv("STATS_ONLY_CARD_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
+    market_mode = "Stats Only" if stats_only else "Normal"
     lines = [
         "🧪 BETGPTAI CARD DEBUG",
         f"📅 Date: {display_date(selected_date)}",
@@ -4392,6 +4421,7 @@ async def _build_card_debug_text() -> str:
         "Generated card sections:",
         *(f"- {section}" for section in sections),
         "",
+        f"Market Mode: {market_mode}",
         f"Market context available: {'yes' if market_context_found else 'no'}",
         f"Odds provider used: {odds_provider_used}",
         f"Odds events returned: {odds_events_returned}",

@@ -104,7 +104,7 @@ def sharp_api_key() -> str:
 
 
 def sharp_api_base_url() -> str:
-    return os.getenv("SHARP_API_BASE_URL", "https://api.sharp-odds.com/v1").rstrip("/")
+    return os.getenv("SHARP_API_BASE_URL", "https://api.sharpapi.io/api/v1").rstrip("/")
 
 
 def odds_api_enabled() -> bool:
@@ -262,7 +262,7 @@ def fetch_mlb_odds() -> list[dict[str, Any]]:
         raise SharpAPIError("SHARP_API_KEY is missing from .env.")
 
     base = sharp_api_base_url()
-    url = f"{base}/odds/baseball_mlb"
+    url = f"{base}/odds"
 
     cached = _cache_read("baseball_mlb")
     if cached is not None:
@@ -272,6 +272,8 @@ def fetch_mlb_odds() -> list[dict[str, Any]]:
     _throttle()
 
     params: dict[str, str] = {
+        "sport": "baseball",
+        "league": "MLB",
         "regions": "us",
         "markets": "h2h,spreads,totals,team_totals",
         "oddsFormat": "american",
@@ -283,15 +285,6 @@ def fetch_mlb_odds() -> list[dict[str, Any]]:
         resp = requests.get(url, params=params, headers=headers, timeout=20)
     except requests.RequestException as exc:
         raise SharpAPIError(f"Sharp API request failed: {exc}") from exc
-
-    # Fallback: 401 missing_api_key → try api_key query param
-    if resp.status_code == 401 and "missing_api_key" in (resp.text or "").lower():
-        logger.warning("Sharp X-API-Key header rejected (401) — falling back to api_key query param")
-        params["api_key"] = api_key
-        try:
-            resp = requests.get(url, params=params, timeout=20)
-        except requests.RequestException as exc:
-            raise SharpAPIError(f"Sharp API request failed: {exc}") from exc
 
     if resp.status_code == 429:
         raise SharpRateLimitError("Sharp API rate limit hit (429)")

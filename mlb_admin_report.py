@@ -1308,13 +1308,18 @@ async def build_mlb_admin_report_async(
 
 def render_mlb_admin_report(report: dict[str, Any], *, full: bool = True) -> str:
     """Render the War Room report as Telegram-safe text."""
+    import os
+    stats_only = os.getenv("STATS_ONLY_CARD_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
+    market_mode_line = "   Market Mode: Stats Only" if stats_only else ""
     lines = [
         "⚾ BETGPTAI OFFICIAL MLB WAR ROOM",
         f"📅 Date: {report.get('display_date')}",
         "🧪 ADMIN ONLY — NOT PUBLIC CARD",
         f"Verification Score: {report.get('verification_score', 0)}/100",
-        "",
     ]
+    if market_mode_line:
+        lines.append(market_mode_line)
+    lines.append("")
     errors = report.get("errors") if isinstance(report.get("errors"), list) else []
     if errors:
         lines.extend([
@@ -1395,6 +1400,9 @@ def render_mlb_admin_report(report: dict[str, Any], *, full: bool = True) -> str
             lines.extend(["🧩 SAFE 2-LEG PARLAY", _safe(official["safe_parlay"]), ""])
     lines.append(f"Card source: {source}")
     lines.append(f"Saved picks: {official.get('saved_pick_count', 0)}")
+    stats_only = os.getenv("STATS_ONLY_CARD_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
+    if stats_only:
+        lines.append("Market Mode: Stats Only")
     lines.extend(["", f"Saved JSON: {report.get('report_path')}"])
     return "\n".join(str(line) for line in lines).strip()
 

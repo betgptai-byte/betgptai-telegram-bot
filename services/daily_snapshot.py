@@ -146,13 +146,16 @@ def _edge_scores_from_picks(picks: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 
 def _market_context_snapshot(slate: list[dict[str, Any]]) -> dict[str, Any]:
+    import os
     matched = sum(1 for g in slate if g.get("odds_status") == "available")
     total = len(slate)
+    stats_only = os.getenv("STATS_ONLY_CARD_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
     return {
         "games_with_odds": matched,
         "total_games": total,
         "provider": "Sharp API / Odds API" if matched > 0 else "None",
         "matched_ratio": f"{matched}/{total}",
+        "market_mode": "stats_only" if stats_only else "normal",
     }
 
 
@@ -184,6 +187,7 @@ def _build_snapshot(
     except Exception:
         weights = {}
 
+    market_ctx = _market_context_snapshot(slate)
     snapshot = {
         "date": card_date,
         "created_at": _now_iso(),
@@ -191,7 +195,8 @@ def _build_snapshot(
         "model_version": model_version,
         "git_commit": _git_commit(),
         "source": source,
-        "market_provider": _market_context_snapshot(slate).get("provider", "None"),
+        "market_provider": market_ctx.get("provider", "None"),
+        "market_mode": market_ctx.get("market_mode", "normal"),
         "official_picks_count": len(regular),
         "admin_only_picks_count": len(admin_only),
         "official_picks": regular,
@@ -310,6 +315,7 @@ def snapshot_status(card_date: str) -> dict[str, Any]:
         } if exists else {},
         "created_at": payload.get("created_at") if exists else None,
         "locked": exists,
+        "market_mode": payload.get("market_mode", "normal"),
     }
 
 
@@ -326,6 +332,7 @@ def snapshot_debug(card_date: str) -> dict[str, Any]:
         "official_picks": official,
         "admin_only_picks": admin,
         "admin_only_count": len(admin),
+        "market_mode": payload.get("market_mode", "normal"),
         "missing_fields": [k for k in [
             "date", "created_at", "model_version", "git_commit", "source",
             "official_picks", "moneylines", "edge_scores", "weather_snapshot",
@@ -337,13 +344,16 @@ def render_snapshot_status(payload: dict[str, Any]) -> str:
     if not payload.get("exists"):
         return "No official snapshot saved for this date."
     markets = payload.get("markets_saved") or {}
+    mm = payload.get("market_mode", "normal")
+    mode_line = f"\nMarket Mode: {'Stats Only' if mm == 'stats_only' else 'Normal'}"
     return (
         "📸 BETGPTAI DAILY SNAPSHOT STATUS\n\n"
         f"Snapshot exists: ✅\n"
         f"Path: {payload.get('path')}\n"
         f"Official picks: {payload.get('official_picks_count')}\n"
         f"Created at: {payload.get('created_at')}\n"
-        f"Locked: {'✅' if payload.get('locked') else '❌'}\n\n"
+        f"Locked: {'✅' if payload.get('locked') else '❌'}"
+        f"{mode_line}\n\n"
         "Markets saved:\n"
         f"- Play of Day: {'✅' if markets.get('play_of_day') else '❌'}\n"
         f"- Moneylines: {markets.get('moneylines', 0)}\n"
@@ -402,6 +412,7 @@ def render_snapshot_debug(payload: dict[str, Any]) -> str:
         f"Path: {payload.get('path')}",
         f"Official picks: {len(payload.get('official_picks') or [])}",
         f"Admin-only picks excluded: {payload.get('admin_only_count', 0)}",
+        f"Market Mode: {payload.get('market_mode', 'normal')}",
     ]
     if admin:
         lines.append("Admin-only excluded picks:")

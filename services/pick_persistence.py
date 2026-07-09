@@ -226,6 +226,32 @@ def _build_official_picks(card: Any) -> tuple[str, list[dict[str, Any]]]:
     had_pre_guard_picks = bool(picks)
     if _public_market_guard_enabled(source):
         picks = _filter_public_market_context(picks, slate)
+    elif _stats_only_card_mode() and source in _PUBLIC_SOURCES:
+        # Stats-only card mode: keep picks, mark with stats-only metadata
+        stats_filtered: list[dict[str, Any]] = []
+        for pick in picks:
+            mt = str(pick.get("market_type") or pick.get("market") or "").lower()
+            line = pick.get("market_line") or pick.get("line")
+            # Block totals/team-totals unless projected line is known
+            if mt in ("total", "game_total", "totals", "team_total", "team_totals", "tt") and not line:
+                _log_storage({
+                    "component": "pick_persistence",
+                    "event": "stats_only_totals_skipped_no_line",
+                    "card_date": card_date,
+                    "pick_id": pick.get("pick_id"),
+                    "market": mt,
+                    "reason": "No projected line for totals — cannot save as official.",
+                })
+                continue
+            # Mark as stats-only
+            pick["odds_status"] = "unavailable"
+            pick["market_context_status"] = "stats_only"
+            pick["sportsbook"] = "none"
+            pick["odds"] = None
+            pick["posted_line"] = None
+            pick["market_line"] = line
+            stats_filtered.append(pick)
+        picks = stats_filtered
     if not picks:
         # Build odds-unavailable context from slate
         odds_provider = "unknown"
@@ -237,8 +263,12 @@ def _build_official_picks(card: Any) -> tuple[str, list[dict[str, Any]]]:
             odds_provider = str(slate[0].get("market_context", {}).get("provider", "unknown")) if slate else "unknown"
         odds_context = f"odds_provider={odds_provider} odds_events_returned={matched_games} matched_games={matched_games} schedule_games={len(slate)}"
         if had_pre_guard_picks:
+            mode_hint = ""
+            if _stats_only_card_mode():
+                mode_hint = "STATS_ONLY_CARD_MODE is enabled but all picks were filtered (totals without projected line, etc). "
             raise ValueError(
                 f"Odds unavailable: providers returned {len(slate) - matched_games} MLB events with no market context for schedule with {len(slate)} games. "
+                f"{mode_hint}"
                 f"({odds_context}) "
                 "Set ADMIN_MARKET_OVERRIDE=true to force save."
             )
@@ -258,21 +288,31 @@ def _build_official_picks(card: Any) -> tuple[str, list[dict[str, Any]]]:
     return card_date, normalized
 
 
+def _stats_only_card_mode() -> bool:
+    """Allow official picks using stats/model edges when odds are unavailable."""
+    return os.getenv("STATS_ONLY_CARD_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+_PUBLIC_SOURCES = frozenset({
+    "mlb_auto",
+    "generate_today",
+    "force_generate_today",
+    "scheduled_generate",
+    "scheduled_t45_generation",
+    "scheduled_post",
+    "today",
+    "card_debug",
+    "save_today_picks",
+})
+
+
 def _public_market_guard_enabled(source: str) -> bool:
     """Public cards need market context unless owner explicitly overrides."""
     if os.getenv("ADMIN_MARKET_OVERRIDE", "").strip().lower() in {"1", "true", "yes", "on"}:
         return False
-    return source in {
-        "mlb_auto",
-        "generate_today",
-        "force_generate_today",
-        "scheduled_generate",
-        "scheduled_t45_generation",
-        "scheduled_post",
-        "today",
-        "card_debug",
-        "save_today_picks",
-    }
+    if _stats_only_card_mode():
+        return False
+    return source in _PUBLIC_SOURCES
 
 
 def _game_has_market_context(game_pk: Any, slate: list[dict[str, Any]]) -> bool:

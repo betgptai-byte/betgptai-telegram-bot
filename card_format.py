@@ -39,7 +39,24 @@ Please shop for the best available number before playing.
 Singles are recommended for better long-term results.
 Parlays are optional and higher risk."""
 
-TIMED_CARD_FOOTER = (
-    f"{RECOMMENDATION_FOOTER}\n\n{ODDS_SHOPPING_FOOTER}\n\n"
-    f"{CARD_TIMING_FOOTER}\n\n{GAME_TIME_FOOTER}"
-)
+STATS_ONLY_FOOTER = """
+📊 Stats-based card. Odds vary by sportsbook. Verify lines before placing any wager.
+"""
+
+
+def _stats_only_card_mode() -> bool:
+    import os
+    return os.getenv("STATS_ONLY_CARD_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def build_card_footer() -> str:
+    """Return the appropriate footer — stats-only warning when mode is active, normal timed footer otherwise."""
+    if _stats_only_card_mode():
+        return (
+            f"{RECOMMENDATION_FOOTER}\n\n{ODDS_SHOPPING_FOOTER}\n\n"
+            f"{CARD_TIMING_FOOTER}\n\n{GAME_TIME_FOOTER}\n{STATS_ONLY_FOOTER}"
+        )
+    return f"{RECOMMENDATION_FOOTER}\n\n{ODDS_SHOPPING_FOOTER}\n\n{CARD_TIMING_FOOTER}\n\n{GAME_TIME_FOOTER}"
+
+
+TIMED_CARD_FOOTER = build_card_footer()

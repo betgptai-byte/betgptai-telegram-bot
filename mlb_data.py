@@ -390,17 +390,18 @@ def _market_context_from_prices(prices: list[dict[str, Any]]) -> dict[str, Any]:
     return context
 
 
-def _build_sharp_url(sport_param: str, league: str | None, event_date: str | None, markets: str, *, sportsbook: str | None = None) -> str:
+def _build_sharp_url(sport_param: str, league: str | None, event_date: str | None, markets: str, *, sportsbook: str | None = None, endpoint: str | None = None) -> str:
     """Build a sanitized Sharp API request URL for debug display.
 
     No API key in URL — Sharp uses X-API-Key header for auth.
+    ``endpoint``: ``/odds`` (default), ``/odds/best``, or ``/events``.
     """
-    from api.sharp_odds_client import _base_url as sharp_base
+    from api.sharp_odds_client import SHARP_ENDPOINT_ODDS, _base_url as sharp_base
     base = sharp_base()
+    ep = endpoint or SHARP_ENDPOINT_ODDS
     params: dict[str, str] = {
         "sport": sport_param,
         "regions": "us",
-        "markets": markets,
         "oddsFormat": "american",
         "dateFormat": "iso",
     }
@@ -412,7 +413,7 @@ def _build_sharp_url(sport_param: str, league: str | None, event_date: str | Non
         params["commenceTimeFrom"] = f"{event_date}T00:00:00Z"
         params["commenceTimeTo"] = f"{event_date}T23:59:59Z"
     import urllib.parse
-    return f"{base}/odds?{urllib.parse.urlencode(params)}"
+    return f"{base}{ep}?{urllib.parse.urlencode(params)}"
 
 
 def _build_odds_api_url(event_date: str | None = None) -> str:
@@ -439,7 +440,7 @@ def odds_debug_payload(
     event_date: str | None = None,
 ) -> dict[str, Any]:
     """Owner-only diagnostics for odds providers by sport."""
-    from api.sharp_odds_client import MLB_MAPPINGS, SHARP_SPORT_MAP, default_sportsbook, health as sharp_health, probe_sharp_mlb, secondary_sportsbook, sharp_api_enabled, sharp_api_key
+    from api.sharp_odds_client import ALL_SPORTSBOOKS, MLB_MAPPINGS, SHARP_ENDPOINT_BEST_ODDS, SHARP_ENDPOINT_ODDS, SHARP_SPORT_MAP, _active_endpoint, _use_best_odds, default_sportsbook, health as sharp_health, probe_sharp_mlb, secondary_sportsbook, sharp_api_enabled, sharp_api_key
     from services.odds_provider_router import provider_status as router_status
 
     sport_lower = sport.lower()
@@ -448,6 +449,8 @@ def odds_debug_payload(
 
     default_sb = default_sportsbook()
     secondary_sb = secondary_sportsbook()
+    active_ep = _active_endpoint()
+    use_best = _use_best_odds()
     payload: dict[str, Any] = {
         "sport": sport_lower,
         "league": league,
@@ -473,8 +476,10 @@ def odds_debug_payload(
         "default_sportsbook": default_sb,
         "secondary_sportsbook": secondary_sb,
         "active_sportsbook": None,
-        "draftkings_games": 0,
-        "fanduel_games": 0,
+        "endpoint_used": active_ep,
+        "use_best_odds": use_best,
+        "auth_method": "X-API-Key header only",
+        "sportsbook_game_counts": {},
     }
 
     schedule: list[dict[str, Any]] = []
@@ -490,12 +495,24 @@ def odds_debug_payload(
     if sport_lower == "mlb":
         payload["odds_api_request_url"] = _build_odds_api_url(event_date=event_date or selected_date)
         payload["sharp_mlb_probes"] = []
+        # Best-odds probe
+        payload["sharp_mlb_probes"].append({
+            "url": _build_sharp_url("baseball", "MLB", event_date or selected_date, markets_requested, endpoint=SHARP_ENDPOINT_BEST_ODDS),
+            "endpoint": SHARP_ENDPOINT_BEST_ODDS,
+            "sport_param": "baseball",
+            "league": "MLB",
+            "sportsbook": None,
+            "status_code": None,
+            "games_count": 0,
+            "error": None,
+        })
         for m in MLB_MAPPINGS:
             sp = m["sport_param"]
             lg = m["league"]
             sb = m.get("sportsbook")
             payload["sharp_mlb_probes"].append({
-                "url": _build_sharp_url(sp, lg, event_date or selected_date, markets_requested, sportsbook=sb),
+                "url": _build_sharp_url(sp, lg, event_date or selected_date, markets_requested, sportsbook=sb, endpoint=SHARP_ENDPOINT_ODDS),
+                "endpoint": SHARP_ENDPOINT_ODDS,
                 "sport_param": sp,
                 "league": lg,
                 "sportsbook": sb,
@@ -510,6 +527,7 @@ def odds_debug_payload(
             event_date or selected_date,
             markets_requested,
             sportsbook=default_sb,
+            endpoint=active_ep,
         )
     else:
         cfg_map = cfg
@@ -518,6 +536,7 @@ def odds_debug_payload(
             league or cfg_map.get("league"),
             event_date or selected_date,
             markets_requested,
+            endpoint=SHARP_ENDPOINT_ODDS,
         )
         payload["odds_api_request_url"] = "N/A (sport not supported by The Odds API)"
 
@@ -563,13 +582,13 @@ def odds_debug_payload(
                     payload["sharp_mlb_probes"][i]["games_count"] = pr.get("games_count", 0)
                     payload["sharp_mlb_probes"][i]["error"] = pr.get("error")
                     payload["sharp_mlb_probes"][i]["first_matchup"] = pr.get("first_matchup")
-            # Track DraftKings vs FanDuel game counts (first probe = draftkings default, second = fanduel fallback)
+            # Track game counts per sportsbook
+            sb_counts: dict[str, int] = {}
             for p in payload["sharp_mlb_probes"]:
                 sb = p.get("sportsbook")
-                if sb == "draftkings":
-                    payload["draftkings_games"] = max(payload["draftkings_games"], p.get("games_count", 0))
-                elif sb == "fanduel":
-                    payload["fanduel_games"] = max(payload["fanduel_games"], p.get("games_count", 0))
+                if sb:
+                    sb_counts[sb] = max(sb_counts.get(sb, 0), p.get("games_count", 0))
+            payload["sportsbook_game_counts"] = sb_counts
         except Exception as prob_err:
             payload["errors"].append(f"Sharp MLB probe error: {prob_err}")
 
@@ -578,16 +597,16 @@ def odds_debug_payload(
     payload["games_returned"] = len(odds)
     # Determine active sportsbook from provider + probe data
     if odds and sport_lower == "mlb":
-        payload["active_sportsbook"] = default_sb
-        # Check if fanduel probe returned more games — if so, that's actually active
-        if payload["fanduel_games"] > payload["draftkings_games"] and payload["fanduel_games"] >= payload["games_returned"]:
-            payload["active_sportsbook"] = secondary_sb
+        sb_counts = payload.get("sportsbook_game_counts", {})
+        best_sb = max(sb_counts, key=sb_counts.get) if sb_counts else default_sb
+        payload["active_sportsbook"] = best_sb if sb_counts.get(best_sb, 0) >= payload["games_returned"] else default_sb
         payload["sharp_request_url"] = _build_sharp_url(
             cfg.get("sport_param", "baseball"),
             league or cfg.get("league"),
             event_date or selected_date,
             markets_requested,
             sportsbook=payload["active_sportsbook"],
+            endpoint=SHARP_ENDPOINT_ODDS,
         )
     if schedule:
         odds_keys = {

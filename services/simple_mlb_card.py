@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,15 +41,28 @@ _MARKET_LABELS = {
 
 
 def _stats_mode_active(slate: list[dict[str, Any]]) -> bool:
-    """True when no game carries usable market/odds context."""
+    """True when no game carries usable (real) market/odds context.
+
+    A truthy *string* in ``best_available_prices`` / ``market_context`` (e.g. a
+    serialized placeholder) must NOT count as available odds — only a dict with
+    actual price/odds data does.
+    """
     if not slate:
         return True
-    return not any(
-        game.get("odds_status") == "available"
-        or game.get("best_available_prices")
-        or game.get("market_context")
-        for game in slate
-    )
+    for game in slate:
+        if not isinstance(game, dict):
+            continue
+        ctx = game.get("market_context")
+        if isinstance(ctx, dict) and ctx.get("odds"):
+            return False
+        prices = game.get("best_available_prices")
+        if isinstance(prices, dict) and prices:
+            return False
+        if game.get("odds_status") == "available":
+            # Status alone is not enough; require accompanying real data.
+            if (isinstance(prices, (dict, list)) and prices) or (isinstance(ctx, dict) and ctx):
+                return False
+    return True
 
 
 def _quant_for(game: dict[str, Any]) -> dict[str, Any]:
@@ -126,7 +140,7 @@ def build_simple_mlb_card(card_date: str | None = None) -> dict:
     """Build a stats-only MLB card dict directly from the enriched slate."""
     from ai_analysis import upcoming_mlb_slate
     from mlb_data import get_combined_slate
-    from quant_engine import enrich_slate_with_quant_scores
+    from quant_engine import score_game
 
     selected_date = card_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     errors: list[str] = []
@@ -149,8 +163,26 @@ def build_simple_mlb_card(card_date: str | None = None) -> dict:
 
     if slate:
         try:
-            slate = enrich_slate_with_quant_scores(slate, selected_date)
-        except Exception as error:  # pragma: no cover - engine dependent
+            from quant_engine import score_game
+
+            enriched: list[dict[str, Any]] = []
+            for raw in slate:
+                # Guard: only dict games can be enriched; skip/drop anything else.
+                if not isinstance(raw, dict):
+                    continue
+                game = dict(raw)
+                try:
+                    quant = score_game(game)
+                    if isinstance(quant, dict):
+                        game["betgptai_quant_v21"] = quant
+                        game["betgptai_quant_v20"] = quant
+                        game["betgptai_internal"] = quant
+                except Exception as game_error:  # pragma: no cover - engine dependent
+                    # Best-effort enrichment: one bad game must not break the card.
+                    logging.warning("simple_mlb_card quant skip for %s: %s", game.get("game_pk"), game_error)
+                enriched.append(game)
+            slate = enriched
+        except Exception as error:  # pragma: no cover - import/setup failure
             errors.append(f"quant_enrich_failed: {error!r}")
 
     candidates: list[dict[str, Any]] = []

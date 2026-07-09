@@ -58,6 +58,15 @@ def _stats_only_mode() -> bool:
     return os.getenv("STATS_ONLY_CARD_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _strict_builder_debug() -> bool:
+    """Raise the stats-only conversion failure instead of recording it.
+
+    Off by default so production admin commands (e.g. /card_debug) never crash
+    on a conversion miss. Set STRICT_BUILDER_DEBUG=true to surface it loudly.
+    """
+    return os.getenv("STRICT_BUILDER_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _heading_text(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9 /-]", "", value).strip()
 
@@ -733,13 +742,17 @@ def build_card_from_analysis(
                          "total": "Total", "team_total": "Team Total", "parlay": "Parlay"}.get(mt, mt)
                 display_sections.setdefault(label, []).append(str(pk.selected_team or ""))
 
-    # Hard failure (spec point 8): generated sections exist but stats-only
-    # conversion still returned 0 picks. Raise before returning StructuredCard
-    # so the failure is visible in logs/trace instead of silently saving 0 picks.
-    if _stats_only_mode() and not all_picks and stats_sections_found:
-        raise RuntimeError(
-            "ACTIVE builder stats-only conversion failed before StructuredCard return"
-        )
+    # Conversion failure signal: generated sections exist but stats-only
+    # conversion still returned 0 picks. In STRICT_BUILDER_DEBUG mode this is
+    # raised before returning StructuredCard so the failure is loud. Otherwise
+    # it is recorded in metadata so admin commands keep working and the simple
+    # engine fallback remains available.
+    conversion_failed = bool(_stats_only_mode() and not all_picks and stats_sections_found)
+    conversion_error = ""
+    if conversion_failed:
+        conversion_error = "ACTIVE builder stats-only conversion failed before StructuredCard return"
+        if _strict_builder_debug():
+            raise RuntimeError(conversion_error)
 
     if not all_picks:
         error_msg = "Stats-only builder found 0 sections to convert." if _stats_only_mode() else "No structured official picks were generated."
@@ -757,6 +770,8 @@ def build_card_from_analysis(
         "builder_trace_version": BUILDER_TRACE_VERSION,
         "source_command": source_command,
         "errors": errors,
+        "builder_conversion_failed": conversion_failed,
+        "builder_conversion_error": conversion_error,
     }
     if _stats_only_mode():
         meta["market_mode"] = "stats_only"

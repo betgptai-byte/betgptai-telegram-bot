@@ -1997,7 +1997,15 @@ async def force_generate_today(update: Update, context: ContextTypes.DEFAULT_TYP
         )
     except Exception as error:
         logging.exception("Unexpected /force_generate_today error")
-        await update.message.reply_text(f"Unable to force-generate today.\n\nError: {error}")
+        await update.message.reply_text(
+            "❌ FORCE GENERATE TODAY FAILED\n\n"
+            f"Error: {error}\n\n"
+            "The advanced card pipeline did not complete. You can still publish an "
+            "emergency stats-based card without it:\n"
+            "  /simple_generate_today  → build + save simple card\n"
+            "  /simple_post_today      → post simple card to FREE channel\n"
+            "  /force_post_text_card   → post the generated card text as-is"
+        )
 
 
 async def force_post_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4420,21 +4428,50 @@ async def _build_card_debug_text() -> str:
             skipped_reasons.append("Generated picks exist, but no matched market context was found.")
     except Exception as extract_error:
         skipped_reasons.append(f"Official pick extraction failed: {extract_error!r}")
-    card_obj = await asyncio.to_thread(
-        build_card_from_analysis, analysis, slate, selected_date, "card_debug",
-    )
-    builder_count = len(card_obj.official_picks)
-    card_dict = structured_card_to_dict(card_obj)
-    dict_count = len(card_dict.get("official_picks", []))
-    card_dict["analysis"] = analysis
-    card_dict["slate"] = slate
-    card_dict["source_command"] = "card_debug"
-    persist_count = len(card_dict.get("official_picks", []))
-    save_result = await asyncio.to_thread(persist_official_card, card_dict)
-    if not save_result.get("success"):
-        skip_reason = str(save_result.get("error") or "Pick persistence failed")
+    builder_count = 0
+    dict_count = 0
+    persist_count = 0
+    builder_trace_version = "MISSING"
+    builder_error = ""
+    save_result: dict[str, Any] = {"success": False, "error": "builder_not_run"}
+    try:
+        card_obj = await asyncio.to_thread(
+            build_card_from_analysis, analysis, slate, selected_date, "card_debug",
+        )
+        builder_count = len(card_obj.official_picks)
+        builder_trace_version = card_obj.metadata.get("builder_trace_version", "MISSING")
+        if card_obj.metadata.get("builder_conversion_failed"):
+            builder_error = card_obj.metadata.get("builder_conversion_error", "stats-only conversion failed")
+        card_dict = structured_card_to_dict(card_obj)
+        dict_count = len(card_dict.get("official_picks", []))
+        card_dict["analysis"] = analysis
+        card_dict["slate"] = slate
+        card_dict["source_command"] = "card_debug"
+        persist_count = len(card_dict.get("official_picks", []))
+        save_result = await asyncio.to_thread(persist_official_card, card_dict)
+        if not save_result.get("success"):
+            skip_reason = str(save_result.get("error") or "Pick persistence failed")
+    except Exception as build_error:
+        builder_error = f"{type(build_error).__name__}: {build_error}"
+        logging.warning("/card_debug builder/persist failed: %s", builder_error)
+        save_result = {"success": False, "error": builder_error}
+
     stats_only = os.getenv("STATS_ONLY_CARD_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
     market_mode = "Stats Only" if stats_only else "Normal"
+
+    # Emergency fallback: when the advanced builder failed and we are in
+    # stats-only mode, probe the independent simple engine so the owner can
+    # recover without a working StructuredCard pipeline.
+    simple_available = "NO"
+    simple_count = 0
+    if stats_only and (builder_error or builder_count == 0):
+        try:
+            simple_card = await asyncio.to_thread(build_simple_mlb_card, selected_date)
+            simple_count = int(simple_card.get("counts", {}).get("total", 0))
+            simple_available = "YES" if simple_count > 0 else "YES (0 picks)"
+        except Exception as simple_error:
+            simple_available = f"NO ({type(simple_error).__name__})"
+
     lines = [
         "🧪 BETGPTAI CARD DEBUG",
         f"📅 Date: {display_date(selected_date)}",
@@ -4454,13 +4491,20 @@ async def _build_card_debug_text() -> str:
         f"Save result: {save_result.get('error') or 'OK'}",
         "",
         "── TRACE: official_picks count ──",
-        f"Builder Trace Version: {card_obj.metadata.get('builder_trace_version', 'MISSING')}",
+        f"Builder Trace Version: {builder_trace_version}",
         f"After build_card_from_analysis:  {builder_count}",
         f"After structured_card_to_dict:  {dict_count}",
         f"Before persist_official_card:   {persist_count}",
         f"After persist (saved):          {save_result.get('saved_pick_count', 0)}",
         f"After persist (success):        {save_result.get('success')}",
     ]
+    if builder_error:
+        lines += [
+            "",
+            "── Builder Conversion ──",
+            f"Conversion failed: YES",
+            f"Error: {builder_error}",
+        ]
     if stats_only and save_result.get("stats_section_debug"):
         sdb = save_result["stats_section_debug"]
         lines += [
@@ -4474,12 +4518,27 @@ async def _build_card_debug_text() -> str:
         if sdb.get("rejected_items"):
             for idx in range(min(len(sdb["rejected_items"]), 5)):
                 lines.append(f"  Rejected: {sdb['rejected_items'][idx][:60]} — {sdb['rejection_reasons'][idx][:80]}")
+    if stats_only:
+        lines += [
+            "",
+            "── Simple Engine Fallback ──",
+            f"Simple Engine Available: {simple_available}",
+            f"Simple Picks Count: {simple_count}",
+        ]
     lines += [
         "Skipped picks and reasons:",
         *(f"- {reason}" for reason in (skipped_reasons or [skip_reason or "No skip reason reported."])),
     ]
     if skip_reason and not skipped_reasons:
         lines.append(f"Official picks skipped reason: {skip_reason}")
+    lines += [
+        "",
+        "── Emergency Options ──",
+        "/simple_card_debug",
+        "/simple_generate_today",
+        "/simple_post_today",
+        "/force_post_text_card",
+    ]
     return "\n".join(lines).strip()
 
 

@@ -4431,6 +4431,21 @@ async def _build_card_debug_text() -> str:
         f"Trackable picks saved this run: {save_result.get('saved_pick_count', 0)}",
         f"Save success: {'yes' if save_result.get('success') else 'no'}",
         f"Save result: {save_result.get('error') or 'OK'}",
+    ]
+    if stats_only and save_result.get("stats_section_debug"):
+        sdb = save_result["stats_section_debug"]
+        lines += [
+            "",
+            "── Stats-Only Section Build ──",
+            f"Sections found: {sdb.get('sections_found_count', 0)}",
+            f"Item counts: {sdb.get('section_item_counts', {})}",
+            f"Converted: {sdb.get('total_converted', 0)}",
+            f"Rejected: {sdb.get('total_rejected', 0)}",
+        ]
+        if sdb.get("rejected_items"):
+            for idx in range(min(len(sdb["rejected_items"]), 5)):
+                lines.append(f"  Rejected: {sdb['rejected_items'][idx][:60]} — {sdb['rejection_reasons'][idx][:80]}")
+    lines += [
         "Skipped picks and reasons:",
         *(f"- {reason}" for reason in (skipped_reasons or [skip_reason or "No skip reason reported."])),
     ]

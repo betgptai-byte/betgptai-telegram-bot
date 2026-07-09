@@ -224,6 +224,15 @@ def _build_official_picks(card: Any) -> tuple[str, list[dict[str, Any]]]:
         picks = rt.extract_official_picks(analysis, slate, card_date, source)
     picks.extend(rt._approved_prop_records(card_date, source))  # approved admin props, if any
     had_pre_guard_picks = bool(picks)
+    if not had_pre_guard_picks and _stats_only_card_mode() and source in _PUBLIC_SOURCES and analysis:
+        # Both structured path and legacy parser returned 0 picks.
+        # Build picks from the analysis text sections directly (stats-only fallback).
+        _stats_section_log = _build_picks_from_sections(analysis, slate, card_date, source, picks)
+        picks = _stats_section_log["picks"]
+        had_pre_guard_picks = bool(picks)
+        # Attach debug log to card so save_official_card can surface it
+        if isinstance(card, dict):
+            card["_stats_section_debug"] = _stats_section_log
     if _public_market_guard_enabled(source):
         picks = _filter_public_market_context(picks, slate)
     elif _stats_only_card_mode() and source in _PUBLIC_SOURCES:
@@ -291,6 +300,288 @@ def _build_official_picks(card: Any) -> tuple[str, list[dict[str, Any]]]:
 def _stats_only_card_mode() -> bool:
     """Allow official picks using stats/model edges when odds are unavailable."""
     return os.getenv("STATS_ONLY_CARD_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+_STATS_SECTION_HEADINGS: list[tuple[str, str]] = [
+    ("moneyline", "🔥 PLAY OF THE DAY"),
+    ("moneyline", "🏆 TOP 2 MONEYLINE"),
+    ("moneyline", "🏆 TOP 5 MONEYLINE"),
+    ("f5_moneyline", "🔥 TOP 2 F5 MONEYLINE"),
+    ("f5_moneyline", "🔥 TOP 5 F5"),
+    ("f5_moneyline", "🔥 F5 MONEYLINE LEAN"),
+    ("runline", "📈 TOP 2 RUNLINE/SPREAD"),
+    ("runline", "📈 TOP 5 RUNLINE/SPREAD"),
+    ("runline", "📈 TOP 5 RUN LINE"),
+    ("total", "🎯 TOP 2 OVER/UNDER TOTAL RUNS"),
+    ("total", "🎯 TOP 5 OVER/UNDER TOTAL RUNS"),
+    ("total", "🎯 TOP 5 GAME TOTALS"),
+    ("team_total", "💰 TOP 2 TEAM TOTALS"),
+    ("team_total", "💰 TEAM TOTAL ANGLE"),
+    ("team_total", "💰 TOP 5 TEAM TOTALS"),
+    ("parlay", "🧩 2-LEG SAFE PARLAY"),
+    ("parlay", "🧩 SAFE PARLAY OF THE DAY"),
+]
+
+
+def _normalize_team_text(name: str) -> str:
+    """Lowercase and strip non-alphanumeric for fuzzy team matching."""
+    import re
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def _team_key(selection: str) -> str:
+    """Normalized search key from a pick line (e.g. 'New York Yankees -150' → 'newyorkyankees150')."""
+    return _normalize_team_text(selection)
+
+
+def _match_game(selection: str, slate: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Match a pick line to a slate game by normalized team name."""
+    skey = _team_key(selection)
+    matches: list[dict[str, Any]] = []
+    for game in slate:
+        for k in ("away_team", "home_team"):
+            full = _normalize_team_text(str(game.get(k, "")))
+            nick = _normalize_team_text(str(game.get(k, "")).split()[-1]) if game.get(k) else ""
+            if (full and full in skey) or (len(nick) >= 3 and nick in skey):
+                matches.append(game)
+                break
+    if len(matches) == 1:
+        return matches[0]
+    unique = {g.get("game_pk") or g.get("game_id"): g for g in matches}
+    return next(iter(unique.values())) if len(unique) == 1 else None
+
+
+def _extract_team_from_selection(selection: str, game: dict[str, Any]) -> str | None:
+    """Return which side (away/home) the selection refers to, if any."""
+    away = str(game.get("away_team", ""))
+    home = str(game.get("home_team", ""))
+    norm_away = _normalize_team_text(away)
+    norm_home = _normalize_team_text(home)
+    norm_sel = _normalize_team_text(selection)
+    if norm_away and norm_away in norm_sel:
+        return away
+    if norm_home and norm_home in norm_sel:
+        return home
+    return None
+
+
+def _stats_market_type(category: str) -> str:
+    return {
+        "moneyline": "moneyline",
+        "f5_moneyline": "f5_moneyline",
+        "runline": "runline",
+        "total": "total",
+        "team_total": "team_total",
+        "parlay": "parlay",
+    }.get(category, "moneyline")
+
+
+def _parse_line_value(selection: str, market_type: str) -> float | None:
+    """Extract a numeric line from the pick text (totals, team-totals, runlines)."""
+    import re
+    if market_type in ("total", "team_total"):
+        m = re.search(r"(?:Over|Under)\s+(\d+(?:\.\d+)?)", selection, flags=re.I)
+        return float(m.group(1)) if m else None
+    if market_type == "runline":
+        m = re.search(r"[+-]\d+(?:\.\d+)?", selection)
+        return float(m.group()) if m else None
+    return None
+
+
+def _extract_section_content(analysis: str, heading: str) -> str:
+    """Return content between *heading* and the next divider or section heading."""
+    start = analysis.find(heading)
+    if start < 0:
+        return ""
+    body_start = start + len(heading)
+    # Find next section heading or divider
+    rest = analysis[body_start:]
+    end = len(analysis)
+    for marker in ("\n---", "\n━━━", "\n🔥", "\n🏆", "\n📈", "\n🎯", "\n💰", "\n🧩"):
+        pos = analysis.find(marker, body_start + 1)
+        if pos >= 0:
+            end = min(end, pos)
+    return analysis[body_start:end].strip() if end > body_start else rest.strip()
+
+
+def _parse_pick_lines_from_section(content: str) -> list[str]:
+    """Extract individual pick lines from a section body."""
+    lines: list[str] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Strip leading emoji/number bullets
+        cleaned = re.sub(r"^[⚾1️⃣2️⃣3️⃣4️⃣5️⃣✅*_`\d.)\s]+", "", stripped).strip()
+        if not cleaned:
+            continue
+        if cleaned.startswith(("Risk", "Line", "Safer", "No", "None", "Unavailable", "🆚")):
+            continue
+        if len(cleaned) < 5:
+            continue
+        lines.append(cleaned)
+    return lines
+
+
+def _build_picks_from_sections(
+    analysis: str,
+    slate: list[dict[str, Any]],
+    card_date: str,
+    source: str,
+    existing_picks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Parse analysis text sections into stats-only pick dicts.
+
+    Only called when the structured path and legacy parser both returned 0 picks
+    and STATS_ONLY_CARD_MODE is enabled.  Returns a debug log dict with keys:
+      picks, sections_found, section_item_counts, rejected_items, rejection_reasons.
+    """
+    import hashlib
+    import re as _re
+    from datetime import datetime, timezone
+
+    log: dict[str, Any] = {
+        "picks": list(existing_picks),
+        "sections_found": [],
+        "section_item_counts": {},
+        "rejected_items": [],
+        "rejection_reasons": [],
+    }
+
+    for category, heading in _STATS_SECTION_HEADINGS:
+        if heading not in analysis:
+            continue
+        content = _extract_section_content(analysis, heading)
+        if not content:
+            continue
+        log["sections_found"].append(heading)
+
+        if category == "parlay":
+            # Parlay legs: find ✅ lines
+            import re as _re2
+            leg_lines = _re2.findall(r"(?m)^✅\s+(.+)$", content)[:2]
+            log["section_item_counts"][heading] = len(leg_lines)
+            if len(leg_lines) == 2:
+                for leg in leg_lines:
+                    game = _match_game(leg, slate)
+                    if not game:
+                        log["rejected_items"].append(leg)
+                        log["rejection_reasons"].append(f"Parlay leg no game match: {leg[:60]}")
+                        continue
+                    pick = _build_single_stats_pick(leg, "moneyline", game, card_date)
+                    if pick:
+                        log["picks"].append(pick)
+                    else:
+                        log["rejected_items"].append(leg)
+                        log["rejection_reasons"].append(f"Parlay leg build failed: {leg[:60]}")
+            continue
+
+        pick_lines = _parse_pick_lines_from_section(content)
+        log["section_item_counts"][heading] = len(pick_lines)
+
+        for line in pick_lines:
+            market_type = _stats_market_type(category)
+            game = _match_game(line, slate)
+
+            if not game:
+                log["rejected_items"].append(line)
+                log["rejection_reasons"].append(f"No game match for market={market_type}: {line[:60]}")
+                continue
+
+            # For totals/team-totals, require a line value
+            line_value = _parse_line_value(line, market_type)
+            if market_type in ("total", "team_total") and line_value is None:
+                log["rejected_items"].append(line)
+                log["rejection_reasons"].append(f"No line value for {market_type}: {line[:60]}")
+                continue
+
+            pick = _build_single_stats_pick(line, market_type, game, card_date, line_value=line_value)
+            if pick:
+                log["picks"].append(pick)
+            else:
+                log["rejected_items"].append(line)
+                log["rejection_reasons"].append(f"Pick build failed for market={market_type}: {line[:60]}")
+
+    # Write section-build debug log
+    _log_storage({
+        "component": "pick_persistence",
+        "event": "stats_sections_build",
+        "card_date": card_date,
+        "source": source,
+        "sections_found_count": len(log["sections_found"]),
+        "section_item_counts": log["section_item_counts"],
+        "total_converted": len(log["picks"]) - len(existing_picks),
+        "total_rejected": len(log["rejected_items"]),
+    })
+    return log
+
+
+def _build_single_stats_pick(
+    selection: str,
+    market_type: str,
+    game: dict[str, Any],
+    card_date: str,
+    line_value: float | None = None,
+) -> dict[str, Any] | None:
+    """Build a single pick dict from a selection line (stats-only, no odds required)."""
+    import hashlib
+
+    selected_team: str | None = None
+    opponent: str | None = None
+    away = str(game.get("away_team", ""))
+    home = str(game.get("home_team", ""))
+
+    if market_type not in ("total", "parlay"):
+        selected_team = _extract_team_from_selection(selection, game)
+        if not selected_team:
+            # Fallback: try the longer team name match
+            norm_sel = _normalize_team_text(selection)
+            for t in (away, home):
+                if _normalize_team_text(t) and _normalize_team_text(t) in norm_sel:
+                    selected_team = t
+                    break
+        if selected_team:
+            opponent = home if _normalize_team_text(selected_team) == _normalize_team_text(away) else away
+
+    game_pk = game.get("game_pk") or game.get("game_id")
+    if isinstance(game_pk, list):
+        game_pk = game_pk[0] if game_pk else None
+
+    quant = game.get("betgptai_quant_v20") or game.get("betgptai_internal") or {}
+    if isinstance(quant, dict) and isinstance(quant.get("v20"), dict):
+        quant = quant["v20"]
+
+    raw_id = "|".join(str(p or "") for p in [card_date, str(game_pk), market_type, selected_team or "", str(line_value or "")])
+    pick_id = hashlib.sha1(raw_id.encode("utf-8")).hexdigest()[:16]
+
+    return {
+        "pick_id": pick_id,
+        "sport": "mlb",
+        "league": "MLB",
+        "card_date": card_date,
+        "game_pk": int(game_pk) if game_pk is not None else None,
+        "away_team": away,
+        "home_team": home,
+        "selected_team": selected_team,
+        "opponent": opponent,
+        "market": market_type,
+        "market_type": market_type,
+        "market_line": line_value,
+        "odds": None,
+        "confidence": quant.get("confidence"),
+        "edge_score": quant.get("final_edge_score") or quant.get("edge_score"),
+        "risk": quant.get("risk_level") or quant.get("risk"),
+        "units": 1.0,
+        "reason": "",
+        "status": "pending",
+        "result": None,
+        "model_version": "BETGPTAI v20.0",
+        "odds_status": "unavailable",
+        "market_context_status": "stats_only",
+        "sportsbook": "none",
+        "posted_line": None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 _PUBLIC_SOURCES = frozenset({
@@ -422,6 +713,7 @@ def save_official_card(card: Any) -> dict[str, Any]:
                     "card_date": card_date,
                     "error": repr(snap_error),
                 })
+            sdb = card.get("_stats_section_debug") if isinstance(card, dict) else None
             status = {
                 "success": True,
                 "error": "",
@@ -429,6 +721,7 @@ def save_official_card(card: Any) -> dict[str, Any]:
                 "card_date": card_date,
                 "path": str(PICKS_FILE),
                 "last_save_time": _now_iso(),
+                "stats_section_debug": sdb,
             }
             _write_status(status)
             return status

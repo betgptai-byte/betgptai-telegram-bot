@@ -391,11 +391,13 @@ def _market_context_from_prices(prices: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _build_sharp_url(sport_param: str, league: str | None, event_date: str | None, markets: str, *, sportsbook: str | None = None) -> str:
-    """Build a sanitized Sharp API request URL for debug display."""
+    """Build a sanitized Sharp API request URL for debug display.
+
+    No API key in URL — Sharp uses X-API-Key header for auth.
+    """
     from api.sharp_odds_client import _base_url as sharp_base
     base = sharp_base()
     params: dict[str, str] = {
-        "apiKey": "REDACTED",
         "sport": sport_param,
         "regions": "us",
         "markets": markets,

@@ -3825,6 +3825,7 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
         "── Sharp API ──",
         f"Enabled: {'yes' if payload.get('sharp_api_enabled') else 'no'}",
         f"Key loaded: {'yes' if payload.get('sharp_api_key_loaded') else 'no'}",
+        f"Auth method: X-API-Key header (fallback: api_key query param)",
         f"Cache age: {cache_str}",
         f"Cache fresh: {'yes' if sharp.get('cache_fresh') else 'no'}",
         f"Sportsbook used: {active_sb or 'none'}",
@@ -3976,6 +3977,7 @@ async def odds_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         ]
         sharp_url = payload.get("sharp_request_url") or "N/A"
         lines.append(f"Primary URL: {sharp_url}")
+        lines.append(f"Auth method: X-API-Key header (fallback: api_key query param)")
         lines.append(f"Default sportsbook: {payload.get('default_sportsbook', 'draftkings')}")
         lines.append(f"Secondary sportsbook: {payload.get('secondary_sportsbook', 'fanduel')}")
         lines.append(f"Active sportsbook: {payload.get('active_sportsbook') or 'none'}")

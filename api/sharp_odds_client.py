@@ -204,10 +204,12 @@ def build_sharp_odds_url(
     markets: str | None = None,
     sportsbook: str | None = None,
 ) -> str:
-    """Build the Sharp API request URL with REDACTED key for debug display."""
+    """Build the Sharp API request URL for debug display (no key exposed).
+
+    Auth is sent via X-API-Key header, not in the URL.
+    """
     base = _base_url()
     params: dict[str, str] = {
-        "apiKey": "REDACTED",
         "sport": sport_param,
         "regions": "us",
         "markets": markets or "h2h,spreads,totals,team_totals",
@@ -225,6 +227,19 @@ def build_sharp_odds_url(
     return f"{base}/odds?{urllib.parse.urlencode(params)}"
 
 
+def _do_sharp_request(
+    url: str,
+    params: dict[str, str],
+    headers: dict[str, str] | None,
+) -> requests.Response:
+    """Send one Sharp API GET, returning the response or raising."""
+    _throttle()
+    try:
+        return requests.get(url, params=params, headers=headers, timeout=20)
+    except requests.RequestException as exc:
+        raise SharpAPIError(f"Sharp API request failed: {exc}") from exc
+
+
 def _sharpen_request(
     sport_param: str,
     league: str | None,
@@ -236,16 +251,17 @@ def _sharpen_request(
     *,
     sportsbook: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Make one Sharp API request and return normalized events."""
+    """Make one Sharp API request and return normalized events.
+
+    Auth: X-API-Key header (primary).  If Sharp responds 401 with
+    ``missing_api_key``, falls back once to ``api_key`` query param."""
     cached = _cache_read(cache_key)
     if cached is not None:
         logger.debug("Sharp cache HIT for %s", cache_key)
         return cached
 
     url = f"{base_url}/odds"
-    _throttle()
     params: dict[str, str] = {
-        "apiKey": api_key,
         "sport": sport_param,
         "regions": "us",
         "markets": markets,
@@ -260,10 +276,16 @@ def _sharpen_request(
         params["commenceTimeFrom"] = f"{event_date}T00:00:00Z"
         params["commenceTimeTo"] = f"{event_date}T23:59:59Z"
 
-    try:
-        resp = requests.get(url, params=params, timeout=20)
-    except requests.RequestException as exc:
-        raise SharpAPIError(f"Sharp API request failed: {exc}") from exc
+    # Primary: X-API-Key header
+    headers = {"X-API-Key": api_key}
+    resp = _do_sharp_request(url, params, headers)
+
+    # Fallback: if 401 missing_api_key, try api_key query param
+    if resp.status_code == 401 and "missing_api_key" in (resp.text or "").lower():
+        logger.warning("Sharp X-API-Key header rejected (401) — falling back to api_key query param")
+        params["api_key"] = api_key
+        headers = None
+        resp = _do_sharp_request(url, params, headers)
 
     if resp.status_code == 429:
         raise SharpRateLimitError("Sharp API rate limit hit (429)")

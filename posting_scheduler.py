@@ -23,14 +23,16 @@ import requests
 
 from ai_analysis import analyze_mlb_slate, get_last_analysis_metadata
 from ai_learning_engine import render_auto_apply_notification, render_learning_report, run_learning_review
-from card_time import EASTERN, official_sports_date
+from card_time import EASTERN, official_sports_date, tomorrow_sports_date
 from core.builder import build_card_from_analysis
 from core.card import structured_card_to_dict
 from daily_workflow import (
     generate_cards_job,
+    get_first_mlb_pitch,
     post_cards_job,
     pregame_verify_job,
     schedule_times,
+    seconds_until_next_job,
     time_debug_payload,
     workflow_status,
 )
@@ -666,6 +668,55 @@ def scheduler_status_text(day: str | None = None) -> str:
 def post_status_text(day: str | None = None) -> str:
     """Owner-facing status for automatic T-43 channel posting."""
     selected_day = day or official_sports_date().isoformat()
+    today_str = official_sports_date().isoformat()
+    now = now_et()
+
+    # ── Detect whether today's workflow window has ended ──────────────
+    first_pitch = get_first_mlb_pitch(selected_day)
+    window_ended = False
+    games_final = 0
+    total_games = 0
+    if first_pitch is not None and now > first_pitch:
+        window_ended = True
+    try:
+        schedule = get_mlb_schedule(selected_day)
+        total_games = len(schedule)
+        games_final = sum(
+            1 for game in schedule
+            if str(game.get("status", "")).lower() == "final"
+        )
+        if total_games > 0 and games_final == total_games:
+            window_ended = True
+    except Exception:
+        pass
+
+    if selected_day == today_str and window_ended:
+        payload = workflow_status(selected_day)
+        generation = payload.get("generation") if isinstance(payload.get("generation"), dict) else {}
+        created_at = str(generation.get("created_at") or "")
+        state_age_str = "unknown"
+        if created_at:
+            try:
+                created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                age_minutes = int((now - created).total_seconds() / 60)
+                state_age_str = f"{age_minutes} min"
+            except Exception:
+                pass
+        next_slate = tomorrow_sports_date(now).isoformat()
+        next_seconds = seconds_until_next_job(next_slate)
+        next_workflow = f"~{next_seconds // 60} min" if next_seconds is not None else "Unavailable"
+        return (
+            "📡 BETGPTAI POST STATUS\n\n"
+            "Today's workflow ended.\n"
+            "Last failed state is historical.\n\n"
+            f"Workflow Date: {display_date(selected_day)}\n"
+            f"Workflow State Age: {state_age_str}\n"
+            f"Games Final: {games_final}/{total_games}\n"
+            f"Next Slate Date: {display_date(next_slate)}\n"
+            f"Next Scheduled Workflow: {next_workflow}"
+        )
+
+    # ── Active workflow display ───────────────────────────────────────
     payload = workflow_status(selected_day)
     verification = payload.get("verification") if isinstance(payload.get("verification"), dict) else {}
     generation = payload.get("generation") if isinstance(payload.get("generation"), dict) else {}

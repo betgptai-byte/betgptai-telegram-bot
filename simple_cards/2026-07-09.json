@@ -1,0 +1,96 @@
+{
+  "source": "simple_mlb_card_v1",
+  "date": "2026-07-09",
+  "generated_at": "2026-07-09T19:02:01.112312+00:00",
+  "market_mode": "stats_only",
+  "stats_only": true,
+  "odds_status": "unavailable",
+  "picks": [
+    {
+      "id": "2a7df2178339bd8c",
+      "date": "2026-07-09",
+      "market": "play_of_day",
+      "team": "Los Angeles Dodgers",
+      "opponent": "Atlanta Braves",
+      "game_id": 2,
+      "pick": "Los Angeles Dodgers (play_of_day)",
+      "confidence": "PASS",
+      "edge_score": 60.9,
+      "market_mode": "stats_only",
+      "odds_status": "unavailable",
+      "sportsbook": "none",
+      "posted_line": null,
+      "line_verified": false,
+      "trackable": true,
+      "source": "simple_mlb_card_v1",
+      "parlay_leg": false,
+      "game_time": "2026-07-09T20:10:00Z",
+      "model_version": "BETGPTAI v21.0"
+    },
+    {
+      "id": "2c8a4d85d8126f32",
+      "date": "2026-07-09",
+      "market": "moneyline",
+      "team": "Houston Astros",
+      "opponent": "Chicago Cubs",
+      "game_id": 3,
+      "pick": "Houston Astros (moneyline)",
+      "confidence": "PASS",
+      "edge_score": 60.7,
+      "market_mode": "stats_only",
+      "odds_status": "unavailable",
+      "sportsbook": "none",
+      "posted_line": null,
+      "line_verified": false,
+      "trackable": true,
+      "source": "simple_mlb_card_v1",
+      "parlay_leg": false,
+      "game_time": "2026-07-09T21:15:00Z",
+      "model_version": "BETGPTAI v21.0"
+    },
+    {
+      "id": "d6a615fc7c246eca",
+      "date": "2026-07-09",
+      "market": "moneyline",
+      "team": "Boston Red Sox",
+      "opponent": "New York Yankees",
+      "game_id": 1,
+      "pick": "Boston Red Sox (moneyline)",
+      "confidence": "PASS",
+      "edge_score": 60.6,
+      "market_mode": "stats_only",
+      "odds_status": "unavailable",
+      "sportsbook": "none",
+      "posted_line": null,
+      "line_verified": false,
+      "trackable": true,
+      "source": "simple_mlb_card_v1",
+      "parlay_leg": false,
+      "game_time": "2026-07-09T19:05:00Z",
+      "model_version": "BETGPTAI v21.0"
+    }
+  ],
+  "parlay": [],
+  "sections": {
+    "play_of_day": [
+      "2a7df2178339bd8c"
+    ],
+    "moneylines": [
+      "2c8a4d85d8126f32",
+      "d6a615fc7c246eca"
+    ],
+    "f5": [],
+    "runlines": [],
+    "core_five": []
+  },
+  "counts": {
+    "play_of_day": 1,
+    "moneyline": 2,
+    "f5_moneyline": 0,
+    "runline": 0,
+    "parlay_legs": 0,
+    "core_five": 0,
+    "total": 3
+  },
+  "errors": []
+}

@@ -39,6 +39,11 @@ from ai_analysis import (
     get_last_analysis_metadata,
     upcoming_mlb_slate,
 )
+from services.simple_mlb_card import (
+    build_simple_mlb_card,
+    post_simple_mlb_card,
+    save_simple_mlb_card,
+)
 from ai_learning_engine import (
     approve_weight_update as approve_learning_weight_update,
     learning_status_payload,
@@ -4449,6 +4454,7 @@ async def _build_card_debug_text() -> str:
         f"Save result: {save_result.get('error') or 'OK'}",
         "",
         "── TRACE: official_picks count ──",
+        f"Builder Trace Version: {card_obj.metadata.get('builder_trace_version', 'MISSING')}",
         f"After build_card_from_analysis:  {builder_count}",
         f"After structured_card_to_dict:  {dict_count}",
         f"Before persist_official_card:   {persist_count}",
@@ -4491,6 +4497,167 @@ async def card_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except Exception as error:
         logging.exception("/card_debug failed")
         await update.message.reply_text(f"/card_debug failed:\n{error!r}")
+
+
+async def force_post_text_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only emergency post of the generated MLB card text to FREE_CHANNEL_ID.
+
+    Posts the same AI-generated card text that /card_debug inspects, even when
+    the StructuredCard official_picks count is 0.  This does NOT mark the normal
+    workflow complete, does NOT mark picks saved, and does NOT create fake picks.
+    """
+    del context
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id != OWNER_TELEGRAM_ID:
+        return
+    if not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+    await update.message.reply_text("⏳ Generating card text for emergency free-channel post...")
+    try:
+        slate = await asyncio.to_thread(
+            get_combined_slate,
+            os.getenv("ODDS_API_KEY", ""),
+            game_date=selected_date,
+            highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+        )
+        slate = upcoming_mlb_slate(slate)
+        if not slate:
+            await update.message.reply_text("❌ No upcoming MLB games available; cannot post emergency card.")
+            return
+        try:
+            analysis = await analyze_mlb_slate(
+                slate,
+                os.getenv("OPENAI_API_KEY", ""),
+                os.getenv("ANTHROPIC_API_KEY", ""),
+            )
+        except Exception as error:
+            analysis = build_fallback_card(slate)
+            logging.warning("force_post_text_card used fallback card: %s", error)
+        footer = (
+            "Emergency stats-based card. Odds vary by sportsbook. "
+            "Verify lines before placing any wager."
+        )
+        message = f"{analysis.strip()}\n\n━━━━━━━━━━━━\n\n{footer}"
+
+        chat_id = _telegram_destination(os.getenv("FREE_CHANNEL_ID", ""))
+        remaining = message.strip()
+        posted = 0
+        while remaining:
+            if len(remaining) <= 3900:
+                chunk, remaining = remaining, ""
+            else:
+                split_at = remaining.rfind("\n\n", 0, 3900)
+                if split_at < 1:
+                    split_at = remaining.rfind("\n", 0, 3900)
+                if split_at < 1:
+                    split_at = 3900
+                chunk, remaining = remaining[:split_at], remaining[split_at:].lstrip()
+            await context.bot.send_message(chat_id=chat_id, text=chunk)
+            posted += 1
+
+        SYSTEM_LOG.info(
+            "component=ForcePostTextCard status=posted source=manual_emergency_text_post "
+            "market_mode=stats_only tracked=false channel=FREE_CHANNEL_ID date=%s chunks=%s",
+            selected_date, posted,
+        )
+        await update.message.reply_text(
+            "Emergency text card posted to free channel.\n"
+            "Tracked picks: NO\n"
+            "Snapshot: NO\n"
+            "Reason: StructuredCard official_picks empty."
+        )
+    except Exception as error:
+        logging.exception("/force_post_text_card failed")
+        await update.message.reply_text(f"❌ Emergency post failed:\n{error!r}")
+
+
+async def simple_card_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: build the simple stats-only card and show pick counts by market."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+    await update.message.reply_text("⏳ Building simple MLB card debug...")
+    try:
+        card = await asyncio.to_thread(build_simple_mlb_card, selected_date)
+        counts = card.get("counts", {})
+        errors = card.get("errors", [])
+        path = services_simple_path(selected_date)
+        lines = [
+            "🧪 SIMPLE MLB CARD DEBUG",
+            f"📅 Date: {selected_date}",
+            f"Mode: {'Stats Only' if card.get('stats_only') else 'Normal'}",
+            "",
+            "Picks by market:",
+            f"- Play of the Day: {counts.get('play_of_day', 0)}",
+            f"- Moneylines: {counts.get('moneyline', 0)}",
+            f"- F5 Moneylines: {counts.get('f5_moneyline', 0)}",
+            f"- Runlines: {counts.get('runline', 0)}",
+            f"- Parlay legs: {counts.get('parlay_legs', 0)}",
+            f"- Core Five: {counts.get('core_five', 0)}",
+            f"- TOTAL: {counts.get('total', 0)}",
+            "",
+            f"Saved path: {path}",
+            f"Errors: {errors if errors else 'none'}",
+        ]
+        await _send_long_message(update, "\n".join(lines))
+    except Exception as error:
+        logging.exception("/simple_card_debug failed")
+        await update.message.reply_text(f"❌ Simple card debug failed:\n{error!r}")
+
+
+async def simple_generate_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: build and save today's simple MLB card."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+    await update.message.reply_text("⏳ Building and saving simple MLB card...")
+    try:
+        card = await asyncio.to_thread(build_simple_mlb_card, selected_date)
+        path = await asyncio.to_thread(save_simple_mlb_card, card)
+        await update.message.reply_text(
+            f"✅ Simple card generated.\n\n"
+            f"Saved picks: {card.get('counts', {}).get('total', 0)}\n"
+            f"Path: {path}"
+        )
+    except Exception as error:
+        logging.exception("/simple_generate_today failed")
+        await update.message.reply_text(f"❌ Simple generate failed:\n{error!r}")
+
+
+async def simple_post_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: load (or build+save) the simple card and post to FREE_CHANNEL_ID."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+    await update.message.reply_text("⏳ Loading simple MLB card for posting...")
+    try:
+        path = services_simple_path(selected_date)
+        import json as _json
+        if Path(str(path)).exists():
+            card = _json.loads(Path(str(path)).read_text(encoding="utf-8"))
+        else:
+            card = await asyncio.to_thread(build_simple_mlb_card, selected_date)
+            path = await asyncio.to_thread(save_simple_mlb_card, card)
+        channel = os.getenv("FREE_CHANNEL_ID", "")
+        posted = await asyncio.to_thread(post_simple_mlb_card, card, channel, context.bot)
+        await update.message.reply_text(
+            f"{'✅ Simple card posted to FREE channel.' if posted else '❌ Post failed (check FREE_CHANNEL_ID).'}\n"
+            f"Saved picks: {card.get('counts', {}).get('total', 0)}\n"
+            f"Path: {path}"
+        )
+    except Exception as error:
+        logging.exception("/simple_post_today failed")
+        await update.message.reply_text(f"❌ Simple post failed:\n{error!r}")
+
+
+def services_simple_path(card_date: str) -> str:
+    """Return the expected saved path for a simple card (mirrors simple_mlb_card)."""
+    from storage import DATA_DIR
+    return str(DATA_DIR / "simple_cards" / f"{card_date}.json")
 
 
 async def mlb_top5_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5965,6 +6132,18 @@ async def main() -> None:
     application.add_handler(CommandHandler("card_debug", card_debug))
     SYSTEM_LOG.info("Registered command: /card_debug")
     print("Registered command: /card_debug", flush=True)
+    application.add_handler(CommandHandler("force_post_text_card", force_post_text_card))
+    SYSTEM_LOG.info("Registered command: /force_post_text_card")
+    print("Registered command: /force_post_text_card", flush=True)
+    application.add_handler(CommandHandler("simple_card_debug", simple_card_debug))
+    SYSTEM_LOG.info("Registered command: /simple_card_debug")
+    print("Registered command: /simple_card_debug", flush=True)
+    application.add_handler(CommandHandler("simple_generate_today", simple_generate_today))
+    SYSTEM_LOG.info("Registered command: /simple_generate_today")
+    print("Registered command: /simple_generate_today", flush=True)
+    application.add_handler(CommandHandler("simple_post_today", simple_post_today))
+    SYSTEM_LOG.info("Registered command: /simple_post_today")
+    print("Registered command: /simple_post_today", flush=True)
     application.add_handler(CommandHandler("workflow_debug", workflow_debug_handler))
     SYSTEM_LOG.info("Registered command: /workflow_debug")
     print("Registered command: /workflow_debug", flush=True)

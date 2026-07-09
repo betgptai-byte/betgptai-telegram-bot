@@ -1,0 +1,362 @@
+"""SIMPLE MLB CARD ENGINE v1 — parallel emergency-stable card path.
+
+This module is intentionally independent of the advanced StructuredCard
+pipeline.  It builds official picks directly from the quant-enriched slate
+and never:
+
+  * parses Telegram card text,
+  * requires ``StructuredCard`` / ``build_card_from_analysis``,
+  * requires ``extract_official_picks``,
+  * requires ``best_available_prices`` or any sportsbook odds.
+
+When odds are unavailable it runs in stats-only mode and still produces a
+graded, saved card so the free channel always has content.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from storage import DATA_DIR
+
+
+SIMPLE_CARD_DIR = DATA_DIR / "simple_cards"
+SIMPLE_CARD_DIR.mkdir(parents=True, exist_ok=True)
+
+SOURCE = "simple_mlb_card_v1"
+MARKET_MODE = "stats_only"
+
+_MARKET_LABELS = {
+    "play_of_day": "🔥 PLAY OF THE DAY",
+    "moneyline": "🏆 TOP MONEYLINES",
+    "f5_moneyline": "🔥 TOP F5",
+    "runline": "📈 TOP RUNLINES",
+}
+
+
+def _stats_mode_active(slate: list[dict[str, Any]]) -> bool:
+    """True when no game carries usable market/odds context."""
+    if not slate:
+        return True
+    return not any(
+        game.get("odds_status") == "available"
+        or game.get("best_available_prices")
+        or game.get("market_context")
+        for game in slate
+    )
+
+
+def _quant_for(game: dict[str, Any]) -> dict[str, Any]:
+    quant = (
+        game.get("betgptai_quant_v21")
+        or game.get("betgptai_quant_v20")
+        or game.get("betgptai_internal")
+        or {}
+    )
+    if isinstance(quant, dict) and isinstance(quant.get("v20"), dict):
+        quant = quant["v20"]
+    return quant if isinstance(quant, dict) else {}
+
+
+def _favored_side(game: dict[str, Any]) -> tuple[str, str]:
+    """Pick the side the model leans using stats-only signals.
+
+    Uses recent 10-game form first; falls back to home field when form is
+    tied or unavailable.  Returns (team, opponent).
+    """
+    away = str(game.get("away_team", "")).strip()
+    home = str(game.get("home_team", "")).strip()
+    away_wins = float(game.get("away_last_10_wins") or 0)
+    home_wins = float(game.get("home_last_10_wins") or 0)
+    if away_wins and home_wins and away_wins != home_wins:
+        team, opponent = (away, home) if away_wins > home_wins else (home, away)
+    else:
+        team, opponent = (home, away)
+    return team, opponent
+
+
+def _stable_id(*parts: str) -> str:
+    raw = "|".join(str(p) for p in parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _make_pick(
+    card_date: str,
+    market: str,
+    game: dict[str, Any],
+    team: str,
+    opponent: str,
+    quant: dict[str, Any],
+    *,
+    line: float | None = None,
+    parlay_leg: bool = False,
+) -> dict[str, Any]:
+    game_pk = game.get("game_pk") or game.get("game_id")
+    edge = quant.get("final_edge_score")
+    confidence = quant.get("confidence")
+    return {
+        "id": _stable_id(SOURCE, card_date, str(game_pk), market, team, str(line or "")),
+        "date": card_date,
+        "market": market,
+        "team": team,
+        "opponent": opponent,
+        "game_id": game_pk,
+        "pick": f"{team} ({market})",
+        "confidence": confidence,
+        "edge_score": edge,
+        "market_mode": MARKET_MODE,
+        "odds_status": "unavailable",
+        "sportsbook": "none",
+        "posted_line": line,
+        "line_verified": False,
+        "trackable": True,
+        "source": SOURCE,
+        "parlay_leg": parlay_leg,
+        "game_time": game.get("game_time"),
+        "model_version": quant.get("model_version", "BETGPTAI v21.0"),
+    }
+
+
+def build_simple_mlb_card(card_date: str | None = None) -> dict:
+    """Build a stats-only MLB card dict directly from the enriched slate."""
+    from ai_analysis import upcoming_mlb_slate
+    from mlb_data import get_combined_slate
+    from quant_engine import enrich_slate_with_quant_scores
+
+    selected_date = card_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    errors: list[str] = []
+
+    raw_slate: list[dict[str, Any]] = []
+    try:
+        raw_slate = get_combined_slate(
+            os.getenv("ODDS_API_KEY", ""),
+            game_date=selected_date,
+            highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+        )
+    except Exception as error:  # pragma: no cover - network/IO dependent
+        errors.append(f"slate_load_failed: {error!r}")
+
+    slate = upcoming_mlb_slate(raw_slate) if raw_slate else []
+    if not slate:
+        errors.append("No upcoming MLB games available for card date.")
+
+    stats_mode = _stats_mode_active(slate)
+
+    if slate:
+        try:
+            slate = enrich_slate_with_quant_scores(slate, selected_date)
+        except Exception as error:  # pragma: no cover - engine dependent
+            errors.append(f"quant_enrich_failed: {error!r}")
+
+    candidates: list[dict[str, Any]] = []
+    for game in slate:
+        quant = _quant_for(game)
+        team, opponent = _favored_side(game)
+        candidates.append({
+            "game": game,
+            "team": team,
+            "opponent": opponent,
+            "quant": quant,
+            "edge": float(quant.get("final_edge_score") or 0.0),
+            "confidence": quant.get("confidence"),
+            "risk": quant.get("risk_level"),
+        })
+
+    # Rank by edge score (highest first); fall back to insertion order.
+    candidates.sort(key=lambda c: c["edge"], reverse=True)
+
+    picks: list[dict[str, Any]] = []
+
+    def _gid(cand: dict[str, Any]) -> Any:
+        return cand["game"].get("game_pk") or cand["game"].get("game_id")
+
+    def _take(n: int, market: str, *, require_min_edge: bool = False,
+              exclude: set[Any] | None = None, skip: int = 0) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        scanned = 0
+        for cand in candidates:
+            if len(out) >= n:
+                break
+            if exclude and _gid(cand) in exclude:
+                continue
+            if require_min_edge and cand["edge"] <= 0:
+                continue
+            scanned += 1
+            if scanned <= skip:
+                continue
+            picks.append(_make_pick(selected_date, market, cand["game"], cand["team"], cand["opponent"], cand["quant"]))
+            out.append(picks[-1])
+        return out
+
+    # Play of the Day: single highest-edge pick.
+    play_of_day: list[dict[str, Any]] = _take(1, "play_of_day")
+    pod_game = {_gid(c) for c in candidates[:1]} if play_of_day else set()
+
+    # Top 5 Moneylines (exclude the headline game to avoid exact duplication).
+    moneylines: list[dict[str, Any]] = _take(5, "moneyline", exclude=pod_game)
+
+    # Top 5 F5 Moneylines (same games as ML are fine — different market).
+    f5: list[dict[str, Any]] = _take(5, "f5_moneyline", exclude=pod_game)
+
+    # Top 3 Runlines — only when a meaningful edge exists (model "supports" a line).
+    runlines: list[dict[str, Any]] = _take(3, "runline", require_min_edge=True, exclude=pod_game)
+
+    # Safe Parlay: 2 safest ML/F5 picks (by confidence then edge), excluding headline.
+    parlay_legs: list[dict[str, Any]] = []
+    ranked_safe = sorted(
+        [c for c in candidates if _gid(c) not in pod_game],
+        key=lambda c: (str(c["confidence"] or ""), c["edge"]),
+        reverse=True,
+    )
+    for cand in ranked_safe:
+        if len(parlay_legs) >= 2:
+            break
+        leg = _make_pick(
+            selected_date, "moneyline", cand["game"], cand["team"], cand["opponent"],
+            cand["quant"], parlay_leg=True,
+        )
+        picks.append(leg)
+        parlay_legs.append(leg)
+
+    # Core Five: the next 5 best edges after the Top 5 Moneylines.
+    core_five: list[dict[str, Any]] = _take(5, "moneyline", exclude=pod_game, skip=len(moneylines))
+
+    card = {
+        "source": SOURCE,
+        "date": selected_date,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "market_mode": MARKET_MODE,
+        "stats_only": stats_mode,
+        "odds_status": "unavailable" if stats_mode else "available",
+        "picks": picks,
+        "parlay": [leg["id"] for leg in parlay_legs],
+        "sections": {
+            "play_of_day": [p["id"] for p in play_of_day],
+            "moneylines": [p["id"] for p in moneylines],
+            "f5": [p["id"] for p in f5],
+            "runlines": [p["id"] for p in runlines],
+            "core_five": [p["id"] for p in core_five],
+        },
+        "counts": {
+            "play_of_day": len(play_of_day),
+            "moneyline": len(moneylines),
+            "f5_moneyline": len(f5),
+            "runline": len(runlines),
+            "parlay_legs": len(parlay_legs),
+            "core_five": len(core_five),
+            "total": len(picks),
+        },
+        "errors": errors,
+    }
+    return card
+
+
+def save_simple_mlb_card(card: dict) -> str:
+    """Persist a simple card to /data/simple_cards/YYYY-MM-DD.json."""
+    card_date = card.get("date") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    path = SIMPLE_CARD_DIR / f"{card_date}.json"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(card, indent=2, default=str), encoding="utf-8")
+    tmp.replace(path)
+    return str(path)
+
+
+def _display_date(card_date: str) -> str:
+    try:
+        return datetime.strptime(card_date, "%Y-%m-%d").strftime("%m/%d/%Y")
+    except (ValueError, TypeError):
+        return str(card_date)
+
+
+def render_simple_mlb_card(card: dict) -> str:
+    """Render clean Telegram text for the simple stats-based card."""
+    by_id = {p["id"]: p for p in card.get("picks", [])}
+    sections = card.get("sections", {})
+    lines: list[str] = []
+    lines.append("🏆 BETGPTAI MLB CARD")
+    lines.append(f"📅 {_display_date(card.get('date', ''))}")
+    lines.append(f"Mode: {'Stats Only' if card.get('stats_only') else 'Normal'}")
+    lines.append("")
+
+    def _block(title: str, ids: list[str]) -> None:
+        if not ids:
+            return
+        lines.append(title)
+        for idx, pid in enumerate(ids, start=1):
+            pick = by_id.get(pid)
+            if not pick:
+                continue
+            label = pick.get("team") or pick.get("pick") or "Unknown"
+            market = pick.get("market", "")
+            suffix = f" {market}" if market not in ("play_of_day",) else ""
+            lines.append(f"{idx}. {label}{suffix}")
+        lines.append("")
+
+    _block("🔥 PLAY OF THE DAY", sections.get("play_of_day", []))
+    _block("🏆 TOP MONEYLINES", sections.get("moneylines", []))
+    _block("🔥 TOP F5", sections.get("f5", []))
+
+    runlines = sections.get("runlines", [])
+    if runlines:
+        _block("📈 TOP RUNLINES", runlines)
+
+    parlay_ids = card.get("parlay", [])
+    if parlay_ids:
+        lines.append("🧩 SAFE PARLAY")
+        for idx, pid in enumerate(parlay_ids, start=1):
+            pick = by_id.get(pid)
+            label = pick.get("team") or "Unknown" if pick else "Unknown"
+            lines.append(f"Leg {idx}: {label}")
+        lines.append("")
+
+    _block("⚾ CORE FIVE", sections.get("core_five", []))
+
+    lines.append("Stats-based card. Odds vary by sportsbook. Verify lines before placing any wager.")
+    return "\n".join(lines).strip()
+
+
+def _resolve_destination(channel: str) -> int | str:
+    """Resolve a channel env value or raw id to a Telegram destination."""
+    cleaned = (channel or "").strip()
+    if not cleaned:
+        raise ValueError("Channel destination is empty.")
+    if cleaned.startswith("@"):
+        return cleaned
+    try:
+        numeric = int(cleaned)
+    except ValueError as error:
+        raise ValueError("Channel must be numeric or an @username.") from error
+    if numeric > 0 and cleaned.startswith("100"):
+        numeric = -numeric
+    return numeric
+
+
+def post_simple_mlb_card(card: dict, channel: str, bot: Any = None) -> bool:
+    """Post a rendered simple card to FREE_CHANNEL_ID (or given channel).
+
+    ``bot`` is required to send.  Returns True if at least one chunk posted.
+    """
+    if bot is None:
+        return False
+    text = render_simple_mlb_card(card)
+    chat_id = _resolve_destination(channel)
+    remaining = text.strip()
+    posted = False
+    while remaining:
+        if len(remaining) <= 3900:
+            chunk, remaining = remaining, ""
+        else:
+            split_at = remaining.rfind("\n\n", 0, 3900)
+            if split_at < 1:
+                split_at = remaining.rfind("\n", 0, 3900)
+            if split_at < 1:
+                split_at = 3900
+            chunk, remaining = remaining[:split_at], remaining[split_at:].lstrip()
+        bot.send_message(chat_id=chat_id, text=chunk)
+        posted = True
+    return posted

@@ -655,6 +655,8 @@ def build_card_from_analysis(
     card_date: str,
     source_command: str = "unknown",
 ) -> StructuredCard:
+    BUILDER_TRACE_VERSION = "stats_only_builder_v2_ACTIVE"
+
     all_picks: list[OfficialPick] = []
     display_sections: dict[str, list[str]] = {}
     errors: list[str] = []
@@ -662,25 +664,24 @@ def build_card_from_analysis(
     stats_sections_found: list[str] = []
     stats_section_item_counts: dict[str, int] = {}
 
-    if _stats_only_mode() and slate:
-        # Stats-only mode: build picks from sections directly (no odds required)
+    stats_mode = _stats_only_mode() and bool(slate)
+
+    if stats_mode:
+        # Stats-only mode: build picks from sections directly (no odds required).
+        # This is the active path when STATS_ONLY_CARD_MODE=true and a slate exists.
         stats_result = _build_stats_only_official_picks(analysis, slate, card_date)
         all_picks = stats_result["picks"]
         stats_sections_found = stats_result.get("sections_found", [])
         stats_section_item_counts = stats_result.get("section_item_counts", {})
-        rejected = stats_result.get("rejected_items", [])
         reasons = stats_result.get("rejection_reasons", [])
         if reasons:
             errors.extend(reasons[:20])
-        if all_picks:
-            stats_only_builder_picks_created = len(all_picks)
-            for pk in all_picks:
-                mt = pk.market_type
-                label = {"moneyline": "Moneyline", "f5_moneyline": "F5", "runline": "Runline",
-                         "total": "Total", "team_total": "Team Total", "parlay": "Parlay"}.get(mt, mt)
-                display_sections.setdefault(label, []).append(str(pk.selected_team or ""))
-        elif stats_sections_found:
-            stats_only_builder_picks_created = 0
+        stats_only_builder_picks_created = len(all_picks)
+        for pk in all_picks:
+            mt = pk.market_type
+            label = {"moneyline": "Moneyline", "f5_moneyline": "F5", "runline": "Runline",
+                     "total": "Total", "team_total": "Team Total", "parlay": "Parlay"}.get(mt, mt)
+            display_sections.setdefault(label, []).append(str(pk.selected_team or ""))
     else:
         headings = _find_headings(analysis)
         for idx, (section_key, start_idx) in enumerate(headings):
@@ -713,8 +714,35 @@ def build_card_from_analysis(
             display_sections[display_key] = [str(p.selected_team or p.market_type) for p in _section_picks]
             all_picks.extend(_section_picks)
 
+    # Explicit fallback (spec point 5): if stats-only mode is active and the
+    # active path above produced no picks, run the stats-only builder helper
+    # directly. This must happen BEFORE StructuredCard(...) is returned.
+    if _stats_only_mode() and not all_picks and slate:
+        stats_result = _build_stats_only_official_picks(analysis, slate, card_date)
+        if stats_result["picks"]:
+            all_picks = stats_result["picks"]
+            stats_sections_found = stats_result.get("sections_found", [])
+            stats_section_item_counts = stats_result.get("section_item_counts", {})
+            reasons = stats_result.get("rejection_reasons", [])
+            if reasons:
+                errors.extend(reasons[:20])
+            stats_only_builder_picks_created = len(all_picks)
+            for pk in all_picks:
+                mt = pk.market_type
+                label = {"moneyline": "Moneyline", "f5_moneyline": "F5", "runline": "Runline",
+                         "total": "Total", "team_total": "Team Total", "parlay": "Parlay"}.get(mt, mt)
+                display_sections.setdefault(label, []).append(str(pk.selected_team or ""))
+
+    # Hard failure (spec point 8): generated sections exist but stats-only
+    # conversion still returned 0 picks. Raise before returning StructuredCard
+    # so the failure is visible in logs/trace instead of silently saving 0 picks.
+    if _stats_only_mode() and not all_picks and stats_sections_found:
+        raise RuntimeError(
+            "ACTIVE builder stats-only conversion failed before StructuredCard return"
+        )
+
     if not all_picks:
-        error_msg = "Stats-only builder failed: generated sections exist but official_picks is empty." if (_stats_only_mode() and stats_sections_found and not stats_only_builder_picks_created) else "No structured official picks were generated."
+        error_msg = "Stats-only builder found 0 sections to convert." if _stats_only_mode() else "No structured official picks were generated."
         display_sections["_errors"] = errors if errors else [error_msg]
 
     from datetime import datetime, timezone
@@ -726,6 +754,7 @@ def build_card_from_analysis(
         _dd = str(card_date or "Unavailable")
 
     meta: dict[str, Any] = {
+        "builder_trace_version": BUILDER_TRACE_VERSION,
         "source_command": source_command,
         "errors": errors,
     }

@@ -1,0 +1,1135 @@
+{
+  "model_version": "BETGPTAI v21.0",
+  "card_date": "2026-07-09",
+  "created_at": "2026-07-09T19:02:46Z",
+  "games": [
+    {
+      "game_pk": 1,
+      "away_team": "Boston Red Sox",
+      "home_team": "New York Yankees",
+      "model_version": "BETGPTAI v21.0",
+      "component_scores": {
+        "sp_score": 55.0,
+        "offense_score": 55.0,
+        "bullpen_score": 55.0,
+        "defense_score": 50.0,
+        "weather_park_score": 52.0,
+        "market_value_score": 50.0,
+        "situational_score": 55.0,
+        "sp_batter_matchup_score": 20.0,
+        "home_away_score": 55.0,
+        "travel_rest_score": 45.0,
+        "recent_form_score": 46.0,
+        "team_splits_score": 50.0
+      },
+      "weights_used": {
+        "sp_score": 0.3,
+        "bullpen_score": 0.15,
+        "sp_batter_matchup_score": 0.1,
+        "weather_park_score": 0.1,
+        "market_value_score": 0.1,
+        "offense_score": 0.2,
+        "situational_score": 0.05,
+        "defense_score": 0.1,
+        "home_away_score": 0.025,
+        "travel_rest_score": 0.025,
+        "recent_form_score": 0.025,
+        "team_splits_score": 0.025
+      },
+      "sp_score": 55.0,
+      "offense_score": 55.0,
+      "bullpen_score": 55.0,
+      "defense_score": 50.0,
+      "weather_park_score": 52.0,
+      "market_value_score": 50.0,
+      "situational_score": 55.0,
+      "sp_batter_matchup_score": 20.0,
+      "home_away_score": 55.0,
+      "travel_rest_score": 45.0,
+      "recent_form_score": 46.0,
+      "team_splits_score": 50.0,
+      "final_edge_score": 60.6,
+      "minimum_edge_score": 82.0,
+      "engine_decision": "PASS",
+      "confidence": "PASS",
+      "risk_level": "PASS",
+      "data_quality_grade": "F",
+      "details": {
+        "sp_score": {
+          "side_scores": {
+            "away": 55.0,
+            "home": 55.0
+          },
+          "available_fields": 12,
+          "possible_fields": 12
+        },
+        "offense_score": {
+          "side_scores": {
+            "away": 50.0,
+            "home": 50.0
+          },
+          "available_fields": 8,
+          "possible_fields": 8
+        },
+        "bullpen_score": {
+          "side_details": {
+            "away": {
+              "recent_3d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "recent_7d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "yesterday_usage": {
+                "b2b_candidates": 0,
+                "relievers": []
+              },
+              "closer": {
+                "closer": "unavailable",
+                "setup": "unavailable",
+                "closer_available": false,
+                "setup_available": false
+              },
+              "fatigue_score": 40.0,
+              "late_inning_risk": 40.0
+            },
+            "home": {
+              "recent_3d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "recent_7d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "yesterday_usage": {
+                "b2b_candidates": 0,
+                "relievers": []
+              },
+              "closer": {
+                "closer": "unavailable",
+                "setup": "unavailable",
+                "closer_available": false,
+                "setup_available": false
+              },
+              "fatigue_score": 40.0,
+              "late_inning_risk": 40.0
+            }
+          },
+          "quality_scores": {
+            "away": 55.0,
+            "home": 55.0
+          },
+          "available_fields": 0,
+          "possible_fields": 12
+        },
+        "defense_score": {
+          "available_fields": 0,
+          "possible_fields": 2,
+          "note": "neutral_no_verified_defense_feed"
+        },
+        "weather_park_score": {
+          "available_fields": 0,
+          "possible_fields": 2,
+          "park_label": "unavailable"
+        },
+        "market_value_score": {
+          "available_fields": 0,
+          "possible_fields": 8,
+          "price_pass_reasons": []
+        },
+        "situational_score": {
+          "available_fields": 1,
+          "possible_fields": 3
+        },
+        "sp_batter_matchup_score": {
+          "available_fields": 2,
+          "possible_fields": 14,
+          "combined_contact": 0,
+          "combined_power": 0,
+          "hitters_qualified": 0,
+          "hitters_scanned": 0,
+          "data_quality_grade": "D"
+        },
+        "home_away_score": {
+          "note": "Home field baseline +5"
+        },
+        "travel_rest_score": {
+          "away_rest": 0.0,
+          "home_rest": 0.0
+        },
+        "recent_form_score": {
+          "away_last_10_wins": 6.0,
+          "home_last_10_wins": 4.0
+        },
+        "team_splits_score": {
+          "note": "No split data — neutral"
+        }
+      },
+      "matchup_summary": {
+        "game_pk": 1,
+        "matchup": "Boston Red Sox @ New York Yankees",
+        "scores": {
+          "sp_score": 55.0,
+          "offense_score": 55.0,
+          "bullpen_score": 55.0,
+          "defense_score": 50.0,
+          "weather_park_score": 52.0,
+          "market_value_score": 50.0,
+          "situational_score": 55.0,
+          "sp_batter_matchup_score": 20.0,
+          "home_away_score": 55.0,
+          "travel_rest_score": 45.0,
+          "recent_form_score": 46.0,
+          "team_splits_score": 50.0
+        }
+      }
+    },
+    {
+      "game_pk": 2,
+      "away_team": "Atlanta Braves",
+      "home_team": "Los Angeles Dodgers",
+      "model_version": "BETGPTAI v21.0",
+      "component_scores": {
+        "sp_score": 55.0,
+        "offense_score": 55.0,
+        "bullpen_score": 55.0,
+        "defense_score": 50.0,
+        "weather_park_score": 52.0,
+        "market_value_score": 50.0,
+        "situational_score": 55.0,
+        "sp_batter_matchup_score": 20.0,
+        "home_away_score": 55.0,
+        "travel_rest_score": 45.0,
+        "recent_form_score": 58.0,
+        "team_splits_score": 50.0
+      },
+      "weights_used": {
+        "sp_score": 0.3,
+        "bullpen_score": 0.15,
+        "sp_batter_matchup_score": 0.1,
+        "weather_park_score": 0.1,
+        "market_value_score": 0.1,
+        "offense_score": 0.2,
+        "situational_score": 0.05,
+        "defense_score": 0.1,
+        "home_away_score": 0.025,
+        "travel_rest_score": 0.025,
+        "recent_form_score": 0.025,
+        "team_splits_score": 0.025
+      },
+      "sp_score": 55.0,
+      "offense_score": 55.0,
+      "bullpen_score": 55.0,
+      "defense_score": 50.0,
+      "weather_park_score": 52.0,
+      "market_value_score": 50.0,
+      "situational_score": 55.0,
+      "sp_batter_matchup_score": 20.0,
+      "home_away_score": 55.0,
+      "travel_rest_score": 45.0,
+      "recent_form_score": 58.0,
+      "team_splits_score": 50.0,
+      "final_edge_score": 60.9,
+      "minimum_edge_score": 82.0,
+      "engine_decision": "PASS",
+      "confidence": "PASS",
+      "risk_level": "PASS",
+      "data_quality_grade": "F",
+      "details": {
+        "sp_score": {
+          "side_scores": {
+            "away": 55.0,
+            "home": 55.0
+          },
+          "available_fields": 12,
+          "possible_fields": 12
+        },
+        "offense_score": {
+          "side_scores": {
+            "away": 50.0,
+            "home": 50.0
+          },
+          "available_fields": 8,
+          "possible_fields": 8
+        },
+        "bullpen_score": {
+          "side_details": {
+            "away": {
+              "recent_3d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "recent_7d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "yesterday_usage": {
+                "b2b_candidates": 0,
+                "relievers": []
+              },
+              "closer": {
+                "closer": "unavailable",
+                "setup": "unavailable",
+                "closer_available": false,
+                "setup_available": false
+              },
+              "fatigue_score": 40.0,
+              "late_inning_risk": 40.0
+            },
+            "home": {
+              "recent_3d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "recent_7d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "yesterday_usage": {
+                "b2b_candidates": 0,
+                "relievers": []
+              },
+              "closer": {
+                "closer": "unavailable",
+                "setup": "unavailable",
+                "closer_available": false,
+                "setup_available": false
+              },
+              "fatigue_score": 40.0,
+              "late_inning_risk": 40.0
+            }
+          },
+          "quality_scores": {
+            "away": 55.0,
+            "home": 55.0
+          },
+          "available_fields": 0,
+          "possible_fields": 12
+        },
+        "defense_score": {
+          "available_fields": 0,
+          "possible_fields": 2,
+          "note": "neutral_no_verified_defense_feed"
+        },
+        "weather_park_score": {
+          "available_fields": 0,
+          "possible_fields": 2,
+          "park_label": "unavailable"
+        },
+        "market_value_score": {
+          "available_fields": 0,
+          "possible_fields": 8,
+          "price_pass_reasons": []
+        },
+        "situational_score": {
+          "available_fields": 1,
+          "possible_fields": 3
+        },
+        "sp_batter_matchup_score": {
+          "available_fields": 2,
+          "possible_fields": 14,
+          "combined_contact": 0,
+          "combined_power": 0,
+          "hitters_qualified": 0,
+          "hitters_scanned": 0,
+          "data_quality_grade": "D"
+        },
+        "home_away_score": {
+          "note": "Home field baseline +5"
+        },
+        "travel_rest_score": {
+          "away_rest": 0.0,
+          "home_rest": 0.0
+        },
+        "recent_form_score": {
+          "away_last_10_wins": 3.0,
+          "home_last_10_wins": 7.0
+        },
+        "team_splits_score": {
+          "note": "No split data — neutral"
+        }
+      },
+      "matchup_summary": {
+        "game_pk": 2,
+        "matchup": "Atlanta Braves @ Los Angeles Dodgers",
+        "scores": {
+          "sp_score": 55.0,
+          "offense_score": 55.0,
+          "bullpen_score": 55.0,
+          "defense_score": 50.0,
+          "weather_park_score": 52.0,
+          "market_value_score": 50.0,
+          "situational_score": 55.0,
+          "sp_batter_matchup_score": 20.0,
+          "home_away_score": 55.0,
+          "travel_rest_score": 45.0,
+          "recent_form_score": 58.0,
+          "team_splits_score": 50.0
+        }
+      }
+    },
+    {
+      "game_pk": 3,
+      "away_team": "Chicago Cubs",
+      "home_team": "Houston Astros",
+      "model_version": "BETGPTAI v21.0",
+      "component_scores": {
+        "sp_score": 55.0,
+        "offense_score": 55.0,
+        "bullpen_score": 55.0,
+        "defense_score": 50.0,
+        "weather_park_score": 52.0,
+        "market_value_score": 50.0,
+        "situational_score": 55.0,
+        "sp_batter_matchup_score": 20.0,
+        "home_away_score": 55.0,
+        "travel_rest_score": 45.0,
+        "recent_form_score": 50.0,
+        "team_splits_score": 50.0
+      },
+      "weights_used": {
+        "sp_score": 0.3,
+        "bullpen_score": 0.15,
+        "sp_batter_matchup_score": 0.1,
+        "weather_park_score": 0.1,
+        "market_value_score": 0.1,
+        "offense_score": 0.2,
+        "situational_score": 0.05,
+        "defense_score": 0.1,
+        "home_away_score": 0.025,
+        "travel_rest_score": 0.025,
+        "recent_form_score": 0.025,
+        "team_splits_score": 0.025
+      },
+      "sp_score": 55.0,
+      "offense_score": 55.0,
+      "bullpen_score": 55.0,
+      "defense_score": 50.0,
+      "weather_park_score": 52.0,
+      "market_value_score": 50.0,
+      "situational_score": 55.0,
+      "sp_batter_matchup_score": 20.0,
+      "home_away_score": 55.0,
+      "travel_rest_score": 45.0,
+      "recent_form_score": 50.0,
+      "team_splits_score": 50.0,
+      "final_edge_score": 60.7,
+      "minimum_edge_score": 82.0,
+      "engine_decision": "PASS",
+      "confidence": "PASS",
+      "risk_level": "PASS",
+      "data_quality_grade": "F",
+      "details": {
+        "sp_score": {
+          "side_scores": {
+            "away": 55.0,
+            "home": 55.0
+          },
+          "available_fields": 12,
+          "possible_fields": 12
+        },
+        "offense_score": {
+          "side_scores": {
+            "away": 50.0,
+            "home": 50.0
+          },
+          "available_fields": 8,
+          "possible_fields": 8
+        },
+        "bullpen_score": {
+          "side_details": {
+            "away": {
+              "recent_3d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "recent_7d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "yesterday_usage": {
+                "b2b_candidates": 0,
+                "relievers": []
+              },
+              "closer": {
+                "closer": "unavailable",
+                "setup": "unavailable",
+                "closer_available": false,
+                "setup_available": false
+              },
+              "fatigue_score": 40.0,
+              "late_inning_risk": 40.0
+            },
+            "home": {
+              "recent_3d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "recent_7d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "yesterday_usage": {
+                "b2b_candidates": 0,
+                "relievers": []
+              },
+              "closer": {
+                "closer": "unavailable",
+                "setup": "unavailable",
+                "closer_available": false,
+                "setup_available": false
+              },
+              "fatigue_score": 40.0,
+              "late_inning_risk": 40.0
+            }
+          },
+          "quality_scores": {
+            "away": 55.0,
+            "home": 55.0
+          },
+          "available_fields": 0,
+          "possible_fields": 12
+        },
+        "defense_score": {
+          "available_fields": 0,
+          "possible_fields": 2,
+          "note": "neutral_no_verified_defense_feed"
+        },
+        "weather_park_score": {
+          "available_fields": 0,
+          "possible_fields": 2,
+          "park_label": "unavailable"
+        },
+        "market_value_score": {
+          "available_fields": 0,
+          "possible_fields": 8,
+          "price_pass_reasons": []
+        },
+        "situational_score": {
+          "available_fields": 1,
+          "possible_fields": 3
+        },
+        "sp_batter_matchup_score": {
+          "available_fields": 2,
+          "possible_fields": 14,
+          "combined_contact": 0,
+          "combined_power": 0,
+          "hitters_qualified": 0,
+          "hitters_scanned": 0,
+          "data_quality_grade": "D"
+        },
+        "home_away_score": {
+          "note": "Home field baseline +5"
+        },
+        "travel_rest_score": {
+          "away_rest": 0.0,
+          "home_rest": 0.0
+        },
+        "recent_form_score": {
+          "away_last_10_wins": 5.0,
+          "home_last_10_wins": 5.0
+        },
+        "team_splits_score": {
+          "note": "No split data — neutral"
+        }
+      },
+      "matchup_summary": {
+        "game_pk": 3,
+        "matchup": "Chicago Cubs @ Houston Astros",
+        "scores": {
+          "sp_score": 55.0,
+          "offense_score": 55.0,
+          "bullpen_score": 55.0,
+          "defense_score": 50.0,
+          "weather_park_score": 52.0,
+          "market_value_score": 50.0,
+          "situational_score": 55.0,
+          "sp_batter_matchup_score": 20.0,
+          "home_away_score": 55.0,
+          "travel_rest_score": 45.0,
+          "recent_form_score": 50.0,
+          "team_splits_score": 50.0
+        }
+      }
+    },
+    {
+      "game_pk": 4,
+      "away_team": "Seattle Mariners",
+      "home_team": "Texas Rangers",
+      "model_version": "BETGPTAI v21.0",
+      "component_scores": {
+        "sp_score": 55.0,
+        "offense_score": 55.0,
+        "bullpen_score": 55.0,
+        "defense_score": 50.0,
+        "weather_park_score": 52.0,
+        "market_value_score": 50.0,
+        "situational_score": 55.0,
+        "sp_batter_matchup_score": 20.0,
+        "home_away_score": 55.0,
+        "travel_rest_score": 45.0,
+        "recent_form_score": 38.0,
+        "team_splits_score": 50.0
+      },
+      "weights_used": {
+        "sp_score": 0.3,
+        "bullpen_score": 0.15,
+        "sp_batter_matchup_score": 0.1,
+        "weather_park_score": 0.1,
+        "market_value_score": 0.1,
+        "offense_score": 0.2,
+        "situational_score": 0.05,
+        "defense_score": 0.1,
+        "home_away_score": 0.025,
+        "travel_rest_score": 0.025,
+        "recent_form_score": 0.025,
+        "team_splits_score": 0.025
+      },
+      "sp_score": 55.0,
+      "offense_score": 55.0,
+      "bullpen_score": 55.0,
+      "defense_score": 50.0,
+      "weather_park_score": 52.0,
+      "market_value_score": 50.0,
+      "situational_score": 55.0,
+      "sp_batter_matchup_score": 20.0,
+      "home_away_score": 55.0,
+      "travel_rest_score": 45.0,
+      "recent_form_score": 38.0,
+      "team_splits_score": 50.0,
+      "final_edge_score": 60.4,
+      "minimum_edge_score": 82.0,
+      "engine_decision": "PASS",
+      "confidence": "PASS",
+      "risk_level": "PASS",
+      "data_quality_grade": "F",
+      "details": {
+        "sp_score": {
+          "side_scores": {
+            "away": 55.0,
+            "home": 55.0
+          },
+          "available_fields": 12,
+          "possible_fields": 12
+        },
+        "offense_score": {
+          "side_scores": {
+            "away": 50.0,
+            "home": 50.0
+          },
+          "available_fields": 8,
+          "possible_fields": 8
+        },
+        "bullpen_score": {
+          "side_details": {
+            "away": {
+              "recent_3d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "recent_7d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "yesterday_usage": {
+                "b2b_candidates": 0,
+                "relievers": []
+              },
+              "closer": {
+                "closer": "unavailable",
+                "setup": "unavailable",
+                "closer_available": false,
+                "setup_available": false
+              },
+              "fatigue_score": 40.0,
+              "late_inning_risk": 40.0
+            },
+            "home": {
+              "recent_3d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "recent_7d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "yesterday_usage": {
+                "b2b_candidates": 0,
+                "relievers": []
+              },
+              "closer": {
+                "closer": "unavailable",
+                "setup": "unavailable",
+                "closer_available": false,
+                "setup_available": false
+              },
+              "fatigue_score": 40.0,
+              "late_inning_risk": 40.0
+            }
+          },
+          "quality_scores": {
+            "away": 55.0,
+            "home": 55.0
+          },
+          "available_fields": 0,
+          "possible_fields": 12
+        },
+        "defense_score": {
+          "available_fields": 0,
+          "possible_fields": 2,
+          "note": "neutral_no_verified_defense_feed"
+        },
+        "weather_park_score": {
+          "available_fields": 0,
+          "possible_fields": 2,
+          "park_label": "unavailable"
+        },
+        "market_value_score": {
+          "available_fields": 0,
+          "possible_fields": 8,
+          "price_pass_reasons": []
+        },
+        "situational_score": {
+          "available_fields": 1,
+          "possible_fields": 3
+        },
+        "sp_batter_matchup_score": {
+          "available_fields": 2,
+          "possible_fields": 14,
+          "combined_contact": 0,
+          "combined_power": 0,
+          "hitters_qualified": 0,
+          "hitters_scanned": 0,
+          "data_quality_grade": "D"
+        },
+        "home_away_score": {
+          "note": "Home field baseline +5"
+        },
+        "travel_rest_score": {
+          "away_rest": 0.0,
+          "home_rest": 0.0
+        },
+        "recent_form_score": {
+          "away_last_10_wins": 8.0,
+          "home_last_10_wins": 2.0
+        },
+        "team_splits_score": {
+          "note": "No split data — neutral"
+        }
+      },
+      "matchup_summary": {
+        "game_pk": 4,
+        "matchup": "Seattle Mariners @ Texas Rangers",
+        "scores": {
+          "sp_score": 55.0,
+          "offense_score": 55.0,
+          "bullpen_score": 55.0,
+          "defense_score": 50.0,
+          "weather_park_score": 52.0,
+          "market_value_score": 50.0,
+          "situational_score": 55.0,
+          "sp_batter_matchup_score": 20.0,
+          "home_away_score": 55.0,
+          "travel_rest_score": 45.0,
+          "recent_form_score": 38.0,
+          "team_splits_score": 50.0
+        }
+      }
+    },
+    {
+      "game_pk": 5,
+      "away_team": "Mets",
+      "home_team": "Phillies",
+      "model_version": "BETGPTAI v21.0",
+      "component_scores": {
+        "sp_score": 55.0,
+        "offense_score": 55.0,
+        "bullpen_score": 55.0,
+        "defense_score": 50.0,
+        "weather_park_score": 52.0,
+        "market_value_score": 50.0,
+        "situational_score": 55.0,
+        "sp_batter_matchup_score": 20.0,
+        "home_away_score": 55.0,
+        "travel_rest_score": 45.0,
+        "recent_form_score": 54.0,
+        "team_splits_score": 50.0
+      },
+      "weights_used": {
+        "sp_score": 0.3,
+        "bullpen_score": 0.15,
+        "sp_batter_matchup_score": 0.1,
+        "weather_park_score": 0.1,
+        "market_value_score": 0.1,
+        "offense_score": 0.2,
+        "situational_score": 0.05,
+        "defense_score": 0.1,
+        "home_away_score": 0.025,
+        "travel_rest_score": 0.025,
+        "recent_form_score": 0.025,
+        "team_splits_score": 0.025
+      },
+      "sp_score": 55.0,
+      "offense_score": 55.0,
+      "bullpen_score": 55.0,
+      "defense_score": 50.0,
+      "weather_park_score": 52.0,
+      "market_value_score": 50.0,
+      "situational_score": 55.0,
+      "sp_batter_matchup_score": 20.0,
+      "home_away_score": 55.0,
+      "travel_rest_score": 45.0,
+      "recent_form_score": 54.0,
+      "team_splits_score": 50.0,
+      "final_edge_score": 60.8,
+      "minimum_edge_score": 82.0,
+      "engine_decision": "PASS",
+      "confidence": "PASS",
+      "risk_level": "PASS",
+      "data_quality_grade": "F",
+      "details": {
+        "sp_score": {
+          "side_scores": {
+            "away": 55.0,
+            "home": 55.0
+          },
+          "available_fields": 12,
+          "possible_fields": 12
+        },
+        "offense_score": {
+          "side_scores": {
+            "away": 50.0,
+            "home": 50.0
+          },
+          "available_fields": 8,
+          "possible_fields": 8
+        },
+        "bullpen_score": {
+          "side_details": {
+            "away": {
+              "recent_3d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "recent_7d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "yesterday_usage": {
+                "b2b_candidates": 0,
+                "relievers": []
+              },
+              "closer": {
+                "closer": "unavailable",
+                "setup": "unavailable",
+                "closer_available": false,
+                "setup_available": false
+              },
+              "fatigue_score": 40.0,
+              "late_inning_risk": 40.0
+            },
+            "home": {
+              "recent_3d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "recent_7d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "yesterday_usage": {
+                "b2b_candidates": 0,
+                "relievers": []
+              },
+              "closer": {
+                "closer": "unavailable",
+                "setup": "unavailable",
+                "closer_available": false,
+                "setup_available": false
+              },
+              "fatigue_score": 40.0,
+              "late_inning_risk": 40.0
+            }
+          },
+          "quality_scores": {
+            "away": 55.0,
+            "home": 55.0
+          },
+          "available_fields": 0,
+          "possible_fields": 12
+        },
+        "defense_score": {
+          "available_fields": 0,
+          "possible_fields": 2,
+          "note": "neutral_no_verified_defense_feed"
+        },
+        "weather_park_score": {
+          "available_fields": 0,
+          "possible_fields": 2,
+          "park_label": "unavailable"
+        },
+        "market_value_score": {
+          "available_fields": 0,
+          "possible_fields": 8,
+          "price_pass_reasons": []
+        },
+        "situational_score": {
+          "available_fields": 1,
+          "possible_fields": 3
+        },
+        "sp_batter_matchup_score": {
+          "available_fields": 2,
+          "possible_fields": 14,
+          "combined_contact": 0,
+          "combined_power": 0,
+          "hitters_qualified": 0,
+          "hitters_scanned": 0,
+          "data_quality_grade": "D"
+        },
+        "home_away_score": {
+          "note": "Home field baseline +5"
+        },
+        "travel_rest_score": {
+          "away_rest": 0.0,
+          "home_rest": 0.0
+        },
+        "recent_form_score": {
+          "away_last_10_wins": 4.0,
+          "home_last_10_wins": 6.0
+        },
+        "team_splits_score": {
+          "note": "No split data — neutral"
+        }
+      },
+      "matchup_summary": {
+        "game_pk": 5,
+        "matchup": "Mets @ Phillies",
+        "scores": {
+          "sp_score": 55.0,
+          "offense_score": 55.0,
+          "bullpen_score": 55.0,
+          "defense_score": 50.0,
+          "weather_park_score": 52.0,
+          "market_value_score": 50.0,
+          "situational_score": 55.0,
+          "sp_batter_matchup_score": 20.0,
+          "home_away_score": 55.0,
+          "travel_rest_score": 45.0,
+          "recent_form_score": 54.0,
+          "team_splits_score": 50.0
+        }
+      }
+    },
+    {
+      "game_pk": 6,
+      "away_team": "Cardinals",
+      "home_team": "Brewers",
+      "model_version": "BETGPTAI v21.0",
+      "component_scores": {
+        "sp_score": 55.0,
+        "offense_score": 55.0,
+        "bullpen_score": 55.0,
+        "defense_score": 50.0,
+        "weather_park_score": 52.0,
+        "market_value_score": 50.0,
+        "situational_score": 55.0,
+        "sp_batter_matchup_score": 20.0,
+        "home_away_score": 55.0,
+        "travel_rest_score": 45.0,
+        "recent_form_score": 50.0,
+        "team_splits_score": 50.0
+      },
+      "weights_used": {
+        "sp_score": 0.3,
+        "bullpen_score": 0.15,
+        "sp_batter_matchup_score": 0.1,
+        "weather_park_score": 0.1,
+        "market_value_score": 0.1,
+        "offense_score": 0.2,
+        "situational_score": 0.05,
+        "defense_score": 0.1,
+        "home_away_score": 0.025,
+        "travel_rest_score": 0.025,
+        "recent_form_score": 0.025,
+        "team_splits_score": 0.025
+      },
+      "sp_score": 55.0,
+      "offense_score": 55.0,
+      "bullpen_score": 55.0,
+      "defense_score": 50.0,
+      "weather_park_score": 52.0,
+      "market_value_score": 50.0,
+      "situational_score": 55.0,
+      "sp_batter_matchup_score": 20.0,
+      "home_away_score": 55.0,
+      "travel_rest_score": 45.0,
+      "recent_form_score": 50.0,
+      "team_splits_score": 50.0,
+      "final_edge_score": 60.7,
+      "minimum_edge_score": 82.0,
+      "engine_decision": "PASS",
+      "confidence": "PASS",
+      "risk_level": "PASS",
+      "data_quality_grade": "F",
+      "details": {
+        "sp_score": {
+          "side_scores": {
+            "away": 55.0,
+            "home": 55.0
+          },
+          "available_fields": 12,
+          "possible_fields": 12
+        },
+        "offense_score": {
+          "side_scores": {
+            "away": 50.0,
+            "home": 50.0
+          },
+          "available_fields": 8,
+          "possible_fields": 8
+        },
+        "bullpen_score": {
+          "side_details": {
+            "away": {
+              "recent_3d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "recent_7d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "yesterday_usage": {
+                "b2b_candidates": 0,
+                "relievers": []
+              },
+              "closer": {
+                "closer": "unavailable",
+                "setup": "unavailable",
+                "closer_available": false,
+                "setup_available": false
+              },
+              "fatigue_score": 40.0,
+              "late_inning_risk": 40.0
+            },
+            "home": {
+              "recent_3d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "recent_7d": {
+                "relievers_used": 0,
+                "total_pitches": 0,
+                "avg_pitches_per_reliever": 0.0
+              },
+              "yesterday_usage": {
+                "b2b_candidates": 0,
+                "relievers": []
+              },
+              "closer": {
+                "closer": "unavailable",
+                "setup": "unavailable",
+                "closer_available": false,
+                "setup_available": false
+              },
+              "fatigue_score": 40.0,
+              "late_inning_risk": 40.0
+            }
+          },
+          "quality_scores": {
+            "away": 55.0,
+            "home": 55.0
+          },
+          "available_fields": 0,
+          "possible_fields": 12
+        },
+        "defense_score": {
+          "available_fields": 0,
+          "possible_fields": 2,
+          "note": "neutral_no_verified_defense_feed"
+        },
+        "weather_park_score": {
+          "available_fields": 0,
+          "possible_fields": 2,
+          "park_label": "unavailable"
+        },
+        "market_value_score": {
+          "available_fields": 0,
+          "possible_fields": 8,
+          "price_pass_reasons": []
+        },
+        "situational_score": {
+          "available_fields": 1,
+          "possible_fields": 3
+        },
+        "sp_batter_matchup_score": {
+          "available_fields": 2,
+          "possible_fields": 14,
+          "combined_contact": 0,
+          "combined_power": 0,
+          "hitters_qualified": 0,
+          "hitters_scanned": 0,
+          "data_quality_grade": "D"
+        },
+        "home_away_score": {
+          "note": "Home field baseline +5"
+        },
+        "travel_rest_score": {
+          "away_rest": 0.0,
+          "home_rest": 0.0
+        },
+        "recent_form_score": {
+          "away_last_10_wins": 5.0,
+          "home_last_10_wins": 5.0
+        },
+        "team_splits_score": {
+          "note": "No split data — neutral"
+        }
+      },
+      "matchup_summary": {
+        "game_pk": 6,
+        "matchup": "Cardinals @ Brewers",
+        "scores": {
+          "sp_score": 55.0,
+          "offense_score": 55.0,
+          "bullpen_score": 55.0,
+          "defense_score": 50.0,
+          "weather_park_score": 52.0,
+          "market_value_score": 50.0,
+          "situational_score": 55.0,
+          "sp_batter_matchup_score": 20.0,
+          "home_away_score": 55.0,
+          "travel_rest_score": 45.0,
+          "recent_form_score": 50.0,
+          "team_splits_score": 50.0
+        }
+      }
+    }
+  ]
+}

@@ -1,12 +1,17 @@
 {
   "weights": {
     "sp_score": 0.3,
-    "offense_score": 0.2,
     "bullpen_score": 0.15,
-    "defense_score": 0.1,
+    "sp_batter_matchup_score": 0.1,
     "weather_park_score": 0.1,
     "market_value_score": 0.1,
+    "offense_score": 0.2,
     "situational_score": 0.05,
+    "defense_score": 0.1,
+    "home_away_score": 0.025,
+    "travel_rest_score": 0.025,
+    "recent_form_score": 0.025,
+    "team_splits_score": 0.025,
     "starting_pitcher_edge": 0.5,
     "bullpen_edge": 0.5,
     "lineup_confirmation": 0.5,
@@ -24,7 +29,7 @@
     "player_lineup_spot": 0.5,
     "player_team_verification": 0.7
   },
-  "updated_at": "2026-07-07T19:54:59-04:00",
+  "updated_at": "2026-07-09T15:02:01-04:00",
   "auto_apply": false,
   "history": []
 }

@@ -8,8 +8,10 @@ This is the single service responsible for writing official picks to
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -325,7 +327,6 @@ _STATS_SECTION_HEADINGS: list[tuple[str, str]] = [
 
 def _normalize_team_text(name: str) -> str:
     """Lowercase and strip non-alphanumeric for fuzzy team matching."""
-    import re
     return re.sub(r"[^a-z0-9]", "", name.lower())
 
 
@@ -378,7 +379,6 @@ def _stats_market_type(category: str) -> str:
 
 def _parse_line_value(selection: str, market_type: str) -> float | None:
     """Extract a numeric line from the pick text (totals, team-totals, runlines)."""
-    import re
     if market_type in ("total", "team_total"):
         m = re.search(r"(?:Over|Under)\s+(\d+(?:\.\d+)?)", selection, flags=re.I)
         return float(m.group(1)) if m else None
@@ -436,8 +436,6 @@ def _build_picks_from_sections(
     and STATS_ONLY_CARD_MODE is enabled.  Returns a debug log dict with keys:
       picks, sections_found, section_item_counts, rejected_items, rejection_reasons.
     """
-    import hashlib
-    import re as _re
     from datetime import datetime, timezone
 
     log: dict[str, Any] = {

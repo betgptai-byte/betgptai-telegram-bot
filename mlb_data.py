@@ -395,6 +395,7 @@ def odds_debug_payload(
     selected_date: str,
     sport: str = "mlb",
     league: str | None = None,
+    event_date: str | None = None,
 ) -> dict[str, Any]:
     """Owner-only diagnostics for odds providers by sport."""
     from api.sharp_odds_client import SHARP_SPORT_MAP, health as sharp_health, sharp_api_enabled, sharp_api_key
@@ -407,6 +408,7 @@ def odds_debug_payload(
     payload: dict[str, Any] = {
         "sport": sport_lower,
         "league": league,
+        "event_date": event_date or selected_date,
         "odds_api_key_loaded": bool(str(odds_api_key or "").strip()),
         "odds_api_status_code": None,
         "sharp_api_enabled": sharp_api_enabled(),
@@ -437,10 +439,11 @@ def odds_debug_payload(
         kwargs: dict[str, Any] = {"sport": sport_lower}
         if league:
             kwargs["league"] = league
+        if event_date:
+            kwargs["event_date"] = event_date
         odds = fetch_odds(**kwargs)
         payload["provider"] = _detect_odds_provider(odds)
-        if odds:
-            payload["odds_api_status_code"] = 200
+        payload["odds_api_status_code"] = 200
     except Exception as error:
         if not odds and odds_api_key and sport_lower == "mlb":
             try:

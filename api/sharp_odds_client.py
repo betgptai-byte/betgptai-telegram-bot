@@ -256,19 +256,20 @@ def get_odds(
     return normalized
 
 
-def get_soccer_odds(league: str | None = None) -> list[dict[str, Any]]:
-    """Fetch soccer odds, optionally scoped to a league.
+def get_soccer_odds(league: str | None = None, event_date: str | None = None) -> list[dict[str, Any]]:
+    """Fetch soccer odds, optionally scoped to a league and date.
 
     Args:
         league: Optional league name, e.g. ``"EPL"``, ``"La Liga"``,
                 ``"MLS"``.  If ``None``, fetches all soccer odds.
+        event_date: Optional ISO date to scope the request.
 
     Returns normalized events in The Odds API shape.
     """
     if league:
         league_clean = league.strip()
-        return get_odds(sport="soccer", league=league_clean)
-    return get_odds(sport="soccer", league=None)
+        return get_odds(sport="soccer", league=league_clean, event_date=event_date)
+    return get_odds(sport="soccer", league=None, event_date=event_date)
 
 
 def _base_url() -> str:

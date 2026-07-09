@@ -198,14 +198,19 @@ def _prop_empty_reason(props_payload: dict[str, Any], prop_family: str) -> str:
 
 def _admin_pick_line(candidate: dict[str, Any], fallback_market: str) -> str:
     pick = _safe(candidate.get("pick_text") or candidate.get("selection"), "Pick")
-    if fallback_market == "team_total":
+    if candidate.get("inferred_line_admin_only"):
+        pick = f"{pick} (Inferred line — admin only)"
+    elif fallback_market == "team_total":
         line = candidate.get("line")
         if line not in (None, "", "unavailable") and str(line) not in pick:
             pick = f"{pick} {line}"
+    edge = candidate.get("final_edge_score")
+    if edge is not None:
+        pick = f"{pick} — Edge {edge}"
     return pick
 
 
-def _mlb_top5_lists(card_date: str, odds_api_key: str, highlightly_api_key: str) -> dict[str, list[str]]:
+def _mlb_top5_lists(card_date: str, odds_api_key: str, highlightly_api_key: str) -> dict[str, Any]:
     """Build MLB-only top opportunity lists from the MLB admin Top 5 engine."""
     try:
         report = build_mlb_top5_admin_card(
@@ -216,14 +221,21 @@ def _mlb_top5_lists(card_date: str, odds_api_key: str, highlightly_api_key: str)
     except Exception:
         return {
             "team_totals": [],
+            "game_totals": [],
             "moneylines": [],
             "f5_moneylines": [],
+            "market_debug": {},
         }
     top5 = report.get("top5") if isinstance(report.get("top5"), dict) else {}
     return {
         "team_totals": [
             _admin_pick_line(item, "team_total")
             for item in (top5.get("team_totals") or [])
+            if isinstance(item, dict)
+        ],
+        "game_totals": [
+            _admin_pick_line(item, "total")
+            for item in (top5.get("game_totals") or [])
             if isinstance(item, dict)
         ],
         "moneylines": [
@@ -236,6 +248,7 @@ def _mlb_top5_lists(card_date: str, odds_api_key: str, highlightly_api_key: str)
             for item in (top5.get("f5_moneyline") or [])
             if isinstance(item, dict)
         ],
+        "market_debug": report.get("market_debug") if isinstance(report.get("market_debug"), dict) else {},
     }
 
 
@@ -503,13 +516,11 @@ def build_intelligence_dashboard(
     strikeouts = _top_props(props, "strikeouts")
     matched_odds_games = sum(1 for game in slate if game.get("odds_status") == "available")
     market_empty_reason = (
-        "Moneylines unavailable because Odds API returned 0 matched MLB games."
-        if slate and matched_odds_games == 0
-        else "No qualified MLB candidates available from current engines."
+        "No qualified MLB candidates available from current engines."
     )
 
     dashboard = {
-        "version": "BETGPTAI Intelligence Dashboard v1",
+        "version": "BETGPTAI Intelligence Dashboard v2",
         "card_date": card_date,
         "display_date": _display_date(card_date),
         "created_at": datetime.now(EASTERN).isoformat(timespec="seconds"),
@@ -530,22 +541,24 @@ def build_intelligence_dashboard(
             "hr_watch_reason": "" if hr_watch else _prop_empty_reason(props, "home_runs"),
             "strikeout_props": [_strikeout_prop_line(prop) for prop in strikeouts],
             "strikeout_props_reason": "" if strikeouts else _prop_empty_reason(props, "strikeouts"),
-            "team_totals": mlb_top5.get("team_totals") or _extract_saved_picks(card_date, "team_total"),
+            "team_totals": mlb_top5.get("team_totals") or [],
             "team_totals_reason": "" if mlb_top5.get("team_totals") else market_empty_reason,
-            "moneylines": mlb_top5.get("moneylines") or _extract_saved_picks(card_date, "moneyline"),
+            "game_totals": mlb_top5.get("game_totals") or [],
+            "game_totals_reason": "" if mlb_top5.get("game_totals") else market_empty_reason,
+            "moneylines": mlb_top5.get("moneylines") or [],
             "moneylines_reason": "" if mlb_top5.get("moneylines") else market_empty_reason,
-            "f5_moneylines": mlb_top5.get("f5_moneylines") or _extract_saved_picks(card_date, "f5_moneyline"),
+            "f5_moneylines": mlb_top5.get("f5_moneylines") or [],
             "f5_moneylines_reason": "" if mlb_top5.get("f5_moneylines") else market_empty_reason,
             "top_underdogs": _top_underdogs(card_date),
         },
-        # Backward-compatible key for old callers. Keep it MLB-only now.
         "top_opportunities": {
             "top_10_hit_props": [_hit_prop_line(prop) for prop in hit_props],
             "top_10_hr_watch": [_hr_watch_line(prop) for prop in hr_watch],
             "top_10_strikeout_props": [_strikeout_prop_line(prop) for prop in strikeouts],
-            "top_10_team_totals": mlb_top5.get("team_totals") or _extract_saved_picks(card_date, "team_total"),
-            "top_10_moneylines": mlb_top5.get("moneylines") or _extract_saved_picks(card_date, "moneyline"),
-            "top_10_f5_moneylines": mlb_top5.get("f5_moneylines") or _extract_saved_picks(card_date, "f5_moneyline"),
+            "top_10_team_totals": mlb_top5.get("team_totals") or [],
+            "top_10_game_totals": mlb_top5.get("game_totals") or [],
+            "top_10_moneylines": mlb_top5.get("moneylines") or [],
+            "top_10_f5_moneylines": mlb_top5.get("f5_moneylines") or [],
             "top_underdogs": _top_underdogs(card_date),
         },
         "soccer_top_opportunities": {
@@ -571,6 +584,7 @@ def build_intelligence_dashboard(
                 "home_runs": "" if hr_watch else _prop_empty_reason(props, "home_runs"),
                 "strikeouts": "" if strikeouts else _prop_empty_reason(props, "strikeouts"),
             },
+            "market_debug": mlb_top5.get("market_debug") or {},
         },
         "player_trends": trends,
         "pitcher_reports": pitcher_reports,
@@ -613,6 +627,7 @@ def render_daily_intel(payload: dict[str, Any]) -> str:
         ("Top Hit Props", "top_hit_props"),
         ("HR Watch", "hr_watch"),
         ("Strikeout Props", "strikeout_props"),
+        ("Game Totals", "game_totals"),
         ("Team Totals", "team_totals"),
         ("Moneylines", "moneylines"),
         ("F5 Moneylines", "f5_moneylines"),
@@ -627,6 +642,7 @@ def render_daily_intel(payload: dict[str, Any]) -> str:
                 "top_hit_props": "top_hit_props_reason",
                 "hr_watch": "hr_watch_reason",
                 "strikeout_props": "strikeout_props_reason",
+                "game_totals": "game_totals_reason",
                 "team_totals": "team_totals_reason",
                 "moneylines": "moneylines_reason",
                 "f5_moneylines": "f5_moneylines_reason",
@@ -662,6 +678,8 @@ def render_morning_report(payload: dict[str, Any]) -> str:
         + "\n".join(
             f"{i}. {item}" for i, item in enumerate((opps.get("top_hit_props") or [])[:5], 1)
         )
+        + "\n\nTop Game Totals:\n"
+        + "\n".join(f"{i}. {item}" for i, item in enumerate((opps.get("game_totals") or [])[:5], 1))
         + "\n\nTop Moneylines:\n"
         + "\n".join(f"{i}. {item}" for i, item in enumerate((opps.get("moneylines") or [])[:5], 1))
     ).strip()
@@ -673,6 +691,8 @@ def render_intel_debug(payload: dict[str, Any]) -> str:
     sources = debug.get("data_sources_used") if isinstance(debug.get("data_sources_used"), dict) else {}
     rejected = debug.get("props_rejected") if isinstance(debug.get("props_rejected"), list) else []
     missing = debug.get("prop_missing_reasons") if isinstance(debug.get("prop_missing_reasons"), dict) else {}
+    market_debug = debug.get("market_debug") if isinstance(debug.get("market_debug"), dict) else {}
+    opps = payload.get("mlb_top_opportunities", {}) or payload.get("top_opportunities", {})
     lines = [
         "🧪 BETGPTAI INTELLIGENCE DEBUG",
         f"📅 Date: {payload.get('display_date')}",
@@ -685,8 +705,37 @@ def render_intel_debug(payload: dict[str, Any]) -> str:
         f"Props candidates created: {debug.get('props_candidates_created', 0)}",
         f"Soccer candidates count: {debug.get('soccer_candidates_count', 0)}",
         "",
-        "Data sources used:",
     ]
+    if market_debug:
+        lines.extend(["── Market Debug ──"])
+        lines.append(f"Market: {market_debug.get('market', 'N/A')}")
+        lines.append(f"Candidates scanned: {market_debug.get('candidates_scanned', 0)}")
+        lines.append(f"Overs created: {market_debug.get('overs_created', 0)}")
+        lines.append(f"Unders created: {market_debug.get('unders_created', 0)}")
+        lines.append(f"Rejected count: {market_debug.get('rejected_count', 0)}")
+        lines.append(f"Edge threshold: {market_debug.get('edge_threshold_used', 'N/A')}")
+        lines.append(f"Fallback used: {'yes' if market_debug.get('fallback_used') else 'no'}")
+        reasons = market_debug.get("rejection_reasons") or []
+        if reasons:
+            lines.append("Rejection reasons:")
+            lines.extend(f"- {r}" for r in reasons[:5])
+        lines.append("")
+    for market_name, market_key in (
+        ("Game Totals", "game_totals"),
+        ("Team Totals", "team_totals"),
+        ("Moneylines", "moneylines"),
+    ):
+        items = opps.get(market_key) or []
+        lines.append(f"── {market_name} ──")
+        lines.append(f"Total: {len(items)}")
+        inferred_count = sum(1 for it in items if "Inferred line" in str(it))
+        lines.append(f"Inferred (admin-only): {inferred_count}")
+        real_count = len(items) - inferred_count
+        lines.append(f"Real market lines: {real_count}")
+        lines.append("")
+    lines.extend([
+        "Data sources used:",
+    ])
     if sources:
         lines.extend(f"- {key}: {value}" for key, value in sources.items())
     else:

@@ -192,12 +192,139 @@ def _ranked_market_candidates(slate: list[dict[str, Any]], market: str, limit: i
     return unique or _admin_market_fallback_candidates(slate, market, limit=limit)
 
 
+def _team_total_edge_score(
+    game: dict[str, Any],
+    side: str,
+    direction: str,
+) -> float:
+    """Score a team-total Over/Under from 0–100 based on opponent SP, bullpen, offense, park."""
+    opponent = "home" if side == "away" else "away"
+    sp_stats = game.get(f"{opponent}_pitcher_stats") or {}
+    savant = _dict(game.get("savant"))
+    sp_savant = _dict(savant.get(f"{opponent}_pitcher"))
+    bullpen = _dict(savant.get(f"{opponent}_bullpen"))
+    fg = _dict(game.get("fangraphs"))
+    fg_batting = _dict(fg.get(f"{side}_team_batting"))
+    weather = _dict(game.get("weather"))
+    park = str(game.get("park_factor") or "").lower()
+
+    score = 50.0
+
+    # Opponent SP quality (ERA/WHIP)
+    sp_era = _num(sp_stats.get("ERA"))
+    sp_whip = _num(sp_stats.get("WHIP"))
+    sp_xera = _num(sp_savant.get("xERA"))
+    sp_xba = _num(sp_savant.get("xBA"))
+    sp_xslg = _num(sp_savant.get("xSLG"))
+
+    sp_poor_mix = (sp_era * 0.30 + sp_whip * 15 + sp_xera * 0.20 + sp_xba * 50 + sp_xslg * 20) / 5
+    if direction == "Over":
+        score += sp_poor_mix * 0.40
+    else:
+        score -= sp_poor_mix * 0.40
+
+    # Bullpen quality
+    bp_whip = _num(bullpen.get("WHIP"))
+    if direction == "Over":
+        score += bp_whip * 15
+    else:
+        score -= bp_whip * 15
+
+    # Team offense OPS
+    team_ops = _num(fg_batting.get("OPS"))
+    if direction == "Over":
+        score += team_ops * 30
+    else:
+        score -= team_ops * 30
+
+    # Park/weather run environment
+    hitter_words = {"hitter", "hr", "extreme", "friendly"}
+    park_is_hitter = any(word in park for word in hitter_words)
+    temp = weather.get("temperature_f") or weather.get("temperature")
+    high_temp = isinstance(temp, (int, float)) and temp > 75
+    if direction == "Over":
+        if park_is_hitter:
+            score += 10
+        if high_temp:
+            score += 5
+    else:
+        if park_is_hitter:
+            score -= 10
+        if high_temp:
+            score -= 5
+
+    return max(0.0, min(100.0, score))
+
+
+def _compute_team_totals(
+    slate: list[dict[str, Any]],
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Rank both Over and Under team-total candidates by edge score.
+
+    Uses real market lines when available; falls back to inferred admin-only
+    lines (4.5/5.5) marked ``inferred_line_admin_only``.
+    """
+    candidates: list[dict[str, Any]] = []
+    for game in slate:
+        for side in ("away", "home"):
+            team = _safe(game.get(f"{side}_team"), "Team")
+            real_over: dict[str, Any] | None = None
+            real_under: dict[str, Any] | None = None
+            for wager in game.get("best_available_prices", []) if isinstance(game.get("best_available_prices"), list) else []:
+                if not isinstance(wager, dict) or wager.get("market") != "team_totals":
+                    continue
+                if not isinstance(wager.get("price"), (int, float)):
+                    continue
+                desc = str(wager.get("description") or "").strip()
+                outcome = str(wager.get("outcome") or "").strip().lower()
+                point = wager.get("point")
+                if not isinstance(point, (int, float)):
+                    continue
+                if outcome == "over" and desc == team:
+                    if real_over is None or abs(point - 4.5) < abs(real_over.get("line", 9) - 4.5):
+                        real_over = {"team": team, "line": point, "odds": wager["price"], "direction": "Over"}
+                elif outcome == "under" and desc == team:
+                    if real_under is None or abs(point - 5.5) < abs(real_under.get("line", 9) - 5.5):
+                        real_under = {"team": team, "line": point, "odds": wager["price"], "direction": "Under"}
+            for direction, market_entry, inferred_line in (
+                ("Over", real_over, 4.5),
+                ("Under", real_under, 5.5),
+            ):
+                if market_entry:
+                    line = market_entry["line"]
+                    odds = market_entry["odds"]
+                    safer = line - 1 if direction == "Over" else line + 1
+                    pick_text = f"{team} Team Total {direction} {line:g} | Safer Alt: {direction} {safer:g}"
+                    row = _candidate_base(game, "team_total", pick_text, line=line, odds=odds)
+                    row["inferred_line"] = False
+                    row["inferred_line_admin_only"] = False
+                else:
+                    line = inferred_line
+                    safer = line - 1 if direction == "Over" else line + 1
+                    pick_text = f"{team} Team Total {direction} {line:g} | Safer Alt: {direction} {safer:g}"
+                    row = _candidate_base(game, "team_total", pick_text, line=line, odds=None)
+                    row["inferred_line"] = True
+                    row["inferred_line_admin_only"] = True
+                edge = _team_total_edge_score(game, side, direction)
+                row["score"] = edge / 100.0
+                row["final_edge_score"] = round(edge)
+                row["team_side"] = side
+                row["direction"] = direction
+                candidates.append(row)
+
+    candidates.sort(key=lambda r: r.get("final_edge_score", 0), reverse=True)
+    return candidates[:limit]
+
+
 def _top_f5_candidates(slate: list[dict[str, Any]], limit: int = 5) -> list[dict[str, Any]]:
     """F5 is always moneyline only, derived from strongest ML profiles."""
     rows = []
     for candidate in _ranked_market_candidates(slate, "h2h", limit=limit * 2):
         game = next((item for item in slate if str(item.get("game_pk") or item.get("game_id")) == str(candidate.get("game_pk"))), {})
-        pick_text = f"{candidate['pick_text']} F5 ML"
+        base = candidate["pick_text"]
+        base = re.sub(r"\s+ML$", "", base)
+        pick_text = f"{base} F5 ML"
         row = _candidate_base(game, "f5_moneyline", pick_text, line=None, odds=None)
         row["score"] = candidate.get("score", 0)
         row["final_edge_score"] = round((row["score"] or 0.86) * 100)
@@ -208,46 +335,184 @@ def _top_f5_candidates(slate: list[dict[str, Any]], limit: int = 5) -> list[dict
     return rows[:limit] or _admin_market_fallback_candidates(slate, "f5_moneyline", limit=limit)
 
 
-def _inferred_team_totals(slate: list[dict[str, Any]], limit: int = 5) -> list[dict[str, Any]]:
-    """Infer safe team-total display when official team-total markets are missing."""
-    inferred: list[dict[str, Any]] = []
+def _moneyline_quant_edge(game: dict[str, Any], side: str) -> float:
+    """Score a moneyline side from 0–100 based on SP/offense/bullpen/market context."""
+    opponent = "home" if side == "away" else "away"
+    sp_stats = game.get(f"{side}_pitcher_stats") or {}
+    opp_sp_stats = game.get(f"{opponent}_pitcher_stats") or {}
+    savant = _dict(game.get("savant"))
+    sp_savant = _dict(savant.get(f"{side}_pitcher"))
+    opp_sp_savant = _dict(savant.get(f"{opponent}_pitcher"))
+    bullpen = _dict(savant.get(f"{side}_bullpen"))
+    opp_bullpen = _dict(savant.get(f"{opponent}_bullpen"))
+    fg = _dict(game.get("fangraphs"))
+    fg_batting = _dict(fg.get(f"{side}_team_batting"))
+    opp_fg_batting = _dict(fg.get(f"{opponent}_team_batting"))
+    park = str(game.get("park_factor") or "").lower()
+
+    score = 50.0
+    sp_era = _num(sp_stats.get("ERA"))
+    opp_sp_era = _num(opp_sp_stats.get("ERA"))
+    sp_xera = _num(sp_savant.get("xERA"))
+    opp_sp_xera = _num(opp_sp_savant.get("xERA"))
+    team_ops = _num(fg_batting.get("OPS"))
+    opp_team_ops = _num(opp_fg_batting.get("OPS"))
+    bp_whip = _num(bullpen.get("WHIP"))
+    opp_bp_whip = _num(opp_bullpen.get("WHIP"))
+
+    # SP edge
+    sp_diff = opp_sp_era - sp_era
+    score += sp_diff * 5
+    xera_diff = opp_sp_xera - sp_xera
+    score += xera_diff * 5
+
+    # OPS edge
+    ops_diff = team_ops - opp_team_ops
+    score += ops_diff * 15
+
+    # Bullpen edge
+    bp_diff = opp_bp_whip - bp_whip
+    score += bp_diff * 10
+
+    # Park factor
+    if any(word in park for word in ("hitter", "hr", "extreme")):
+        score += 3
+
+    return max(0.0, min(100.0, score))
+
+
+def _ranked_market_candidates_v2(
+    slate: list[dict[str, Any]],
+    market: str,
+    limit: int = 5,
+    edge_threshold: float = 55.0,
+) -> list[dict[str, Any]]:
+    """Build ranked admin candidates from best_available_prices with edge scoring.
+
+    For moneylines (h2h), computes a quant edge per side and only includes
+    candidates that exceed *edge_threshold*.  Returns empty list with a
+    reason when no candidate qualifies.
+    """
+    rows: list[dict[str, Any]] = []
+    market_type = {
+        "h2h": "moneyline",
+        "spreads": "runline",
+        "totals": "total",
+        "team_totals": "team_total",
+    }.get(market, market)
+    market_debug = {
+        "market": market,
+        "candidates_scanned": 0,
+        "overs_created": 0,
+        "unders_created": 0,
+        "rejected_count": 0,
+        "rejection_reasons": [],
+        "edge_threshold_used": edge_threshold,
+        "fallback_used": False,
+    }
     for game in slate:
-        moneylines = []
-        totals = []
-        for wager in game.get("best_available_prices", []) if isinstance(game.get("best_available_prices"), list) else []:
-            if not isinstance(wager, dict):
-                continue
-            if wager.get("market") == "h2h" and isinstance(wager.get("price"), (int, float)):
-                moneylines.append(wager)
-            if wager.get("market") == "totals" and isinstance(wager.get("price"), (int, float)):
-                totals.append(wager)
-        moneylines.sort(key=lambda item: _implied_probability(item.get("price")), reverse=True)
-        if not moneylines:
+        prices_list = game.get("best_available_prices", [])
+        if not isinstance(prices_list, list):
             continue
-        total_under = any(str(item.get("outcome", "")).lower() == "under" for item in totals)
-        if total_under and len(moneylines) > 1:
-            team = _safe(moneylines[-1].get("outcome"), "Team")
-            direction, line, safer = "Under", 5.5, 6.5
-        else:
-            team = _safe(moneylines[0].get("outcome"), "Team")
-            direction, line, safer = "Over", 4.5, 3.5
-        row = _candidate_base(
-            game,
-            "team_total",
-            f"{team} Team Total {direction} {line:g} | Safer Alt: {direction} {safer:g}",
-            line=line,
-            odds=None,
-        )
-        row["score"] = _implied_probability(moneylines[0].get("price")) - (0.05 if direction == "Under" else 0)
-        row["final_edge_score"] = round(row["score"] * 100)
-        row["confidence"] = "Admin Candidate"
-        row["risk_level"] = "Medium"
-        row["data_quality_grade"] = "Admin"
-        row["inferred_default"] = True
-        inferred.append(row)
-        if len(inferred) >= limit:
+        for wager in prices_list:
+            if not isinstance(wager, dict) or wager.get("market") != market:
+                continue
+            price = wager.get("price")
+            if not isinstance(price, (int, float)):
+                continue
+            outcome = _safe(wager.get("description") or wager.get("outcome"), "Pick")
+            point = wager.get("point")
+            if market == "spreads" and isinstance(point, (int, float)):
+                pick_text = f"{outcome} {point:+g}"
+                line = point
+            elif market == "totals" and isinstance(point, (int, float)):
+                pick_text = f"{outcome} {point:g} ({game.get('away_team')} @ {game.get('home_team')})"
+                line = point
+            elif market == "team_totals":
+                continue
+            else:
+                pick_text = str(outcome)
+                line = point
+            market_debug["candidates_scanned"] += 1
+            candidate = _candidate_base(game, market_type, pick_text, line=line, odds=price)
+            candidate["score"] = _implied_probability(price)
+            candidate["final_edge_score"] = round(candidate["score"] * 100)
+            candidate["confidence"] = "Admin Candidate"
+            candidate["risk_level"] = "Medium"
+            candidate["data_quality_grade"] = "Admin"
+
+            if market == "h2h":
+                side = None
+                if outcome == game.get("away_team"):
+                    side = "away"
+                elif outcome == game.get("home_team"):
+                    side = "home"
+                if side:
+                    qe = _moneyline_quant_edge(game, side)
+                    if qe < edge_threshold:
+                        market_debug["rejected_count"] += 1
+                        team_name = game.get(f"{side}_team", outcome)
+                        market_debug["rejection_reasons"].append(
+                            f"{team_name} ML — quant edge {qe:.0f} below threshold {edge_threshold:.0f}"
+                        )
+                        continue
+                    candidate["quant_edge_score"] = round(qe)
+                    candidate["final_edge_score"] = round(qe)
+                    candidate["score"] = qe / 100.0
+
+            rows.append(candidate)
+
+    if not rows:
+        market_debug["fallback_used"] = True
+
+    rows.sort(key=lambda r: r.get("final_edge_score", 0), reverse=True)
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[Any, str, str]] = set()
+    for row in rows:
+        key = (row.get("game_pk"), row.get("market_type"), row.get("pick_text"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(row)
+        if len(unique) >= limit:
             break
-    return inferred
+    if not unique:
+        msg = "No qualified moneyline candidates — "
+        reasons = market_debug["rejection_reasons"]
+        if reasons:
+            msg += "; ".join(reasons[:3])
+        else:
+            msg += "no market data or all candidates were below edge threshold."
+        return []
+    return unique
+
+
+def _build_market_debug(
+    slate: list[dict[str, Any]],
+    market: str,
+    edge_threshold: float = 55.0,
+) -> dict[str, Any]:
+    """Build a lightweight market debug dict for the dashboard."""
+    scanned = 0
+    found_over = 0
+    found_under = 0
+    for game in slate:
+        for wager in game.get("best_available_prices", []) if isinstance(game.get("best_available_prices"), list) else []:
+            if not isinstance(wager, dict) or wager.get("market") != market:
+                continue
+            scanned += 1
+            outcome = str(wager.get("outcome") or "").lower()
+            if outcome == "over":
+                found_over += 1
+            elif outcome == "under":
+                found_under += 1
+    return {
+        "market": market,
+        "candidates_scanned": scanned,
+        "overs_found": found_over,
+        "unders_found": found_under,
+        "edge_threshold": edge_threshold,
+    }
 
 
 def build_mlb_top5_admin_card(
@@ -272,17 +537,21 @@ def build_mlb_top5_admin_card(
             slate = enrich_mlb_slate_verification(slate, card_date)
         except Exception as error:
             errors.append(f"ESPN verification unavailable: {error}")
-    official_team_totals = _ranked_market_candidates(slate, "team_totals", limit=5)
-    team_totals = official_team_totals or _inferred_team_totals(slate, limit=5) or _admin_market_fallback_candidates(slate, "team_totals", limit=5)
     top5 = {
-        "moneyline": _ranked_market_candidates(slate, "h2h", limit=5),
+        "moneyline": _ranked_market_candidates_v2(slate, "h2h", limit=5),
         "f5_moneyline": _top_f5_candidates(slate, limit=5),
-        "runline": _ranked_market_candidates(slate, "spreads", limit=5),
+        "runline": _ranked_market_candidates_v2(slate, "spreads", limit=5),
         "game_totals": _ranked_market_candidates(slate, "totals", limit=5),
-        "team_totals": team_totals,
+        "team_totals": _compute_team_totals(slate, limit=5),
+    }
+    market_debug_by_key = {
+        "moneyline": _build_market_debug(slate, "h2h"),
+        "runline": _build_market_debug(slate, "spreads"),
+        "game_totals": _build_market_debug(slate, "totals"),
+        "team_totals": _build_market_debug(slate, "team_totals"),
     }
     report = {
-        "version": "MLB Admin Top 5 Card v1",
+        "version": "MLB Admin Top 5 Card v2",
         "card_date": card_date,
         "display_date": _display_date(card_date),
         "created_at": datetime.now(EASTERN).isoformat(timespec="seconds"),
@@ -290,6 +559,7 @@ def build_mlb_top5_admin_card(
         "saved_to_official_picks": False,
         "errors": errors,
         "top5": top5,
+        "market_debug": market_debug_by_key,
     }
     path = _admin_dir(card_date) / "mlb_top5_admin.json"
     _write_json(path, report)

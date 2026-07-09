@@ -41,12 +41,17 @@ from mlb_data import MLBDataError, get_mlb_odds as odds_api_fetch
 logger = logging.getLogger(__name__)
 
 
-def fetch_odds(sport: str = "mlb", league: str | None = None) -> list[dict[str, Any]]:
+def fetch_odds(
+    sport: str = "mlb",
+    league: str | None = None,
+    event_date: str | None = None,
+) -> list[dict[str, Any]]:
     """Fetch odds for *sport* — Sharp primary, Odds API fallback (MLB only).
 
     Args:
         sport: One of ``mlb``, ``soccer``, ``nba``, ``nfl``, ``nhl``.
         league: Optional league override (e.g. ``"EPL"`` for soccer).
+        event_date: Optional ISO date to scope the request.
 
     Returns normalized events in The Odds API shape.
     Returns empty list if all providers fail.
@@ -66,7 +71,7 @@ def fetch_odds(sport: str = "mlb", league: str | None = None) -> list[dict[str, 
         try:
             cfg = SHARP_SPORT_MAP[sport_lower]
             league_param = league or cfg.get("league")
-            odds = sharp_get_odds(sport=sport_lower, league=league_param)
+            odds = sharp_get_odds(sport=sport_lower, league=league_param, event_date=event_date)
             if odds:
                 logger.info(
                     "Odds provider router: Sharp API for %s (%d events, league=%s)",

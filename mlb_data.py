@@ -328,53 +328,72 @@ def _closest_odds_game(game: dict[str, Any], candidates: list[dict[str, Any]]) -
 
 def combine_schedule_and_odds(schedule: list[dict[str, Any]], odds: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Match odds events to MLB games by normalized team names and start time."""
+    from api.sharp_odds_client import build_game_market_context
+
     by_game: dict[frozenset[str], list[dict[str, Any]]] = {}
     for odds_game in odds:
         by_game.setdefault(_game_key(odds_game.get("away_team", ""), odds_game.get("home_team", "")), []).append(odds_game)
+    provider = _detect_odds_provider(odds)
     combined = []
     for game in schedule:
         odds_game = _closest_odds_game(game, by_game.get(_game_key(game["away_team"], game["home_team"]), []))
         bookmakers = _clean_bookmakers(odds_game) if odds_game else []
         best_prices = _best_available_prices(bookmakers)
-        combined.append({**game, "odds_event_id": odds_game.get("id") if odds_game else None,
-                         "best_available_prices": best_prices,
-                         "bookmakers": bookmakers,
-                         "odds_status": "available" if odds_game else UNAVAILABLE,
-                         "market_context": _market_context_from_prices(best_prices)})
+        game_row = {**game, "odds_event_id": odds_game.get("id") if odds_game else None,
+                    "best_available_prices": best_prices,
+                    "bookmakers": bookmakers,
+                    "odds_status": "available" if odds_game else UNAVAILABLE}
+        game_row["market_context"] = build_game_market_context(game_row, best_prices, provider)
+        combined.append(game_row)
     return combined
 
 
+def _detect_odds_provider(odds: list[dict[str, Any]]) -> str:
+    """Detect which provider returned the odds data based on event shape."""
+    if not odds:
+        return "unknown"
+    sample = odds[0]
+    has_sharp_keys = any(
+        k in sample for k in ("id", "sport_key")
+    ) and "bookmakers" in sample
+    if has_sharp_keys:
+        return "sharp_api"
+    return "odds_api"
+
+
 def _attach_unavailable_odds(slate: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    from api.sharp_odds_client import build_game_market_context
     for game in slate:
         game.update({"odds_event_id": None, "best_available_prices": [],
-                     "bookmakers": [], "odds_status": UNAVAILABLE,
-                     "market_context": _market_context_from_prices([])})
+                     "bookmakers": [], "odds_status": UNAVAILABLE})
+        game["market_context"] = build_game_market_context(game, [], "unknown")
     return slate
 
 
 def _market_context_from_prices(prices: list[dict[str, Any]]) -> dict[str, Any]:
     """Compact market summary stored on each game for admin diagnostics."""
-    context = {"ML": [], "RL": [], "total": [], "team_totals": [], "odds_found": bool(prices)}
+    context = {"moneyline": [], "runline": [], "total": [], "team_totals": [], "odds_found": bool(prices)}
     for price in prices:
         market = price.get("market")
         label = price.get("description") or price.get("outcome")
         point = price.get("point")
         american = price.get("price")
+        entry = {"label": label, "odds": american}
         if market == "h2h":
-            context["ML"].append({"label": label, "odds": american})
+            context["moneyline"].append(entry)
         elif market == "spreads":
-            context["RL"].append({"label": label, "line": point, "odds": american})
+            context["runline"].append({**entry, "line": point})
         elif market == "totals":
-            context["total"].append({"label": label, "line": point, "odds": american})
+            context["total"].append({**entry, "line": point})
         elif market == "team_totals":
-            context["team_totals"].append({"label": label, "line": point, "odds": american})
+            context["team_totals"].append({**entry, "line": point})
     return context
 
 
 def odds_debug_payload(odds_api_key: str, selected_date: str) -> dict[str, Any]:
     """Owner-only diagnostics for all odds providers."""
-    from services.odds_router import provider_status as router_status
-    from api.sharp_client import health as sharp_health, sharp_api_enabled, sharp_api_key
+    from api.sharp_odds_client import health as sharp_health, sharp_api_enabled, sharp_api_key
+    from services.odds_provider_router import provider_status as router_status
 
     payload: dict[str, Any] = {
         "odds_api_key_loaded": bool(str(odds_api_key or "").strip()),
@@ -399,19 +418,11 @@ def odds_debug_payload(odds_api_key: str, selected_date: str) -> dict[str, Any]:
         schedule = []
         payload["errors"].append(f"MLB schedule unavailable: {error}")
 
-    # Try Sharp first, then Odds API fallback
     odds: list[dict[str, Any]] = []
     try:
-        from services.odds_router import fetch_odds
+        from services.odds_provider_router import fetch_odds
         odds = fetch_odds()
-        payload["provider"] = "sharp_api"
-        # Determine which provider actually returned data
-        if odds:
-            has_sharp_keys = any(
-                "bookmaker_key" not in bk and "bookmaker" not in bk
-                for event in odds
-                for bk in (event.get("bookmakers") or [])
-            )
+        payload["provider"] = _detect_odds_provider(odds)
         payload["odds_api_status_code"] = 200
     except Exception as error:
         if not odds and odds_api_key:
@@ -597,12 +608,14 @@ def get_combined_slate(
             game.setdefault("park_factor", "neutral")
 
     try:
-        from services.odds_router import fetch_odds
+        from services.odds_provider_router import fetch_odds, enrich_slate_market_context
         odds = fetch_odds()
         if odds:
+            provider = _detect_odds_provider(odds)
             slate = combine_schedule_and_odds(slate, odds)
+            slate = enrich_slate_market_context(slate, odds, provider)
         else:
-            raise MLBDataError("Odds router returned empty")
+            raise MLBDataError("Odds provider router returned empty")
     except Exception as error:
         logging.warning("Odds unavailable; continuing with schedule data: %s", error)
         slate = _attach_unavailable_odds(slate)

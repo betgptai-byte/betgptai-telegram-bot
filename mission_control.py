@@ -7,7 +7,7 @@ surface. It should never be imported for member-facing copy.
 from __future__ import annotations
 
 from model_weights import ai_learning_auto_apply_enabled
-from api.sharp_client import health as sharp_health
+from api.sharp_odds_client import health as sharp_health
 
 
 def ai_learning_auto_apply_line() -> str:

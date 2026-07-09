@@ -190,7 +190,13 @@ from posting_scheduler import (
     set_auto_results_enabled,
     time_debug_text,
 )
-from daily_workflow import force_post_free_channel_job, generate_cards_job, workflow_status
+from daily_workflow import (
+    force_post_free_channel_job,
+    generate_cards_job,
+    get_first_mlb_pitch,
+    workflow_status,
+)
+from time_utils import now_et, to_et
 from quality_gate import render_prepost_quality_gate, run_prepost_quality_gate
 from bot.callbacks.router import register_callback_router
 
@@ -1774,10 +1780,37 @@ async def workflow_debug_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def force_generate_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Owner-only manual T-45 generation run."""
-    if not await _require_admin(update) or not update.message:
+    """Owner-only manual T-45 generation run.
+
+    Safety guard: blocks generation if first MLB game is more than
+    90 minutes away.  Owner can override with ``--override``.
+    """
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id != OWNER_TELEGRAM_ID:
         return
+    if not update.message:
+        return
+
+    override = any(arg.strip().lower() == "--override" for arg in (context.args or []))
+
     selected_date = official_sports_date().isoformat()
+
+    if not override:
+        first_pitch = await asyncio.to_thread(get_first_mlb_pitch, selected_date)
+        if first_pitch is not None:
+            now = now_et()
+            minutes_until = (first_pitch - now).total_seconds() / 60.0
+            if minutes_until > 90:
+                await update.message.reply_text(
+                    "Too early to generate official MLB card. "
+                    "Starting pitchers/lineups may not be verified yet.\n\n"
+                    "Allowed while waiting:\n"
+                    "/odds_debug · /status\n"
+                    "/scheduler_status · /workflow_debug\n"
+                    "/post_status"
+                )
+                return
+
     await update.message.reply_text("⏳ Running T-45 generation now...")
     try:
         status = await generate_cards_job(context.bot, selected_date)
@@ -2318,8 +2351,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🟢 OPTIONAL\n\n"
         f"Highlightly: {optional_configured('HIGHLIGHTLY_API_KEY')}\n"
         f"SerpApi: {serpapi_status}\n"
-        f"Sharp API: {core_configured('SHARP_API_KEY')}\n"
-        f"Odds API: {optional_configured('ODDS_API_KEY')}\n"
+        f"Sharp API (primary): {core_configured('SHARP_API_KEY')}\n"
+        f"Odds API (backup): {optional_configured('ODDS_API_KEY')}\n"
         f"API-Sports Baseball: {api_sports_baseball_status}\n"
         f"Player Props Engine: {props_engine_status}\n\n"
         f"TheSportsDB Base URL: {sportsdb_url}\n\n"

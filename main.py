@@ -165,6 +165,8 @@ from results_tracker import (
     save_soccer_picks,
     update_results_from_mlb,
 )
+from core.builder import build_card_from_analysis
+from core.card import structured_card_to_dict
 from safe_parlay_formatter import render_safe_parlay
 from premium_card_formatter import (
     render_category_card,
@@ -967,16 +969,35 @@ async def mlb_auto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             save_model_report, selected_date, slate, analysis, get_last_analysis_metadata()
         )
 
-        # Save the exact free card immediately after generation and before the
-        # card is sent. This guarantees that every delivered pick is tracked.
+        # Build a StructuredCard directly from the slate + analysis data.
+        # This replaces the old flow of generating Telegram text, then
+        # parsing it back to recover picks.
         try:
-            saved_count = await asyncio.to_thread(
-                _save_official_mlb_card,
-                analysis,
-                slate,
-                selected_date,
-                source_command,
+            card = build_card_from_analysis(
+                analysis, slate, selected_date, source_command,
             )
+            _save_latest_card_snapshot(
+                card_date=selected_date,
+                source_command=source_command,
+                analysis=analysis,
+                slate=slate,
+            )
+            card_dict = structured_card_to_dict(card)
+            card_dict["analysis"] = analysis
+            card_dict["slate"] = slate
+            card_dict["source_command"] = source_command
+            save_result = await asyncio.to_thread(persist_official_card, card_dict)
+            if not save_result.get("success"):
+                raise ResultsTrackerError(
+                    str(save_result.get("error") or "Pick persistence failed.")
+                )
+            saved_count = int(save_result.get("saved_pick_count") or 0)
+            summary = render_saved_picks_summary(selected_date)
+            if saved_count <= 0 and "Total picks saved: 0" in summary:
+                raise ResultsTrackerError(
+                    "No structured official picks were generated."
+                )
+            print(f"Saved {saved_count} structured official picks for {selected_date}.", flush=True)
         except Exception as error:
             logging.exception("Could not save official picks to picks.json")
             await update.message.reply_text(
@@ -1921,6 +1942,78 @@ async def debug_picks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "Last grading errors:\n"
         f"{error_text}"
     )
+
+
+async def extract_picks_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only StructuredCard extraction diagnostics."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+    try:
+        analysis = ""
+        slate: list[dict[str, object]] = []
+        if DAILY_CARD_FILE.exists():
+            payload = json.loads(DAILY_CARD_FILE.read_text(encoding="utf-8"))
+            latest_type = payload.get("latest_type")
+            cards = payload.get("cards") if isinstance(payload.get("cards"), dict) else {}
+            latest_card = cards.get(latest_type) if latest_type else None
+            if isinstance(latest_card, dict):
+                analysis = str(latest_card.get("analysis") or latest_card.get("raw_text") or "")
+                saved_slate = latest_card.get("slate")
+                if isinstance(saved_slate, list):
+                    slate = [g for g in saved_slate if isinstance(g, dict)]
+                date_val = latest_card.get("date") or latest_card.get("card_date")
+                if date_val:
+                    selected_date = normalize_pick_date(date_val) or selected_date
+
+        card_generated = bool(analysis.strip())
+        card = await asyncio.to_thread(
+            build_card_from_analysis, analysis, slate, selected_date, "extract_picks_debug",
+        ) if card_generated else None
+
+        lines = [
+            "🧪 BETGPTAI EXTRACT PICKS DEBUG",
+            f"Card date: {selected_date}",
+            f"Card generated: {'YES' if card_generated else 'NO'}",
+        ]
+        if card:
+            total = len(card.official_picks)
+            lines.append(f"Official picks: {total}")
+            errors = (card.metadata or {}).get("errors", [])
+            lines.append(f"Skipped/unmatched: {len(errors)}")
+            sections_found = (card.metadata or {}).get("headings_found", [])
+            lines.append(f"Sections found: {', '.join(sections_found) if sections_found else 'None'}")
+            lines.append("")
+            sections = card.display_sections or {}
+            for key, picks in sections.items():
+                if key.startswith("_"):
+                    continue
+                lines.append(f"  {key}: {len(picks) if isinstance(picks, list) else 0} picks")
+                for p in (picks or []):
+                    lines.append(f"    - {p}")
+            if errors:
+                lines.extend(["", "Skipped picks / errors:"])
+                for err in errors:
+                    lines.append(f"  - {err}")
+            missing = []
+            for pick in card.official_picks:
+                if not pick.game_pk:
+                    missing.append("game_pk")
+                if not pick.selected_team:
+                    missing.append("selected_team")
+                if pick.odds is None:
+                    missing.append("odds")
+                if not pick.market_type:
+                    missing.append("market_type")
+            if missing:
+                lines.extend(["", "Missing required fields:", f"  {set(missing)}"])
+        else:
+            lines.append("No card data available to extract.")
+        await update.message.reply_text("\n".join(lines))
+    except Exception:
+        logging.exception("Unexpected /extract_picks_debug error")
+        await update.message.reply_text("Unable to inspect pick extraction right now.")
 
 
 async def debug_results(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5124,6 +5217,7 @@ async def main() -> None:
     application.add_handler(CommandHandler("enable_auto_results", enable_auto_results))
     application.add_handler(CommandHandler("disable_auto_results", disable_auto_results))
     application.add_handler(CommandHandler("debug_picks", debug_picks))
+    application.add_handler(CommandHandler("extract_picks_debug", extract_picks_debug))
     application.add_handler(CommandHandler("debug_results", debug_results))
     application.add_handler(CommandHandler("date_debug", date_debug))
     application.add_handler(CommandHandler("save_last_card", save_last_card))

@@ -585,6 +585,7 @@ def build_intelligence_dashboard(
                 "strikeouts": "" if strikeouts else _prop_empty_reason(props, "strikeouts"),
             },
             "market_debug": mlb_top5.get("market_debug") or {},
+            "sp_batter_matchup": props_debug.get("sp_batter_matchup") or {},
         },
         "player_trends": trends,
         "pitcher_reports": pitcher_reports,
@@ -750,6 +751,20 @@ def render_intel_debug(payload: dict[str, Any]) -> str:
         for key, value in missing.items():
             if value:
                 lines.append(f"- {key}: {value}")
+    matchup = debug.get("sp_batter_matchup") if isinstance(debug.get("sp_batter_matchup"), dict) else {}
+    if matchup:
+        lines.extend(["", "── SP vs Batter Matchup ──"])
+        lines.append(f"Games scanned: {matchup.get('games_scanned', 0)}")
+        lines.append(f"Hitters scanned: {matchup.get('hitters_scanned', 0)}")
+        lines.append(f"Hitters qualified: {matchup.get('hitters_qualified', 0)}")
+        lines.append(f"Pitcher metrics found: {matchup.get('pitcher_metrics_found', 0)}")
+        lines.append(f"Batter metrics found: {matchup.get('batter_metrics_found', 0)}")
+        lines.append(f"Pitch-type matchups found: {matchup.get('pitch_type_matchups_found', 0)}")
+        lines.append(f"Total missing fields: {matchup.get('missing_fields_total', 0)}")
+        rejected = matchup.get("rejected_hitters") or []
+        if rejected:
+            lines.append(f"Rejected hitters ({len(rejected)}):")
+            lines.extend(f"- {r}" for r in rejected[:10])
     return "\n".join(str(line) for line in lines).strip()
 
 

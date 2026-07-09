@@ -3765,6 +3765,74 @@ async def odds_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(f"/odds_debug failed:\n{error!r}")
 
 
+async def sp_batter_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: show SP vs Batter matchup engine diagnostics.
+
+    Usage: /sp_batter_debug
+    """
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id != OWNER_TELEGRAM_ID:
+        return
+    if not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+    try:
+        await update.message.reply_text("⏳ Running SP vs Batter Matchup Engine...")
+        from services.sp_batter_matchup_engine import build_slate_matchups
+        slate = await asyncio.to_thread(
+            __import__("mlb_data", fromlist=["get_combined_slate"]).get_combined_slate,
+            os.getenv("ODDS_API_KEY", ""),
+            game_date=selected_date,
+            highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+        )
+        result = await asyncio.to_thread(build_slate_matchups, slate)
+        debug = result.get("debug", {})
+        games = result.get("games", [])
+        display_date_str = datetime.fromisoformat(selected_date).strftime("%m/%d/%Y")
+        lines = [
+            "🧪 BETGPTAI SP vs BATTER DEBUG",
+            f"📅 Date: {display_date_str}",
+            f"Games scanned: {debug.get('games_scanned', 0)}",
+            f"Hitters scanned: {debug.get('hitters_scanned', 0)}",
+            f"Hitters qualified: {debug.get('hitters_qualified', 0)}",
+            f"Pitcher metrics found: {debug.get('pitcher_metrics_found', 0)}",
+            f"Batter metrics found: {debug.get('batter_metrics_found', 0)}",
+            f"Pitch-type matchups found: {debug.get('pitch_type_matchups_found', 0)}",
+            f"Total missing fields: {debug.get('missing_fields_total', 0)}",
+            "",
+        ]
+        for g in games:
+            gl = g.get("game_level") or {}
+            lines.append(f"── {gl.get('matchup', 'Game')} ──")
+            lines.append(f"  PK: {g.get('game_pk')}")
+            lines.append(f"  Contact adv: {gl.get('combined_contact_advantage', 'N/A')}")
+            lines.append(f"  Power adv: {gl.get('combined_power_advantage', 'N/A')}")
+            lines.append(f"  Game total side: {gl.get('recommended_game_total_side', 'N/A')}")
+            lines.append(f"  DQ: {gl.get('data_quality_grade', 'N/A')}")
+            for side_key, side_label in (("away_vs_home_sp", "Away→SP"), ("home_vs_away_sp", "Home→SP")):
+                side = g.get(side_key) or {}
+                top = side.get("top_hit_edges") or []
+                if top:
+                    lines.append(f"  Top {side_label}:")
+                    for mu in top[:3]:
+                        lines.append(
+                            f"    {mu.get('player_name')} (spot {mu.get('lineup_spot')}) — "
+                            f"contact {mu.get('contact_edge_score')} / "
+                            f"power {mu.get('power_edge_score')} / "
+                            f"Krisk {mu.get('strikeout_risk_score')} — "
+                            f"{mu.get('best_market')}"
+                        )
+            lines.append("")
+        rejected = debug.get("rejected_hitters") or []
+        if rejected:
+            lines.append(f"Rejected hitters ({len(rejected)}):")
+            lines.extend(f"- {r}" for r in rejected[:15])
+        await _send_long_message(update, "\n".join(lines).strip())
+    except Exception as error:
+        logging.exception("/sp_batter_debug failed")
+        await update.message.reply_text(f"/sp_batter_debug failed:\n{error!r}")
+
+
 async def _build_card_debug_text() -> str:
     """Build owner-only card diagnostics shared by slash command and callback."""
     selected_date = official_sports_date().isoformat()
@@ -5331,6 +5399,9 @@ async def main() -> None:
     application.add_handler(CommandHandler("odds_debug", odds_debug))
     SYSTEM_LOG.info("Registered command: /odds_debug")
     print("Registered command: /odds_debug", flush=True)
+    application.add_handler(CommandHandler("sp_batter_debug", sp_batter_debug))
+    SYSTEM_LOG.info("Registered command: /sp_batter_debug")
+    print("Registered command: /sp_batter_debug", flush=True)
     application.add_handler(CommandHandler("card_debug", card_debug))
     SYSTEM_LOG.info("Registered command: /card_debug")
     print("Registered command: /card_debug", flush=True)

@@ -21,7 +21,7 @@ from edge_database import (
     weighted_score,
 )
 from market_engine import market_value_score
-from matchup_engine import matchup_summary, situational_score
+from matchup_engine import matchup_summary, situational_score, sp_batter_matchup_score
 from offense_engine import offense_score
 from pitcher_engine import pitcher_score
 from weather_park_engine import weather_park_score
@@ -39,6 +39,7 @@ def score_game(game: dict[str, Any]) -> dict[str, Any]:
         ("weather_park_score", weather_park_score),
         ("market_value_score", market_value_score),
         ("situational_score", situational_score),
+        ("sp_batter_matchup_score", sp_batter_matchup_score),
     ):
         score, details = func(game)
         components[key] = score
@@ -59,6 +60,7 @@ def score_game(game: dict[str, Any]) -> dict[str, Any]:
         "weather_park_score": components["weather_park_score"],
         "market_value_score": components["market_value_score"],
         "situational_score": components["situational_score"],
+        "sp_batter_matchup_score": components["sp_batter_matchup_score"],
         "final_edge_score": final_score,
         "minimum_edge_score": MINIMUM_EDGE_SCORE,
         "engine_decision": "QUALIFIED" if final_score >= MINIMUM_EDGE_SCORE else "PASS",

@@ -870,6 +870,14 @@ def _game_report(game: dict[str, Any], props_payload: dict[str, Any]) -> dict[st
     pitcher_context = _dict(enrichment.get("pitcher_context"))
     weather_context = _dict(enrichment.get("weather_context"))
     market_context = _dict(enrichment.get("market_context"))
+
+    sp_batter_matchup: dict[str, Any] = {}
+    try:
+        from services.sp_batter_matchup_engine import build_sp_batter_matchups
+        sp_batter_matchup = build_sp_batter_matchups(game)
+    except Exception:
+        pass
+
     return {
         "game_pk": game_pk,
         "game": f"{game_context.get('away_team')} @ {game_context.get('home_team')}",
@@ -937,6 +945,7 @@ def _game_report(game: dict[str, Any], props_payload: dict[str, Any]) -> dict[st
         "ai_output": _ai_output_for_game(game, props_payload),
         "model_notes": _model_notes(game),
         "overall_grade": enrichment.get("overall_grade"),
+        "sp_batter_matchup": sp_batter_matchup,
     }
 
 
@@ -1293,6 +1302,7 @@ def _render_game(game: dict[str, Any], *, full: bool) -> list[str]:
     weather = _dict(game.get("weather"))
     ai = _dict(game.get("ai_output"))
     notes = _dict(game.get("model_notes"))
+    sp_matchup = _dict(game.get("sp_batter_matchup"))
     lines = [
         DIVIDER,
         f"Game: {game.get('game')}",
@@ -1395,6 +1405,28 @@ def _render_game(game: dict[str, Any], *, full: bool) -> list[str]:
         *[f"- {item}" for item in notes.get("risk_factors", [])],
         "",
     ])
+    # SP vs Batter Matchup section
+    for side_key, side_label in (("away_vs_home_sp", "Away Hitters vs Home SP"), ("home_vs_away_sp", "Home Hitters vs Away SP")):
+        side = _dict(sp_matchup.get(side_key))
+        if not side:
+            continue
+        lines.extend([DIVIDER, f"SP vs Batter: {side_label}"])
+        lines.append(f"Opposing SP: {_safe(side.get('opposing_pitcher'), 'TBD')}")
+        lines.append(f"Hitters scanned: {side.get('hitters_scanned', 0)}")
+        lines.append(f"Team contact adv: {side.get('team_contact_advantage', 'N/A')}")
+        lines.append(f"Team power adv: {side.get('team_power_advantage', 'N/A')}")
+        lines.append(f"Team K risk: {side.get('team_k_risk', 'N/A')}")
+        lines.append(f"Data quality: {_safe(side.get('data_quality_grade'), 'N/A')}")
+        top_edges = side.get("top_hit_edges") or []
+        if top_edges:
+            lines.append("Top hitter edges:")
+            for mu in top_edges[:3]:
+                lines.append(
+                    f"- {mu.get('player_name')} (spot {mu.get('lineup_spot')}) "
+                    f"contact {mu.get('contact_edge_score')} power {mu.get('power_edge_score')} "
+                    f"market {mu.get('best_market')} — DQ {mu.get('data_quality_grade')}"
+                )
+        lines.append("")
     return lines
 
 

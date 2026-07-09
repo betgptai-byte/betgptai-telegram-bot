@@ -24,6 +24,7 @@ from hitting_streaks import get_hitting_streak, hitting_streak_score_adjustment
 from lineup_verification import verify_pitcher_prop_start_state, verify_prop_lineup_state
 from player_verification import verify_player_team, verify_player_team_by_id
 from premium_card_formatter import render_prop_block
+from services.sp_batter_matchup_engine import build_slate_matchups
 from storage import data_file
 
 
@@ -482,6 +483,9 @@ def _build_hitter_props(context: dict[str, Any]) -> tuple[list[dict[str, Any]], 
     park_boost = 4 if any(word in park for word in ("hitter", "hr", "extreme")) else 0
     wind_boost = 2 if (_num(weather.get("wind_speed")) or 0) >= 10 else 0
 
+    side_matchup = context.get("side_matchup") or {}
+    matchup_hitters = {mu.get("player_name", "").lower(): mu for mu in (side_matchup.get("top_hit_edges") or [])}
+
     for lineup_index, hitter in enumerate(hitters[:5], start=1):
         name = _player_name(hitter)
         pid = _player_id(hitter)
@@ -492,6 +496,13 @@ def _build_hitter_props(context: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             str(context.get("team_name") or context.get("team") or ""),
         )
         streak_adjustment = hitting_streak_score_adjustment(streak)
+
+        # SP vs Batter matchup boost
+        mu = matchup_hitters.get(name.lower(), {})
+        matchup_contact_boost = (mu.get("contact_edge_score", 50) - 50) * 0.3
+        matchup_power_boost = (mu.get("power_edge_score", 50) - 50) * 0.3
+        matchup_total_bases_boost = (mu.get("total_bases_score", 50) - 50) * 0.25
+
         contact_score = (
             base
             + _metric_score(pitcher.get("xBA"), average=0.240, weight=85)
@@ -500,6 +511,7 @@ def _build_hitter_props(context: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             + _metric_score(bullpen.get("WHIP"), average=1.30, weight=7)
             + park_boost
             + streak_adjustment
+            + matchup_contact_boost
         )
         reason = _reason([
             "Projected top-half bat with contact indicators.",
@@ -571,6 +583,7 @@ def _build_hitter_props(context: dict[str, Any]) -> tuple[list[dict[str, Any]], 
             + _metric_score(pitcher.get("Barrel %"), average=8.0, weight=1.6)
             + _metric_score(pitcher.get("xSLG"), average=0.410, weight=40)
             + park_boost + wind_boost + max(0, streak_adjustment * 0.35) - 10
+            + matchup_power_boost
         )
         hr_reason = _reason([
             "Power profile supports HR watch.",
@@ -699,10 +712,25 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
     pitchers_scanned = 0
     games_scanned = len(slate)
 
+    matchup_result = build_slate_matchups(slate) if slate else {"games": [], "debug": {}}
+    matchup_games = matchup_result.get("games", [])
+    matchup_debug = matchup_result.get("debug", {})
+
     for game in slate:
+        game_matchup = None
+        gpk = game.get("game_pk") or game.get("game_id")
+        for mg in matchup_games:
+            if mg.get("game_pk") == gpk:
+                game_matchup = mg
+                break
         for side in ("away", "home"):
             context = _team_side(game, side)
             context["card_date"] = card_date
+            if game_matchup:
+                side_key = f"{side}_vs_{'home' if side == 'away' else 'away'}_sp"
+                context["side_matchup"] = game_matchup.get(side_key) or {}
+            else:
+                context["side_matchup"] = {}
             hitters = _hitter_pool(context)
             players_scanned += len(hitters)
             if context.get("pitcher") and context.get("pitcher") != "TBD":
@@ -782,6 +810,7 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
                 "weather": "Weather" not in missing_data,
                 "lineups": "Confirmed lineups" not in missing_data,
                 "hitting_streaks": "Hitting streak game logs" not in missing_data,
+                "sp_batter_matchup": bool(matchup_debug),
             },
             "games_scanned": games_scanned,
             "players_scanned": players_scanned,
@@ -805,6 +834,7 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
             "top_candidates_before_filter": top_candidates_before_filter[:15],
             "top_raw_candidates": all_props[:15],
             "missing_fields": missing_data,
+            "sp_batter_matchup": matchup_debug,
         },
         "source_status": {
             "mlb_stats_api": bool(slate),

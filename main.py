@@ -4542,6 +4542,9 @@ async def _build_card_debug_text() -> str:
     persist_count = 0
     builder_trace_version = "MISSING"
     builder_error = ""
+    builder_sections_found: list[str] = []
+    builder_candidates_found = 0
+    builder_rejected: list[str] = []
     save_result: dict[str, Any] = {"success": False, "error": "builder_not_run"}
     try:
         card_obj = await asyncio.to_thread(
@@ -4549,10 +4552,15 @@ async def _build_card_debug_text() -> str:
         )
         builder_count = len(card_obj.official_picks)
         builder_trace_version = card_obj.metadata.get("builder_trace_version", "MISSING")
+        builder_sections_found = list(card_obj.metadata.get("sections_found") or [])
+        builder_candidates_found = int(card_obj.metadata.get("candidates_found") or 0)
+        builder_rejected = list(card_obj.metadata.get("rejected_reasons") or [])
         if card_obj.metadata.get("builder_conversion_failed"):
             builder_error = card_obj.metadata.get("builder_conversion_error", "stats-only conversion failed")
         card_dict = structured_card_to_dict(card_obj)
         dict_count = len(card_dict.get("official_picks", []))
+        official_picks_count = dict_count
+        trackable_picks_count = sum(1 for pick in card_dict.get("official_picks", []) if pick.get("game_pk") or pick.get("game_id"))
         card_dict["analysis"] = analysis
         card_dict["slate"] = slate
         card_dict["source_command"] = "card_debug"
@@ -4601,12 +4609,18 @@ async def _build_card_debug_text() -> str:
         "",
         "── TRACE: official_picks count ──",
         f"Builder Trace Version: {builder_trace_version}",
+        f"Sections found: {builder_sections_found}",
+        f"Candidates found: {builder_candidates_found}",
+        f"Official picks created: {builder_count}",
+        f"Rejected items: {len(builder_rejected)}",
         f"After build_card_from_analysis:  {builder_count}",
         f"After structured_card_to_dict:  {dict_count}",
         f"Before persist_official_card:   {persist_count}",
         f"After persist (saved):          {save_result.get('saved_pick_count', 0)}",
         f"After persist (success):        {save_result.get('success')}",
     ]
+    if builder_rejected:
+        lines.extend(f"- Rejected: {reason}" for reason in builder_rejected[:12])
     if builder_error:
         lines += [
             "",

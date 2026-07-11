@@ -107,7 +107,7 @@ def _advanced_market_candidates(
                 game_id=int(game_pk) if game_pk is not None else None,
                 game_time_et=_game_time_et(game), away_team=away, home_team=home,
                 selected_team=picked_team, opponent=opponent, market_type=market_type,
-                market_line=line, odds=odds, posted_line=line, sportsbook=str(sportsbook or ""),
+                market_line=line, line=line, odds=odds, posted_line=line, sportsbook=str(sportsbook or ""),
                 line_verified=True, edge_score=edge, confidence=quant.get("confidence"),
                 risk_level=quant.get("risk_level"), data_quality_grade=quant.get("data_quality_grade"),
                 reason=str(quant.get("matchup_summary") or "Quant-ranked verified live market."),

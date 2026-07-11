@@ -369,6 +369,26 @@ def _scratch_scan(card_date: str, slate: list[dict[str, Any]], *, mutate: bool) 
 
     for prop in props:
         if prop.get("status") == "invalidated":
+            if mutate:
+                continue
+            reason = str(prop.get("invalidated_reason") or "Previously invalidated after lineup verification.")
+            if _is_pitcher_prop(prop, slate):
+                pitcher_count += 1
+                bucket = pitcher_invalidations
+            elif _is_hitter_prop(prop, slate):
+                hitter_count += 1
+                bucket = hitter_invalidations
+            else:
+                continue
+            key = _invalidation_key(prop, reason)
+            if key in seen:
+                duplicates_removed += 1
+                continue
+            seen.add(key)
+            bucket.append({
+                "player": str(prop.get("player_name") or prop.get("prop_id") or "Player"),
+                "reason": reason,
+            })
             continue
         if _is_pitcher_prop(prop, slate):
             pitcher_count += 1
@@ -490,3 +510,234 @@ def render_lineup_status(payload: dict[str, Any]) -> str:
         f"Games Waiting: {payload.get('games_waiting', 0)}\n"
         f"Estimated Next Refresh: {payload.get('estimated_next_refresh') or 'Unavailable'}"
     )
+
+
+def _best_hit_player_for_date(card_date: str) -> str:
+    """Return the player name of today's public Best Hit Prop (if cached)."""
+    try:
+        from best_hit_prop_image import BEST_HIT_CACHE_FILE
+        cache = _read_json(BEST_HIT_CACHE_FILE, {})
+    except Exception:
+        return ""
+    if not isinstance(cache, dict):
+        return ""
+    entry = cache.get(card_date)
+    if not isinstance(entry, dict):
+        return ""
+    prop = entry.get("prop") if isinstance(entry.get("prop"), dict) else {}
+    return str(prop.get("player_name") or "").strip()
+
+
+def _public_prop_players(card_date: str) -> set[str]:
+    """Players that are in a PUBLIC official prop (Best Hit) for the date."""
+    player = _best_hit_player_for_date(card_date)
+    return {player.lower()} if player else set()
+
+
+def _admin_only_prop_players(card_date: str) -> set[str]:
+    """Players approved as admin-only/watchlist props for the date."""
+    try:
+        from player_props_engine import APPROVED_PROPS_FILE
+        approved = _read_json(APPROVED_PROPS_FILE, {})
+    except Exception:
+        return set()
+    if not isinstance(approved, dict):
+        return set()
+    names: set[str] = set()
+    for prop in approved.values():
+        if not isinstance(prop, dict):
+            continue
+        if str(prop.get("card_date") or "") != card_date:
+            continue
+        name = str(prop.get("player_name") or "").strip().lower()
+        if name:
+            names.add(name)
+    return names
+
+
+def _saved_prop_pick_players(card_date: str) -> set[str]:
+    """Players with a saved official prop pick (approved_player_prop) for the date."""
+    try:
+        from results_tracker import load_picks
+        picks = load_picks()
+    except Exception:
+        return set()
+    names: set[str] = set()
+    for pick in picks:
+        if not isinstance(pick, dict):
+            continue
+        if str(pick.get("card_date") or pick.get("date") or "") != card_date:
+            continue
+        if pick.get("category") != "approved_player_prop":
+            continue
+        name = str(pick.get("player_name") or pick.get("selected_team") or "").strip().lower()
+        if name:
+            names.add(name)
+    return names
+
+
+def _simple_card_prop_players(card_date: str) -> set[str]:
+    """Return player names from prop rows in the saved public simple card."""
+    try:
+        from services.simple_mlb_card import SIMPLE_CARD_DIR
+        path = SIMPLE_CARD_DIR / f"{card_date}.json"
+        if not path.exists():
+            return set()
+        card = _read_json(path, {})
+    except Exception:
+        return set()
+    if not isinstance(card, dict):
+        return set()
+    names: set[str] = set()
+    for pick in card.get("picks", []) if isinstance(card.get("picks"), list) else []:
+        if not isinstance(pick, dict):
+            continue
+        market = str(pick.get("market") or pick.get("market_type") or pick.get("category") or "").lower()
+        # Never interpret an ML/F5/RL team as a player.  A simple-card row only
+        # participates in prop scratch handling when it actually names a player.
+        if not pick.get("player_name") or "prop" not in market:
+            continue
+        name = str(pick.get("player_name") or "").strip().lower()
+        if name:
+            names.add(name)
+    return names
+
+
+def assess_scratch_public_impact(
+    card_date: str,
+    slate: list[dict[str, Any]],
+    invalidation_payload: dict[str, Any] | None = None,
+    *,
+    replacement_generated: bool = False,
+) -> dict[str, Any]:
+    """Assess whether scratched players affect a PUBLIC official card.
+
+    Sources checked per invalidated player:
+      * simple_cards/YYYY-MM-DD.json
+      * official picks store (picks.json)
+      * public posted card payload (Best Hit Prop cache)
+
+    Behaviour:
+      * Admin-only / watchlist players -> owner-only alert, no public correction.
+      * Public official prop players -> public correction, removal from saved
+        official picks, and a replacement only when one qualifies.
+    """
+    # Callers that just invalidated the props must pass that result: a new scan
+    # correctly skips invalidated rows and would otherwise erase the impact.
+    scan = invalidation_payload if isinstance(invalidation_payload, dict) else _scratch_scan(card_date, slate, mutate=False)
+    scratched = scan.get("scratched", []) if isinstance(scan.get("scratched"), list) else []
+
+    public_players = _public_prop_players(card_date)
+    admin_players = _admin_only_prop_players(card_date)
+    simple_players = _simple_card_prop_players(card_date)
+    official_players = _saved_prop_pick_players(card_date)
+
+    affected_public: list[dict[str, str]] = []
+    admin_only: list[str] = []
+    for raw in scratched:
+        name = str(raw).strip().lower()
+        if not name:
+            continue
+        # Only the public Best Hit Prop (and any public simple card entry) counts
+        # as a PUBLIC official prop. Approved/admin-only props and their saved
+        # picks are owner-only and must NOT trigger a public correction.
+        source_matches = []
+        if name in simple_players:
+            source_matches.append("simple_card")
+        if name in official_players:
+            source_matches.append("official_picks")
+        if name in public_players:
+            source_matches.append("public_posted_payload")
+        # approved_props is the admin/watchlist store.  A saved approved prop is
+        # not public by itself; it needs corroboration from a public payload.
+        is_public = bool(name in public_players or name in simple_players or (name in official_players and name not in admin_players))
+        if is_public:
+            affected_public.append({"player": raw, "sources": ", ".join(source_matches)})
+        elif name in admin_players:
+            admin_only.append(raw)
+        else:
+            # Unknown scope: treat as owner-only (safe default).
+            admin_only.append(raw)
+
+    public_card_affected = bool(affected_public)
+    return {
+        "date": card_date,
+        "scratched_players": scratched,
+        "public_card_affected": public_card_affected,
+        "affected_public_picks": affected_public,
+        "admin_only_players": admin_only,
+        "replacement_generated": replacement_generated,
+        "public_correction_needed": public_card_affected,
+        "ml_f5_rl_unaffected": True,
+        "sources_checked": ["simple_card", "official_picks", "public_posted_payload"],
+    }
+
+
+def _find_replacement_best_hit(card_date: str, slate: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return an alternate qualifying Best Hit candidate (different player)."""
+    try:
+        from best_hit_prop_image import select_best_hit_prop
+        from player_props_engine import build_player_props_lab
+        payload = build_player_props_lab(slate, card_date)
+        prop, _ = select_best_hit_prop(payload, slate)
+    except Exception:
+        return None
+    if not isinstance(prop, dict):
+        return None
+    scratched = {p.lower() for p in (_public_prop_players(card_date) | _saved_prop_pick_players(card_date))}
+    if str(prop.get("player_name") or "").strip().lower() in scratched:
+        return None
+    return prop
+
+
+def render_public_scratch_correction(assessment: dict[str, Any]) -> str:
+    """Render the public-facing correction (only call when public impact exists)."""
+    if not assessment.get("public_correction_needed"):
+        return ""
+    players = [item.get("player", "Player") for item in assessment.get("affected_public_picks", [])]
+    replacement = "A replacement Best Hit Prop has been generated." if assessment.get("replacement_generated") else "No qualifying replacement — no replacement prop posted."
+    lines = [
+        "⚠️ BETGPTAI PROP UPDATE",
+        "",
+        "The following player prop has been removed from today's public card:",
+    ]
+    lines.extend(f"- {p}" for p in players)
+    lines.extend([
+        "",
+        replacement,
+        "This is an educational update only. Verify before any action.",
+    ])
+    return "\n".join(lines).strip()
+
+
+def remove_scratched_public_picks(card_date: str, players: list[str]) -> int:
+    """Remove saved official prop picks for scratched public players from picks.json.
+
+    Returns the number of picks removed.  Never touches ML/F5/RL picks.
+    """
+    try:
+        from results_tracker import PICKS_FILE, _write_json, load_picks
+        picks = load_picks()
+    except Exception:
+        return 0
+    lowered = {str(p).strip().lower() for p in players}
+    kept: list[dict[str, Any]] = []
+    removed = 0
+    for pick in picks:
+        if not isinstance(pick, dict):
+            kept.append(pick)
+            continue
+        if str(pick.get("card_date") or pick.get("date") or "") != card_date:
+            kept.append(pick)
+            continue
+        if pick.get("category") != "approved_player_prop":
+            kept.append(pick)
+            continue
+        name = str(pick.get("player_name") or pick.get("selected_team") or "").strip().lower()
+        if name in lowered:
+            removed += 1
+            continue
+        kept.append(pick)
+    if removed:
+        _write_json(PICKS_FILE, kept)
+    return removed

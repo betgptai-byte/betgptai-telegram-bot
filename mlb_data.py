@@ -254,7 +254,8 @@ def get_mlb_odds(odds_api_key: str) -> list[dict[str, Any]]:
 
 
 def _normalize_team(team_name: str) -> str:
-    normalized = re.sub(r"[^a-z0-9]", "", team_name.lower())
+    from api.sharp_client import _normalize_team as normalize_provider_team
+    normalized = normalize_provider_team(team_name)
     return TEAM_ALIASES.get(normalized, normalized)
 
 
@@ -322,6 +323,9 @@ def _closest_odds_game(game: dict[str, Any], candidates: list[dict[str, Any]]) -
     match = min(candidates, key=lambda candidate: abs((game_time - _parse_api_time(
         candidate.get("commence_time"))).total_seconds()) if _parse_api_time(
         candidate.get("commence_time")) else float("inf"))
+    match_time = _parse_api_time(match.get("commence_time"))
+    if match_time is None or abs((game_time - match_time).total_seconds()) > 12 * 60 * 60:
+        return None
     candidates.remove(match)
     return match
 
@@ -357,7 +361,7 @@ def _detect_odds_provider(odds: list[dict[str, Any]]) -> str:
         k in sample for k in ("id", "sport_key")
     ) and "bookmakers" in sample
     if has_sharp_keys:
-        return "sharp_api"
+        return "sharpapi"
     return "odds_api"
 
 
@@ -480,6 +484,9 @@ def odds_debug_payload(
         "use_best_odds": use_best,
         "auth_method": "X-API-Key header only",
         "sportsbook_game_counts": {},
+        "events_returned": 0,
+        "market_context_available": False,
+        "first_matched_game": None,
     }
 
     schedule: list[dict[str, Any]] = []
@@ -619,6 +626,8 @@ def odds_debug_payload(
             if key in odds_keys:
                 matched_keys.add(key)
                 payload["matched_to_mlb_game_pk"] += 1
+                if payload["first_matched_game"] is None:
+                    payload["first_matched_game"] = f"{game.get('away_team')} @ {game.get('home_team')}"
             else:
                 payload["unmatched_mlb_games"].append({
                     "game_pk": game.get("game_pk"),
@@ -635,6 +644,14 @@ def odds_debug_payload(
                     "commence_time": odds_game.get("commence_time"),
                     "normalized_key": sorted(key),
                 })
+    probes = payload.get("sharp_mlb_probes") or []
+    successful_probe = next((probe for probe in probes if int(probe.get("games_count") or 0) > 0), None)
+    if successful_probe:
+        payload["provider"] = "sharpapi"
+        payload["events_returned"] = int(successful_probe.get("events_returned") or successful_probe.get("games_count") or 0)
+        payload["active_sportsbook"] = successful_probe.get("sportsbook") or "best_odds"
+        payload["endpoint_used"] = successful_probe.get("endpoint") or payload.get("endpoint_used")
+    payload["market_context_available"] = bool(payload.get("matched_to_mlb_game_pk") and odds)
     return payload
 
 

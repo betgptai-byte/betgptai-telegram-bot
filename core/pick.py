@@ -16,6 +16,7 @@ class OfficialPick:
     league: str
     card_date: str
     game_pk: int | None = None
+    game_id: int | None = None
     game_time_et: str | None = None
     away_team: str | None = None
     home_team: str | None = None
@@ -23,6 +24,7 @@ class OfficialPick:
     opponent: str | None = None
     market_type: str = "moneyline"
     market_line: float | None = None
+    line: float | None = None
     odds: int | float | None = None
     confidence: str | int | float | None = None
     edge_score: float | None = None
@@ -41,6 +43,9 @@ class OfficialPick:
     posted_line: float | None = None
     line_verified: bool | None = None
     official_pick_source: str | None = None
+    source: str | None = None
+    section: str | None = None
+    parlay_leg: bool = False
 
 
 def official_pick_to_dict(pick: OfficialPick) -> dict[str, Any]:

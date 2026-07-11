@@ -37,11 +37,26 @@ from premium_card_formatter import (
     render_play_of_day_card,
 )
 from services.pick_persistence import save_official_card as persist_official_card
+from services.simple_mlb_card import (
+    build_simple_mlb_card,
+    export_simple_card_to_official_picks,
+    render_simple_mlb_card,
+    save_simple_mlb_card,
+)
 from storage import data_file, storage_status
 from time_utils import format_et, now_et, to_et
 
 
 WORKFLOW_VERSION = "elite_quant_v20"
+
+
+def _live_mlb_engine() -> str:
+    return os.getenv("LIVE_MLB_ENGINE", "simple").strip().lower()
+
+
+def _live_mlb_engine_env_value() -> str:
+    raw = os.getenv("LIVE_MLB_ENGINE")
+    return raw.strip().lower() if raw is not None and raw.strip() else "not_set"
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -148,6 +163,8 @@ def workflow_status(card_date: str | None = None) -> dict[str, Any]:
         "auto_post_enabled": _auto_post_enabled(),
         "approval_required": False,
         "last_scheduler_error": log.get("last_scheduler_error", "None"),
+        "live_engine": "simple_mlb_card_v1" if _live_mlb_engine() == "simple" else "advanced",
+        "live_mlb_engine_env_value": _live_mlb_engine_env_value(),
     }
 
 
@@ -388,6 +405,63 @@ async def pregame_verify_job(bot: Any, card_date: str | None = None) -> dict[str
 async def generate_cards_job(bot: Any, card_date: str | None = None) -> dict[str, Any]:
     """T-45 generation job. Sends admin previews only."""
     selected = card_date or official_sports_date(now_et()).isoformat()
+    if _live_mlb_engine() == "simple":
+        try:
+            simple_card = await asyncio.to_thread(build_simple_mlb_card, selected)
+            simple_path = await asyncio.to_thread(save_simple_mlb_card, simple_card)
+            bridge = await asyncio.to_thread(export_simple_card_to_official_picks, selected)
+            all_picks = simple_card.get("all_picks") or simple_card.get("picks") or []
+            saved_count = len(all_picks)
+            if saved_count < 1:
+                raise RuntimeError("Simple MLB card generated zero picks.")
+            parlay_legs = simple_card.get("parlay") or []
+            status = {
+                "version": WORKFLOW_VERSION,
+                "card_date": selected,
+                "created_at": now_et().isoformat(timespec="seconds"),
+                "generated": True,
+                "card_generation_complete": True,
+                "simple_generate": True,
+                "advanced_generate": "skipped",
+                "live_engine": "simple_mlb_card_v1",
+                "live_mlb_engine_env_value": _live_mlb_engine_env_value(),
+                "image_generation_complete": False,
+                "posting_ready": bool(_auto_post_enabled()),
+                "picks_saved": True,
+                "saved_picks": saved_count,
+                "saved_count": saved_count,
+                "safe_parlay_found": bool(parlay_legs),
+                "safe_parlay_status": "generated" if parlay_legs else "no_qualified",
+                "simple_card_path": simple_path,
+                "bridge_imported": int(bridge.get("imported") or 0),
+                "structured_card_built": False,
+                "official_picks_count": saved_count,
+                "last_generation_error": None,
+                "generation_error": None,
+                "last_save_exception": "",
+                "errors": [],
+                "generation_source_file": "services/simple_mlb_card.py",
+                "generation_source_function": "build_simple_mlb_card",
+            }
+            _write_json(workflow_file(selected, "generation_status.json"), status)
+            await _notify_admin(bot, f"✅ T-45 Simple Generate Complete\nPicks: {saved_count}\nLive Engine: Simple MLB Card v1")
+            return status
+        except Exception as error:
+            logging.exception("T-45 simple generation failed")
+            status = {
+                "version": WORKFLOW_VERSION, "card_date": selected,
+                "created_at": now_et().isoformat(timespec="seconds"),
+                "generated": False, "card_generation_complete": False,
+                "simple_generate": False, "advanced_generate": "skipped",
+                "live_engine": "simple_mlb_card_v1",
+                "live_mlb_engine_env_value": _live_mlb_engine_env_value(),
+                "picks_saved": False, "saved_picks": 0,
+                "last_generation_error": str(error), "generation_error": str(error),
+                "errors": [str(error)],
+            }
+            _write_json(workflow_file(selected, "generation_status.json"), status)
+            await _notify_admin(bot, f"❌ T-45 Simple Generate failed: {error}")
+            return status
     output_dir = data_file("generated_cards") / selected
     output_dir.mkdir(parents=True, exist_ok=True)
     errors: list[str] = []
@@ -476,6 +550,11 @@ async def generate_cards_job(bot: Any, card_date: str | None = None) -> dict[str
         "last_save_exception": str(save_result.get("last_save_exception", "")),
         "generation_source_file": str(save_result.get("generation_source_file", "")),
         "generation_source_function": str(save_result.get("generation_source_function", "")),
+        "simple_generate": False,
+        "advanced_generate": "failed" if generation_error else "testing",
+        "live_engine": "advanced",
+        "live_mlb_engine_env_value": _live_mlb_engine_env_value(),
+        "last_generation_error": generation_error or None,
     }
     if card:
         (output_dir / "mlb_card.txt").write_text(card, encoding="utf-8")
@@ -500,6 +579,38 @@ async def post_cards_job(bot: Any, card_date: str | None = None) -> dict[str, An
     selected = card_date or official_sports_date(now_et()).isoformat()
     log = _posting_log()
     posted_key = f"posted_mlb_card_{selected}"
+    if _live_mlb_engine() == "simple":
+        if log.get(posted_key) or log.get(selected, {}).get("simple_card_posted"):
+            return {"posted": False, "posted_today": True, "simple_card_posted": True, "reason": "already_posted"}
+        if not _auto_post_enabled():
+            return {"posted": False, "posted_today": False, "simple_card_posted": False, "reason": "auto_post_disabled"}
+        path = data_file("simple_cards") / f"{selected}.json"
+        try:
+            simple_card = _read_json(path, {}) if path.exists() else {}
+            if not isinstance(simple_card, dict) or not (simple_card.get("all_picks") or simple_card.get("picks")):
+                simple_card = await asyncio.to_thread(build_simple_mlb_card, selected)
+                await asyncio.to_thread(save_simple_mlb_card, simple_card)
+                await asyncio.to_thread(export_simple_card_to_official_picks, selected)
+            pick_count = len(simple_card.get("all_picks") or simple_card.get("picks") or [])
+            if pick_count < 1:
+                raise RuntimeError("Simple MLB card has no picks to post.")
+            chat = os.getenv("FREE_CHANNEL_ID", "").strip()
+            if not chat:
+                raise RuntimeError("FREE_CHANNEL_ID is not configured.")
+            await _send_long(bot, _destination(chat), render_simple_mlb_card(simple_card))
+            log[posted_key] = True
+            log.setdefault(selected, {})["simple_card_posted"] = True
+            log[selected]["mlb_pregame_post"] = {
+                "status": "sent", "engine": "simple_mlb_card_v1",
+                "recorded_at": now_et().isoformat(timespec="seconds"),
+            }
+            _save_posting_log(log)
+            return {"posted": True, "posted_today": True, "simple_card_posted": True, "live_engine": "simple_mlb_card_v1"}
+        except Exception as error:
+            logging.exception("T-43 simple post failed")
+            log.setdefault(selected, {})["mlb_pregame_post"] = {"status": "failed", "reason": str(error)}
+            _save_posting_log(log)
+            return {"posted": False, "posted_today": False, "simple_card_posted": False, "reason": str(error)}
     if log.get(posted_key):
         return {"posted": False, "reason": "already_posted"}
     if not _auto_post_enabled():

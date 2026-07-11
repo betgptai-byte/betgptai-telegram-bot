@@ -42,6 +42,7 @@ from api.sharp_client import (
     fetch_mlb_odds,
     odds_api_backup_only,
     odds_api_enabled,
+    parse_sharp_response,
     sharp_api_enabled,
     sharp_api_key,
 )
@@ -138,8 +139,20 @@ def build_game_market_context(
         matched_event = int(matched_event) if matched_event is not None else None
     except (TypeError, ValueError):
         matched_event = str(matched_event) if matched_event is not None else None
+    home = str(game.get("home_team") or "")
+    away = str(game.get("away_team") or "")
+    def _team_price(rows: list[dict[str, Any]], team: str) -> Any:
+        target = _normalize_team_name(team)
+        return next((row.get("odds") for row in rows if _normalize_team_name(str(row.get("label") or "")) == target), None)
+    def _team_spread(rows: list[dict[str, Any]], team: str) -> Any:
+        target = _normalize_team_name(team)
+        return next((row.get("line") for row in rows if _normalize_team_name(str(row.get("label") or "")) == target), None)
+    def _total_line(label: str) -> Any:
+        return next((row.get("line") for row in ctx.get("total", []) if str(row.get("label") or "").lower().startswith(label)), None)
+    sportsbook = next((price.get("bookmaker_key") or price.get("bookmaker") for price in prices if price.get("bookmaker_key") or price.get("bookmaker")), None)
+    normalized_provider = "sharpapi" if provider in {"sharp_api", "sharpapi"} else provider
     return {
-        "provider": provider,
+        "provider": normalized_provider,
         "sport": sport,
         "league": league or "",
         "odds_found": bool(prices),
@@ -151,7 +164,25 @@ def build_game_market_context(
         "last_updated": last_updated,
         "matched_event": matched_event,
         "matched_by": provider,
+        "game_id": matched_event,
+        "game_pk": matched_event,
+        "away_team": away,
+        "home_team": home,
+        "start_time": game.get("game_time") or game.get("start_time"),
+        "moneyline_home": _team_price(ctx.get("moneyline", []), home),
+        "moneyline_away": _team_price(ctx.get("moneyline", []), away),
+        "spread_home": _team_spread(ctx.get("spread_or_runline", []), home),
+        "spread_away": _team_spread(ctx.get("spread_or_runline", []), away),
+        "total_over": _total_line("over"),
+        "total_under": _total_line("under"),
+        "sportsbook": sportsbook,
+        "line_verified": bool(prices),
     }
+
+
+def _normalize_team_name(value: str) -> str:
+    from api.sharp_client import _normalize_team
+    return _normalize_team(value)
 
 
 def _market_context_from_prices(prices: list[dict[str, Any]]) -> dict[str, Any]:
@@ -203,13 +234,15 @@ ALL_SPORTSBOOKS: list[str] = [
     "draftkings", "fanduel", "hardrockbet", "betmgm", "caesars", "pinnacle",
 ]
 
+_LAST_REQUEST_DIAGNOSTIC: dict[str, Any] = {}
+
 
 # ── MLB mapping fallbacks ───────────────────────────────────────────────────
 # Each mapping includes sport_param, optional league, and optional sportsbook.
 # The production request tries: best-odds → default sportsbook → secondary → probe all sportsbooks.
 MLB_MAPPINGS: list[dict[str, str | None]] = [
     {"sport_param": "baseball", "league": "MLB", "sportsbook": sb}
-    for sb in ALL_SPORTSBOOKS
+    for sb in ("draftkings", "fanduel", "hardrockbet")
 ] + [
     {"sport_param": "baseball", "league": "MLB", "sportsbook": None},
 ]
@@ -258,7 +291,13 @@ def _do_sharp_request(
     """Send one Sharp API GET, returning the response or raising."""
     _throttle()
     try:
-        return requests.get(url, params=params, headers=headers, timeout=20)
+        response = requests.get(url, params=params, headers=headers, timeout=20)
+        sanitized_url = requests.Request("GET", url, params=params).prepare().url or url
+        endpoint = "/" + url.rstrip("/").split("/")[-1]
+        if url.rstrip("/").endswith("/odds/best"):
+            endpoint = "/odds/best"
+        logger.info("Sharp request endpoint=%s url=%s status=%s", endpoint, sanitized_url, response.status_code)
+        return response
     except requests.RequestException as exc:
         raise SharpAPIError(f"Sharp API request failed: {exc}") from exc
 
@@ -277,6 +316,7 @@ def _sharpen_request(
     cache_key: str,
     *,
     sportsbook: str | None = None,
+    endpoint: str | None = None,
 ) -> list[dict[str, Any]]:
     """Make one Sharp API request and return normalized events.
 
@@ -290,10 +330,7 @@ def _sharpen_request(
         logger.debug("Sharp cache HIT for %s", cache_key)
         return cached
 
-    if _use_best_odds():
-        endpoint = SHARP_ENDPOINT_BEST_ODDS
-    else:
-        endpoint = SHARP_ENDPOINT_ODDS
+    endpoint = endpoint or (SHARP_ENDPOINT_BEST_ODDS if _use_best_odds() else SHARP_ENDPOINT_ODDS)
     url = f"{base_url}{endpoint}"
     params: dict[str, str] = {
         "sport": sport_param,
@@ -315,22 +352,27 @@ def _sharpen_request(
     headers = {"X-API-Key": api_key}
     resp = _do_sharp_request(url, params, headers)
 
+    if resp.status_code == 401:
+        raise SharpAPIError("auth_failed", status_code=401, code="auth_failed")
     if resp.status_code == 429:
         raise SharpRateLimitError("Sharp API rate limit hit (429)")
     if resp.status_code != 200:
-        raise SharpAPIError(
-            f"Sharp API returned HTTP {resp.status_code}: {resp.text[:500]}"
-        )
+        raise SharpAPIError(f"http_error_{resp.status_code}", status_code=resp.status_code)
 
     try:
         data = resp.json()
     except Exception as exc:
-        raise SharpAPIError(f"Sharp API invalid JSON: {exc}") from exc
-    if not isinstance(data, list):
-        raise SharpAPIError(f"Sharp API unexpected response type: {type(data).__name__}")
-
-    from api.sharp_client import _normalize_sharp_event
-    normalized = [_normalize_sharp_event(event) for event in data]
+        raise SharpAPIError("parse_failed", code="parse_failed", response_keys=[]) from exc
+    parsed = parse_sharp_response(data, endpoint=endpoint)
+    normalized = parsed["odds"] or parsed["events"]
+    global _LAST_REQUEST_DIAGNOSTIC
+    _LAST_REQUEST_DIAGNOSTIC = {
+        "endpoint": endpoint, "http_status": resp.status_code,
+        "top_level_keys": parsed["top_level_keys"],
+        "events_returned": parsed["events_returned"], "odds_returned": parsed["odds_rows_returned"],
+        "error": parsed["error"], "sportsbook": sportsbook,
+    }
+    logger.info("Sharp response endpoint=%s keys=%s games=%d events=%d", endpoint, parsed["top_level_keys"], len(normalized), parsed["events_returned"])
     _cache_write(cache_key, normalized)
     return normalized
 
@@ -381,12 +423,19 @@ def probe_sharp_mlb(
             if odds:
                 first = odds[0]
                 result["first_matchup"] = f"{first.get('away_team')} @ {first.get('home_team')} [{first.get('commence_time', '')}]"
+                books = first.get("bookmakers") or []
+                first_markets = books[0].get("markets") if books else []
+                result["first_market"] = first_markets[0].get("key") if first_markets else None
+            else:
+                result["error"] = "no_events_returned"
+            result.update({key: _LAST_REQUEST_DIAGNOSTIC.get(key) for key in ("top_level_keys", "events_returned", "odds_returned")})
         except SharpRateLimitError:
             result["status_code"] = 429
-            result["error"] = "Rate limited (429)"
+            result["error"] = "rate_limited"
         except SharpAPIError as exc:
             result["status_code"] = getattr(exc, "status_code", None)
-            result["error"] = str(exc)[:200]
+            result["error"] = getattr(exc, "code", None) or str(exc)[:200]
+            result["top_level_keys"] = getattr(exc, "response_keys", [])
         except Exception as exc:
             result["error"] = str(exc)[:200]
         results.append(result)
@@ -414,18 +463,25 @@ def probe_sharp_mlb(
             "first_matchup": None,
         }
         try:
-            odds = _sharpen_request(sp_m, lg_m, event_date, api_key, base_url, markets, ck, sportsbook=sb_m)
+            odds = _sharpen_request(sp_m, lg_m, event_date, api_key, base_url, markets, ck, sportsbook=sb_m, endpoint=SHARP_ENDPOINT_ODDS)
             result["games_count"] = len(odds)
             result["status_code"] = 200
             if odds:
                 first = odds[0]
                 result["first_matchup"] = f"{first.get('away_team')} @ {first.get('home_team')} [{first.get('commence_time', '')}]"
+                books = first.get("bookmakers") or []
+                first_markets = books[0].get("markets") if books else []
+                result["first_market"] = first_markets[0].get("key") if first_markets else None
+            else:
+                result["error"] = "no_events_returned"
+            result.update({key: _LAST_REQUEST_DIAGNOSTIC.get(key) for key in ("top_level_keys", "events_returned", "odds_returned")})
         except SharpRateLimitError:
             result["status_code"] = 429
-            result["error"] = "Rate limited (429)"
+            result["error"] = "rate_limited"
         except SharpAPIError as exc:
             result["status_code"] = getattr(exc, "status_code", None)
-            result["error"] = str(exc)[:200]
+            result["error"] = getattr(exc, "code", None) or str(exc)[:200]
+            result["top_level_keys"] = getattr(exc, "response_keys", [])
         except Exception as exc:
             result["error"] = str(exc)[:200]
         results.append(result)
@@ -468,22 +524,27 @@ def _sharpen_request_for_probe(
     headers = {"X-API-Key": api_key}
     resp = _do_sharp_request(url, params, headers)
 
+    if resp.status_code == 401:
+        raise SharpAPIError("auth_failed", status_code=401, code="auth_failed")
     if resp.status_code == 429:
         raise SharpRateLimitError("Sharp API rate limit hit (429)")
     if resp.status_code != 200:
-        raise SharpAPIError(
-            f"Sharp API returned HTTP {resp.status_code}: {resp.text[:500]}"
-        )
+        raise SharpAPIError(f"http_error_{resp.status_code}", status_code=resp.status_code)
 
     try:
         data = resp.json()
     except Exception as exc:
-        raise SharpAPIError(f"Sharp API invalid JSON: {exc}") from exc
-    if not isinstance(data, list):
-        raise SharpAPIError(f"Sharp API unexpected response type: {type(data).__name__}")
-
-    from api.sharp_client import _normalize_sharp_event
-    normalized = [_normalize_sharp_event(event) for event in data]
+        raise SharpAPIError("parse_failed", code="parse_failed", response_keys=[]) from exc
+    parsed = parse_sharp_response(data, endpoint=ep)
+    normalized = parsed["odds"] or parsed["events"]
+    global _LAST_REQUEST_DIAGNOSTIC
+    _LAST_REQUEST_DIAGNOSTIC = {
+        "endpoint": ep, "http_status": resp.status_code,
+        "top_level_keys": parsed["top_level_keys"],
+        "events_returned": parsed["events_returned"], "odds_returned": parsed["odds_rows_returned"],
+        "error": parsed["error"], "sportsbook": sportsbook,
+    }
+    logger.info("Sharp response endpoint=%s keys=%s games=%d events=%d", ep, parsed["top_level_keys"], len(normalized), parsed["events_returned"])
     return normalized
 
 
@@ -544,7 +605,7 @@ def get_odds(
                 odds = _sharpen_request(
                     cfg["sport_param"], league or cfg["league"], event_date,
                     api_key, base_url, cfg["markets"], ck_best,
-                    sportsbook=None,
+                    sportsbook=None, endpoint=SHARP_ENDPOINT_BEST_ODDS,
                 )
                 if odds:
                     logger.info(
@@ -558,13 +619,10 @@ def get_odds(
         # Step 2: /odds with sportsbook filter (default → secondary → probe all)
         default_sb = default_sportsbook()
         secondary_sb = secondary_sportsbook()
-        sportsbooks_to_try: list[str | None] = [default_sb, secondary_sb]
-        # Add remaining sportsbooks not already tried
-        sportsbooks_to_try.extend(
-            sb for sb in ALL_SPORTSBOOKS
-            if sb not in (default_sb, secondary_sb)
-        )
-        sportsbooks_to_try.append(None)
+        sportsbooks_to_try: list[str | None] = []
+        for candidate in (default_sb, secondary_sb, "hardrockbet", None):
+            if candidate not in sportsbooks_to_try:
+                sportsbooks_to_try.append(candidate)
 
         for sb in sportsbooks_to_try:
             ck = cfg["cache_key"]
@@ -581,7 +639,7 @@ def get_odds(
                 odds = _sharpen_request(
                     cfg["sport_param"], league or cfg["league"], event_date,
                     api_key, base_url, cfg["markets"], ck,
-                    sportsbook=sb,
+                    sportsbook=sb, endpoint=SHARP_ENDPOINT_ODDS,
                 )
                 if odds:
                     logger.info(
@@ -609,6 +667,7 @@ def get_odds(
         odds = _sharpen_request(
             cfg["sport_param"], league or cfg["league"], event_date,
             api_key, base_url, cfg["markets"], cache_key,
+            endpoint=SHARP_ENDPOINT_ODDS,
         )
     except (SharpAPIError, SharpRateLimitError):
         logger.warning("Sharp primary mapping failed for %s", sport_lower)
@@ -661,4 +720,5 @@ def health(sport: str = "mlb") -> dict[str, Any]:
         "cache_path": str(cache_path),
         "cache_age_seconds": cache_age,
         "cache_fresh": cache_age is not None and cache_age < SHARP_CACHE_TTL,
+        "last_request": dict(_LAST_REQUEST_DIAGNOSTIC),
     }

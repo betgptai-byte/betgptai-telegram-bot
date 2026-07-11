@@ -37,7 +37,14 @@ from daily_workflow import (
     workflow_status,
 )
 from game_time import parse_game_time
-from lineup_verification import invalidate_scratched_props, render_prop_scratch_alert, summarize_lineups
+from lineup_verification import (
+    assess_scratch_public_impact,
+    invalidate_scratched_props,
+    remove_scratched_public_picks,
+    render_prop_scratch_alert,
+    render_public_scratch_correction,
+    summarize_lineups,
+)
 from best_hit_prop_image import prepare_best_hit_prop_image
 from mlb_auto_image import prepare_mlb_auto_image
 from mlb_data import get_combined_slate, get_mlb_schedule
@@ -50,6 +57,7 @@ from results_tracker import (
     saved_picks_summary,
 )
 from services.pick_persistence import save_official_card as persist_official_card
+from services.simple_mlb_card import simple_card_bridge_status
 from soccer_analysis import analyze_soccer_slate
 from soccer_data import get_soccer_schedule, get_soccer_slate
 from storage import data_file
@@ -724,16 +732,19 @@ def post_status_text(day: str | None = None) -> str:
     times = payload.get("times") if isinstance(payload.get("times"), dict) else {}
     log = _read_log()
     posted_today = bool(log.get(f"posted_mlb_card_{selected_day}"))
+    live_env_raw = os.getenv("LIVE_MLB_ENGINE")
+    live_env_value = live_env_raw.strip().lower() if live_env_raw is not None and live_env_raw.strip() else "not_set"
+    simple_engine = os.getenv("LIVE_MLB_ENGINE", "simple").strip().lower() == "simple"
+    simple_status = simple_card_bridge_status(selected_day) if simple_engine else {}
     images_ready = bool(generation.get("mlb_image") or generation.get("best_hit_image"))
     saved_summary = saved_picks_summary(selected_day)
     todays_count = int(saved_summary.get("total") or 0)
     card_generated = bool(generation.get("card_generation_complete"))
     picks_saved = bool(generation.get("picks_saved")) or todays_count > 0
     posting_ready = bool(
-        card_generated
-        and picks_saved
-        and payload.get("auto_post_enabled")
-        and not posted_today
+        simple_status.get("simple_card_exists") and int(simple_status.get("simple_pick_count") or 0) > 0
+    ) if simple_engine else bool(
+        card_generated and picks_saved and payload.get("auto_post_enabled") and not posted_today
     )
     scheduler_payload = log.get("scheduler", {}) if isinstance(log.get("scheduler"), dict) else {}
     structured_card_built = bool(generation.get("structured_card_built", False))
@@ -742,6 +753,8 @@ def post_status_text(day: str | None = None) -> str:
     last_save_exception = str(generation.get("last_save_exception", ""))
     return (
         "📡 BETGPTAI POST STATUS\n\n"
+        f"LIVE_MLB_ENGINE env value: {live_env_value}\n"
+        f"Live Engine: {'Simple MLB Card v1' if simple_engine else 'Advanced'}\n\n"
         "── Structured Card ──\n"
         f"Built:\n{'Yes ✅' if structured_card_built else 'No ❌'}\n"
         f"Official Picks Count:\n{official_picks_count}\n"
@@ -863,23 +876,33 @@ async def _refresh_lineup_states(bot: Any, day: str, current: datetime) -> None:
         }
         _write_log(log)
         if scratched.get("invalidated"):
-            image_result = await asyncio.to_thread(
-                prepare_best_hit_prop_image,
-                slate,
-                day,
-                image_generation_enabled=os.getenv("IMAGE_GENERATION_ENABLED", "").lower() in {"1", "true", "yes", "on"},
-            )
             admin_id = os.getenv("MY_TELEGRAM_ID", "").strip()
+            # Public correction only when a PUBLIC official prop was scratched.
+            try:
+                assessment = assess_scratch_public_impact(day, slate, scratched)
+                if assessment.get("public_correction_needed"):
+                    public_players = [
+                        item.get("player", "") for item in assessment.get("affected_public_picks", [])
+                    ]
+                    if public_players:
+                        remove_scratched_public_picks(day, public_players)
+                    image_result = await asyncio.to_thread(
+                        prepare_best_hit_prop_image,
+                        slate,
+                        day,
+                        image_generation_enabled=os.getenv("IMAGE_GENERATION_ENABLED", "").lower() in {"1", "true", "yes", "on"},
+                    )
+                    replacement_generated = image_result.get("status") == "ready" and isinstance(image_result.get("prop"), dict)
+                    scratched["best_hit_regenerated"] = replacement_generated
+                    assessment["replacement_generated"] = replacement_generated
+                    correction = render_public_scratch_correction(assessment)
+                    if correction:
+                        free_id = _telegram_destination(os.getenv("FREE_CHANNEL_ID", ""))
+                        await _send_long(bot, free_id, correction)
+            except Exception as public_err:
+                logging.exception("Public scratch correction failed: %s", public_err)
             if admin_id:
-                scratched["best_hit_regenerated"] = bool(
-                    image_result.get("image_path") or image_result.get("prompt_path") or image_result.get("status")
-                )
-                alert_text = render_prop_scratch_alert(scratched)
-                await _send_long(
-                    bot,
-                    int(admin_id),
-                    alert_text,
-                )
+                await _send_long(bot, int(admin_id), render_prop_scratch_alert(scratched))
     except Exception as error:
         logging.exception("Lineup refresh failed")
         log = _read_log()

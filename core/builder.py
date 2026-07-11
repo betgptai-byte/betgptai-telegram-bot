@@ -31,6 +31,119 @@ SECTION_ORDER: list[str] = [
     "play_of_day", "moneyline", "f5", "runline", "totals", "team_totals", "parlay",
 ]
 
+ADVANCED_BUILDER_TRACE_VERSION = "advanced_market_context_v1"
+
+
+def _advanced_market_candidates(
+    slate: list[dict[str, Any]], card_date: str,
+) -> dict[str, Any]:
+    """Build official picks from quant-ranked, verified market objects only."""
+    candidates: dict[str, list[tuple[float, OfficialPick]]] = {key: [] for key in SECTION_ORDER if key != "parlay"}
+    rejected: list[str] = []
+
+    for game in slate:
+        game_pk = game.get("game_pk") or game.get("game_id")
+        away = str(game.get("away_team") or "")
+        home = str(game.get("home_team") or "")
+        label = f"{away} @ {home} ({game_pk})"
+        quant = _quant_payload(game)
+        edge_raw = quant.get("final_edge_score", quant.get("edge_score"))
+        try:
+            edge = float(edge_raw)
+        except (TypeError, ValueError):
+            rejected.append(f"{label}: missing quant edge score")
+            continue
+        if str(quant.get("engine_decision") or "").upper() not in {"QUALIFIED", "PLAY"}:
+            rejected.append(f"{label}: quant engine decision={quant.get('engine_decision') or 'missing'}")
+            continue
+        context = game.get("market_context") if isinstance(game.get("market_context"), dict) else {}
+        prices = game.get("best_available_prices") if isinstance(game.get("best_available_prices"), list) else []
+        provider = str(context.get("provider") or "")
+        if provider not in {"sharpapi", "sharp_api"} or not context.get("line_verified") or not prices:
+            rejected.append(f"{label}: Sharp market_context unavailable or unverified")
+            continue
+
+        by_market: dict[str, list[dict[str, Any]]] = {}
+        for price in prices:
+            if isinstance(price, dict):
+                by_market.setdefault(str(price.get("market") or ""), []).append(price)
+
+        def choose(rows: list[dict[str, Any]], preferred_team: str | None = None) -> dict[str, Any] | None:
+            if preferred_team:
+                target = _normalize_team(preferred_team)
+                match = next((row for row in rows if target in _normalize_team(str(row.get("outcome") or row.get("description") or ""))), None)
+                if match:
+                    return match
+                return None
+            priced = [row for row in rows if isinstance(row.get("price"), (int, float))]
+            return min(priced, key=lambda row: float(row["price"])) if priced else (rows[0] if rows else None)
+
+        money = choose(by_market.get("h2h", []))
+        selected_team = str(money.get("outcome") or money.get("description") or "") if money else ""
+        if _normalize_team(selected_team) not in {_normalize_team(home), _normalize_team(away)}:
+            selected_team = ""
+
+        def add(section: str, market_type: str, row: dict[str, Any] | None, *, team: str | None = None) -> None:
+            if not row:
+                rejected.append(f"{label}: no verified {market_type} market")
+                return
+            outcome = str(row.get("outcome") or row.get("description") or "")
+            picked_team = team
+            if market_type not in {"game_total"} and not picked_team:
+                picked_team = outcome if _normalize_team(outcome) in {_normalize_team(home), _normalize_team(away)} else None
+            line = row.get("point")
+            if market_type in {"runline", "game_total", "team_total"} and line is None:
+                rejected.append(f"{label}: {market_type} rejected because verified line is missing")
+                return
+            sportsbook = row.get("bookmaker_key") or row.get("bookmaker") or context.get("sportsbook")
+            odds = row.get("price")
+            opponent = None
+            if picked_team:
+                opponent = home if _normalize_team(picked_team) == _normalize_team(away) else away
+            pick = OfficialPick(
+                pick_id=_pick_id_from_parts([card_date, str(game_pk), section, market_type, picked_team or outcome, str(line)]),
+                sport="mlb", league="MLB", card_date=card_date,
+                game_pk=int(game_pk) if game_pk is not None else None,
+                game_id=int(game_pk) if game_pk is not None else None,
+                game_time_et=_game_time_et(game), away_team=away, home_team=home,
+                selected_team=picked_team, opponent=opponent, market_type=market_type,
+                market_line=line, odds=odds, posted_line=line, sportsbook=str(sportsbook or ""),
+                line_verified=True, edge_score=edge, confidence=quant.get("confidence"),
+                risk_level=quant.get("risk_level"), data_quality_grade=quant.get("data_quality_grade"),
+                reason=str(quant.get("matchup_summary") or "Quant-ranked verified live market."),
+                status="pending", result=None, model_version=quant.get("model_version", "BETGPTAI v21.0"),
+                market_mode="live_odds", odds_status="available", market_context_status="matched",
+                official_pick_source="advanced_structured_card", source="advanced_structured_card", section=section,
+            )
+            candidates[section].append((edge, pick))
+
+        add("play_of_day", "play_of_day", money, team=selected_team or None)
+        add("moneyline", "moneyline", money, team=selected_team or None)
+        add("f5", "f5_moneyline", choose(by_market.get("f5_h2h", []), selected_team), team=selected_team or None)
+        add("runline", "runline", choose(by_market.get("spreads", []), selected_team), team=selected_team or None)
+        add("totals", "game_total", choose(by_market.get("totals", [])))
+        add("team_totals", "team_total", choose(by_market.get("team_totals", []), selected_team), team=selected_team or None)
+
+    picks: list[OfficialPick] = []
+    section_counts: dict[str, int] = {}
+    for section, ranked in candidates.items():
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        limit = 1 if section == "play_of_day" else 5
+        chosen = [pick for _, pick in ranked[:limit]]
+        section_counts[section] = len(chosen)
+        picks.extend(chosen)
+    parlay_legs = sorted([pick for pick in picks if pick.market_type == "moneyline"], key=lambda pick: pick.edge_score or 0, reverse=True)[:2]
+    for leg in parlay_legs:
+        leg.parlay_leg = True
+    section_counts["safe_parlay_legs"] = len(parlay_legs)
+    return {
+        "picks": picks,
+        "sections_found": [section for section, count in section_counts.items() if count],
+        "section_item_counts": section_counts,
+        "candidates_found": sum(len(rows) for rows in candidates.values()),
+        "rejected_items": rejected,
+    }
+
 # ── Stats-only fallback section list (broader heading set than the prompt) ──
 _STATS_SECTION_HEADINGS: list[tuple[str, str]] = [
     ("play_of_day", "🔥 PLAY OF THE DAY"),
@@ -257,7 +370,7 @@ def _game_time_et(game: dict[str, Any]) -> str | None:
 
 
 def _quant_payload(game: dict[str, Any]) -> dict[str, Any]:
-    quant = game.get("betgptai_quant_v20") or game.get("betgptai_internal") or {}
+    quant = game.get("betgptai_quant_v21") or game.get("betgptai_quant_v20") or game.get("betgptai_internal") or {}
     if isinstance(quant, dict) and isinstance(quant.get("v20"), dict):
         quant = quant["v20"]
     return quant if isinstance(quant, dict) else {}
@@ -664,7 +777,7 @@ def build_card_from_analysis(
     card_date: str,
     source_command: str = "unknown",
 ) -> StructuredCard:
-    BUILDER_TRACE_VERSION = "stats_only_builder_v2_ACTIVE"
+    BUILDER_TRACE_VERSION = "stats_only_builder_v2_ACTIVE" if _stats_only_mode() else ADVANCED_BUILDER_TRACE_VERSION
 
     all_picks: list[OfficialPick] = []
     display_sections: dict[str, list[str]] = {}
@@ -672,6 +785,8 @@ def build_card_from_analysis(
     stats_only_builder_picks_created = 0
     stats_sections_found: list[str] = []
     stats_section_item_counts: dict[str, int] = {}
+    advanced_candidates_found = 0
+    advanced_sections_found: list[str] = []
 
     stats_mode = _stats_only_mode() and bool(slate)
 
@@ -692,36 +807,15 @@ def build_card_from_analysis(
                      "total": "Total", "team_total": "Team Total", "parlay": "Parlay"}.get(mt, mt)
             display_sections.setdefault(label, []).append(str(pk.selected_team or ""))
     else:
-        headings = _find_headings(analysis)
-        for idx, (section_key, start_idx) in enumerate(headings):
-            end_idx = headings[idx + 1][1] if idx + 1 < len(headings) else None
-            content = _section_content(analysis, start_idx, end_idx)
-            if not content:
-                continue
-
-            if section_key == "parlay":
-                legs = _parlay_legs(content, slate, card_date)
-                _display_key = "Parlay"
-                display_sections[_display_key] = [str(p.selected_team or p.market_type) for p in legs]
-                all_picks.extend(legs)
-                continue
-
-            _section_picks: list[OfficialPick] = []
-            pick_lines = _parse_pick_lines(content)
-            for line in pick_lines:
-                game = _game_for_selection(line, slate)
-                if not game:
-                    errors.append(f"No game match: {line[:60]}")
-                    continue
-                pick = _build_official_pick(line, section_key, game, card_date)
-                if pick:
-                    _section_picks.append(pick)
-                else:
-                    errors.append(f"Could not build pick: {line[:60]}")
-
-            display_key = SECTION_HEADINGS.get(section_key, section_key)
-            display_sections[display_key] = [str(p.selected_team or p.market_type) for p in _section_picks]
-            all_picks.extend(_section_picks)
+        advanced = _advanced_market_candidates(slate, card_date)
+        all_picks = advanced["picks"]
+        advanced_candidates_found = int(advanced.get("candidates_found") or 0)
+        advanced_sections_found = list(advanced.get("sections_found") or [])
+        errors.extend(list(advanced.get("rejected_items") or [])[:50])
+        for pick in all_picks:
+            display_sections.setdefault(pick.section or pick.market_type, []).append(
+                str(pick.selected_team or pick.market_type)
+            )
 
     # Explicit fallback (spec point 5): if stats-only mode is active and the
     # active path above produced no picks, run the stats-only builder helper
@@ -772,6 +866,11 @@ def build_card_from_analysis(
         "errors": errors,
         "builder_conversion_failed": conversion_failed,
         "builder_conversion_error": conversion_error,
+        "sections_found": stats_sections_found if stats_mode else advanced_sections_found,
+        "candidates_found": len(all_picks) if stats_mode else advanced_candidates_found,
+        "official_picks_created": len(all_picks),
+        "rejected_items": errors,
+        "rejected_reasons": errors,
     }
     if _stats_only_mode():
         meta["market_mode"] = "stats_only"

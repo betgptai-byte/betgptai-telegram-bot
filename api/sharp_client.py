@@ -36,6 +36,12 @@ class SharpRateLimitError(Exception):
 class SharpAPIError(Exception):
     """Raised on Sharp API HTTP / connectivity failures."""
 
+    def __init__(self, message: str, *, status_code: int | None = None, code: str | None = None, response_keys: list[str] | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.response_keys = response_keys or []
+
 
 # ── Token-bucket rate limiter ──────────────────────────────────────────────
 _last_request_time: float = 0.0
@@ -139,6 +145,16 @@ def _normalize_team(name: str) -> str:
         "stlouiscardinals": "cardinals", "saintlouiscardinals": "cardinals",
         "tampabayrays": "rays", "texasrangers": "rangers",
         "torontobluejays": "bluejays", "washingtonnationals": "nationals",
+        "ari": "diamondbacks", "az": "diamondbacks", "atl": "braves",
+        "bal": "orioles", "bos": "redsox", "chc": "cubs", "chw": "whitesox",
+        "cws": "whitesox", "cin": "reds", "cle": "guardians", "col": "rockies",
+        "det": "tigers", "hou": "astros", "kc": "royals", "kcr": "royals",
+        "laa": "angels", "lad": "dodgers", "mia": "marlins", "mil": "brewers",
+        "min": "twins", "nym": "mets", "nyy": "yankees", "oak": "athletics",
+        "ath": "athletics", "phi": "phillies", "pit": "pirates", "sd": "padres",
+        "sdp": "padres", "sf": "giants", "sfg": "giants", "sea": "mariners",
+        "stl": "cardinals", "tb": "rays", "tbr": "rays", "tex": "rangers",
+        "tor": "bluejays", "wsh": "nationals", "was": "nationals",
     }
     return TEAM_ALIASES.get(normalized, normalized)
 
@@ -149,13 +165,19 @@ def _normalize_sharp_event(event: dict[str, Any]) -> dict[str, Any]:
     away = event.get("away_team") or event.get("awayTeam") or ""
     commence = event.get("commence_time") or event.get("commenceTime") or event.get("start_time") or ""
     bookmakers_raw = event.get("bookmakers") or event.get("sportsbooks") or []
+    if not bookmakers_raw and isinstance(event.get("markets"), list):
+        bookmakers_raw = [{
+            "key": event.get("sportsbook") or event.get("bookmaker") or "sharpapi",
+            "title": event.get("sportsbook") or event.get("bookmaker") or "SharpAPI",
+            "markets": event.get("markets"),
+        }]
     bookmakers = []
     for book in bookmakers_raw:
         markets_raw = book.get("markets") or []
         markets = []
         for m in markets_raw:
             key = m.get("key") or m.get("market_key") or m.get("market") or ""
-            outcomes_raw = m.get("outcomes") or []
+            outcomes_raw = m.get("outcomes") or m.get("prices") or m.get("selections") or []
             outcomes = [
                 {
                     "name": o.get("name") or o.get("outcome") or o.get("team") or "",
@@ -181,6 +203,63 @@ def _normalize_sharp_event(event: dict[str, Any]) -> dict[str, Any]:
         "home_team": home,
         "away_team": away,
         "bookmakers": bookmakers,
+        "provider": "sharpapi",
+    }
+
+
+def parse_sharp_response(data: Any, *, endpoint: str = "/odds") -> dict[str, Any]:
+    """Normalize every documented Sharp response envelope without leaking its body."""
+    keys = sorted(str(key) for key in data.keys()) if isinstance(data, dict) else []
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        rows = next((data[key] for key in ("data", "events", "odds", "results") if isinstance(data.get(key), list)), None)
+        if rows is None:
+            raise SharpAPIError("parse_failed", code="parse_failed", response_keys=keys)
+    else:
+        raise SharpAPIError("parse_failed", code="parse_failed", response_keys=keys)
+    raw_rows = [row for row in rows if isinstance(row, dict)]
+    flat_odds = any(row.get("market_type") or row.get("selection") or row.get("odds_american") is not None for row in raw_rows)
+    if flat_odds:
+        grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        for row in raw_rows:
+            home = str(row.get("home_team") or row.get("homeTeam") or "")
+            away = str(row.get("away_team") or row.get("awayTeam") or "")
+            start = str(row.get("start_time") or row.get("commence_time") or row.get("commenceTime") or "")
+            event_id = str(row.get("event_id") or row.get("id") or "")
+            key = (event_id, away, home, start)
+            event = grouped.setdefault(key, {"id": event_id, "away_team": away, "home_team": home, "commence_time": start, "bookmakers": []})
+            book_key = str(row.get("sportsbook") or row.get("bookmaker") or "sharpapi")
+            book = next((item for item in event["bookmakers"] if item["key"] == book_key), None)
+            if book is None:
+                book = {"key": book_key, "title": book_key, "markets": []}
+                event["bookmakers"].append(book)
+            raw_market = str(row.get("market_type") or row.get("market") or "").lower()
+            market_key = {"moneyline": "h2h", "spread": "spreads", "runline": "spreads", "total": "totals"}.get(raw_market, raw_market)
+            market = next((item for item in book["markets"] if item["key"] == market_key), None)
+            if market is None:
+                market = {"key": market_key, "outcomes": []}
+                book["markets"].append(market)
+            selection = row.get("selection") or row.get("outcome") or row.get("team") or ""
+            market["outcomes"].append({
+                "name": selection,
+                "price": row.get("odds_american") if row.get("odds_american") is not None else row.get("odds"),
+                "point": row.get("line") if row.get("line") is not None else row.get("spread"),
+                "description": row.get("description") or selection,
+            })
+        normalized = [_normalize_sharp_event(event) for event in grouped.values()]
+    else:
+        normalized = [_normalize_sharp_event(row) for row in raw_rows]
+    is_events_endpoint = endpoint.rstrip("/") == "/events"
+    return {
+        "provider": "sharpapi",
+        "events": normalized if is_events_endpoint else normalized,
+        "odds": [] if is_events_endpoint else normalized,
+        "events_returned": len(normalized),
+        "status": "available" if normalized else "unavailable",
+        "error": None if normalized else "no_events_returned",
+        "top_level_keys": keys if keys else (["<list>"] if isinstance(data, list) else []),
+        "odds_rows_returned": len(raw_rows) if flat_odds else len(normalized),
     }
 
 
@@ -257,6 +336,12 @@ def fetch_mlb_odds() -> list[dict[str, Any]]:
     Raises SharpAPIError on connectivity / non-429 failures.
     Raises SharpRateLimitError on 429.
     """
+    # The multi-sport client owns the canonical best-odds → sportsbook
+    # fallback flow.  Import locally to avoid the module-level compatibility
+    # import in sharp_odds_client creating a cycle.
+    from api.sharp_odds_client import get_odds
+    return get_odds(sport="mlb")
+
     api_key = sharp_api_key()
     if not api_key:
         raise SharpAPIError("SHARP_API_KEY is missing from .env.")
@@ -286,23 +371,23 @@ def fetch_mlb_odds() -> list[dict[str, Any]]:
     except requests.RequestException as exc:
         raise SharpAPIError(f"Sharp API request failed: {exc}") from exc
 
+    logger.info("Sharp request endpoint=/odds url=%s status=%s", url, resp.status_code)
+    if resp.status_code == 401:
+        raise SharpAPIError("auth_failed", status_code=401, code="auth_failed")
     if resp.status_code == 429:
         raise SharpRateLimitError("Sharp API rate limit hit (429)")
 
     if resp.status_code != 200:
-        raise SharpAPIError(
-            f"Sharp API returned HTTP {resp.status_code}: {resp.text[:500]}"
-        )
+        raise SharpAPIError(f"http_error_{resp.status_code}", status_code=resp.status_code)
 
     try:
         data = resp.json()
     except Exception as exc:
-        raise SharpAPIError(f"Sharp API invalid JSON: {exc}") from exc
+        raise SharpAPIError("parse_failed", code="parse_failed", response_keys=[]) from exc
 
-    if not isinstance(data, list):
-        raise SharpAPIError(f"Sharp API unexpected response type: {type(data).__name__}")
-
-    normalized = [_normalize_sharp_event(event) for event in data]
+    parsed = parse_sharp_response(data, endpoint="/odds")
+    normalized = parsed["odds"]
+    logger.info("Sharp response endpoint=/odds keys=%s games=%d events=%d", parsed["top_level_keys"], len(normalized), parsed["events_returned"])
     _cache_write("baseball_mlb", normalized)
     logger.info("Sharp API fetched %d MLB odds events", len(normalized))
     return normalized

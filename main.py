@@ -88,9 +88,11 @@ from intelligence_dashboard import (
     render_morning_report,
 )
 from lineup_verification import (
+    assess_scratch_public_impact,
     prop_scratch_debug_payload,
     render_lineup_status,
     render_prop_scratch_debug,
+    render_public_scratch_correction,
     summarize_lineups,
 )
 from mlb_data import MLBDataError, get_combined_slate, odds_debug_payload
@@ -1867,6 +1869,46 @@ async def prop_scratch_debug(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"Unable to inspect prop scratch status right now.\n\nError: {error}")
 
 
+async def scratch_public_impact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: assess whether scratched players affect the PUBLIC official card."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    selected_date = official_sports_date().isoformat()
+    await update.message.reply_text("⏳ Assessing scratch public impact...")
+    try:
+        slate = await asyncio.to_thread(
+            get_combined_slate,
+            os.getenv("ODDS_API_KEY", ""),
+            game_date=selected_date,
+            highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+        )
+        assessment = await asyncio.to_thread(
+            assess_scratch_public_impact, selected_date, upcoming_mlb_slate(slate),
+        )
+        affected = assessment.get("affected_public_picks", [])
+        affected_names = ", ".join(item.get("player", "?") for item in affected) or "None"
+        lines = [
+            "🧪 SCRATCH PUBLIC IMPACT",
+            f"📅 Date: {selected_date}",
+            "",
+            f"Public card affected: {'YES' if assessment.get('public_card_affected') else 'NO'}",
+            f"Affected public picks: {affected_names}",
+            f"Replacement generated: {'YES' if assessment.get('replacement_generated') else 'NO'}",
+            f"Public correction needed: {'YES' if assessment.get('public_correction_needed') else 'NO'}",
+            f"ML/F5/RL card unaffected: {'YES' if assessment.get('ml_f5_rl_unaffected') else 'NO'}",
+        ]
+        admin_only = assessment.get("admin_only_players", [])
+        if admin_only:
+            lines.append("")
+            lines.append("Admin-only/watchlist scratched (owner alert only):")
+            lines.extend(f"- {p}" for p in admin_only)
+        await _send_long_message(update, "\n".join(lines))
+    except Exception as error:
+        logging.exception("/scratch_public_impact failed")
+        await update.message.reply_text(f"❌ Scratch public impact failed:\n{error!r}")
+
+
 async def post_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner-only automatic channel posting status."""
     del context
@@ -1910,9 +1952,16 @@ async def workflow_debug_handler(update: Update, context: ContextTypes.DEFAULT_T
         schedule_games = verification.get("schedule_games", 0)
         stats_only = os.getenv("STATS_ONLY_CARD_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
         market_mode = "Stats Only" if stats_only else "Normal"
+        live_env_raw = os.getenv("LIVE_MLB_ENGINE")
+        live_env_value = live_env_raw.strip().lower() if live_env_raw is not None and live_env_raw.strip() else "not_set"
+        simple_engine = os.getenv("LIVE_MLB_ENGINE", "simple").strip().lower() == "simple"
+        simple_status = await asyncio.to_thread(simple_card_bridge_status, selected) if simple_engine else {}
+        simple_ready = bool(simple_status.get("simple_card_exists") and int(simple_status.get("simple_pick_count") or 0) > 0)
         lines = [
             "🔧 WORKFLOW DEBUG",
             f"Date: {display_date(selected)}",
+            f"LIVE_MLB_ENGINE env value: {live_env_value}",
+            f"Live Engine: {'Simple MLB Card v1' if simple_engine else 'Advanced'}",
             "",
             "── Market Context ──",
             f"Market Mode: {market_mode}",
@@ -1928,6 +1977,8 @@ async def workflow_debug_handler(update: Update, context: ContextTypes.DEFAULT_T
             f"Errors: {verification.get('critical_failures', []) or 'None'}",
             "",
             "── T-45 Generation ──",
+            f"T-45 Simple Generate: {'YES' if generation.get('simple_generate') else 'NO'}",
+            f"T-45 Advanced Generate: {generation.get('advanced_generate', 'skipped' if simple_engine else 'testing')}",
             f"Card Complete: {'YES' if generation.get('card_generation_complete') else 'NO'}",
             f"Picks Saved: {'YES' if generation.get('picks_saved') else 'NO'}",
             f"Saved Count: {generation.get('saved_picks', 0)}",
@@ -1943,10 +1994,11 @@ async def workflow_debug_handler(update: Update, context: ContextTypes.DEFAULT_T
             f"Source Function: {generation.get('generation_source_function', 'N/A')}",
             "",
             "── T-43 Posting ──",
+            f"T-43 Simple Post: {'YES' if posting.get('engine') == 'simple_mlb_card_v1' or (simple_engine and posted_today) else 'NO'}",
             f"Status: {posting.get('status', 'Not run')}",
             f"Auto Post: {'ENABLED' if payload.get('auto_post_enabled') else 'DISABLED'}",
             f"Posted Today: {'YES' if posted_today else 'NO'}",
-            f"Posting Ready: {'YES' if generation.get('card_generation_complete') and (generation.get('picks_saved') or generation.get('saved_picks', 0) > 0) and payload.get('auto_post_enabled') else 'NO'}",
+            f"Posting Ready: {'YES' if (simple_ready if simple_engine else generation.get('card_generation_complete') and (generation.get('picks_saved') or generation.get('saved_picks', 0) > 0) and payload.get('auto_post_enabled')) else 'NO'}",
         ]
         await update.message.reply_text("\n".join(lines))
     except Exception as error:
@@ -2789,7 +2841,11 @@ async def _mission_control_health_text() -> str:
     v20_games = [game.get("betgptai_quant_v20") for game in slate if isinstance(game.get("betgptai_quant_v20"), dict)]
     v20_qualified = sum(1 for item in v20_games if item.get("engine_decision") == "QUALIFIED")
     edge_db_path = data_file("edge_database") / f"{selected_date}.json"
-    ready_to_publish = bool(slate and results_ready and weather_ready and quant_payload)
+    simple_engine = os.getenv("LIVE_MLB_ENGINE", "simple").strip().lower() == "simple"
+    simple_status = await asyncio.to_thread(simple_card_bridge_status, selected_date) if simple_engine else {}
+    ready_to_publish = bool(
+        simple_status.get("simple_card_exists") and int(simple_status.get("simple_pick_count") or 0) > 0
+    ) if simple_engine else bool(slate and results_ready and weather_ready and quant_payload)
     ready_games = sum(1 for item in quant_payload if item.get("game_status") == "ready")
     quant_weights = await asyncio.to_thread(current_quant_weights)
     verification_score = average_verification_score(slate)
@@ -2805,6 +2861,7 @@ async def _mission_control_health_text() -> str:
     )
     return (
         "🧠 BETGPTAI MISSION CONTROL\n\n"
+        f"Live Engine: {'Simple MLB Card v1' if simple_engine else 'Advanced'}\n"
         f"System Health: {'✅ Healthy' if storage_payload.get('writable') else '❌ Needs attention'}\n"
         f"Storage: {'✅ Healthy' if storage_payload.get('results_database_healthy') else '❌ Failed'}\n"
         f"Picks Saved Today: {pick_storage_payload.get('todays_picks', 0)}\n"
@@ -3879,6 +3936,14 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
         f"Request URL: {payload.get('odds_api_request_url') or 'N/A'}",
         "",
         f"Active provider: {payload.get('provider') or 'None'}",
+        f"Provider: {payload.get('provider') or 'None'}",
+        f"Events returned: {payload.get('events_returned', payload.get('games_returned', 0))}",
+        f"Matched games: {payload.get('matched_to_mlb_game_pk', 0)}",
+        f"Sportsbook used: {active_sb or 'none'}",
+        f"Market context available: {'YES' if payload.get('market_context_available') else 'NO'}",
+        f"First matched game: {payload.get('first_matched_game') or 'None'}",
+        f"Unmatched Sharp games: {len(payload.get('unmatched_odds_games') or [])}",
+        f"Unmatched MLB slate games: {len(payload.get('unmatched_mlb_games') or [])}",
         f"Markets: {payload.get('markets_requested')}",
         f"Games returned: {payload.get('games_returned')}",
     ]
@@ -4074,6 +4139,48 @@ async def odds_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except Exception as error:
         logging.exception("/odds_probe failed")
         await update.message.reply_text(f"/odds_probe failed:\n{error!r}")
+
+
+async def sharp_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only direct SharpAPI probe. Usage: /sharp_probe mlb"""
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id != OWNER_TELEGRAM_ID or not update.message:
+        return
+    sport = (context.args or ["mlb"])[0].strip().lower()
+    if sport != "mlb":
+        await update.message.reply_text("/sharp_probe currently supports: mlb")
+        return
+    from api.sharp_odds_client import _base_url, probe_sharp_mlb, sharp_api_enabled
+    try:
+        results = await asyncio.to_thread(probe_sharp_mlb, official_sports_date().isoformat())
+        selected = next((row for row in results if row.get("games_count", 0) > 0), None)
+        if selected is None:
+            selected = next((row for row in results if row.get("status_code") in (401, 429)), None)
+        selected = selected or (results[0] if results else {})
+        lines = [
+            "🔍 SHARP API PROBE — MLB",
+            f"Sharp API Enabled: {'YES' if sharp_api_enabled() else 'NO'}",
+            f"Base URL: {_base_url()}",
+            "Auth Method: X-API-Key",
+            f"Endpoint tested: {selected.get('endpoint') or 'N/A'}",
+            f"HTTP Status: {selected.get('status_code') or 'N/A'}",
+            f"Top-level keys: {', '.join(selected.get('top_level_keys') or []) or 'None'}",
+            f"Events returned: {selected.get('events_returned', selected.get('games_count', 0))}",
+            f"Odds returned: {selected.get('odds_returned', selected.get('games_count', 0))}",
+            f"First matchup: {selected.get('first_matchup') or 'None'}",
+            f"First market: {selected.get('first_market') or 'None'}",
+            f"Error: {selected.get('error') or 'None'}",
+        ]
+        await update.message.reply_text("\n".join(lines))
+    except Exception as error:
+        code = getattr(error, "code", None) or str(error)
+        await update.message.reply_text(
+            "🔍 SHARP API PROBE — MLB\n"
+            f"Sharp API Enabled: {'YES' if sharp_api_enabled() else 'NO'}\n"
+            f"Base URL: {_base_url()}\nAuth Method: X-API-Key\n"
+            "Endpoint tested: N/A\nHTTP Status: N/A\nTop-level keys: None\n"
+            f"Events returned: 0\nOdds returned: 0\nFirst matchup: None\nFirst market: None\nError: {code}"
+        )
 
 
 async def sp_batter_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6237,6 +6344,7 @@ async def main() -> None:
     application.add_handler(CommandHandler("odds_probe", odds_probe))
     SYSTEM_LOG.info("Registered command: /odds_probe")
     print("Registered command: /odds_probe", flush=True)
+    application.add_handler(CommandHandler("sharp_probe", sharp_probe))
     application.add_handler(CommandHandler("sp_batter_debug", sp_batter_debug))
     SYSTEM_LOG.info("Registered command: /sp_batter_debug")
     print("Registered command: /sp_batter_debug", flush=True)
@@ -6308,6 +6416,7 @@ async def main() -> None:
     application.add_handler(CommandHandler("scheduler_status", scheduler_status))
     application.add_handler(CommandHandler("lineup_status", lineup_status))
     application.add_handler(CommandHandler("prop_scratch_debug", prop_scratch_debug))
+    application.add_handler(CommandHandler("scratch_public_impact", scratch_public_impact))
     application.add_handler(CommandHandler("post_status", post_status))
     application.add_handler(CommandHandler("force_generate_today", force_generate_today))
     application.add_handler(CommandHandler("force_post_today", force_post_today))

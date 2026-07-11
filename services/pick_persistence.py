@@ -205,8 +205,10 @@ def _build_official_picks(card: Any) -> tuple[str, list[dict[str, Any]]]:
     analysis, slate, card_date, source = _extract_card_inputs(card)
     if not card_date:
         raise ValueError("card_date is required for official pick persistence")
-    if not analysis:
-        raise ValueError("analysis/card text is required for official pick persistence")
+    metadata = card.get("metadata") if isinstance(card, dict) and isinstance(card.get("metadata"), dict) else {}
+    is_advanced_structured = str(metadata.get("builder_trace_version") or "").startswith("advanced_market_context")
+    if not analysis and not is_advanced_structured:
+        raise ValueError("analysis/card text is required for legacy official pick persistence")
     if slate and not any(game.get("betgptai_quant_v20") for game in slate):
         try:
             slate = rt.enrich_slate_with_quant_scores(slate, card_date)
@@ -215,7 +217,7 @@ def _build_official_picks(card: Any) -> tuple[str, list[dict[str, Any]]]:
             pass
     explicit = card.get("official_picks") if isinstance(card, dict) and isinstance(card.get("official_picks"), list) else []
     picks = [dict(pick) for pick in explicit if isinstance(pick, dict)]
-    if not picks:
+    if not picks and not is_advanced_structured:
         _log_storage({
             "component": "pick_persistence",
             "event": "LEGACY_PICK_PARSER_USED",
@@ -224,7 +226,8 @@ def _build_official_picks(card: Any) -> tuple[str, list[dict[str, Any]]]:
             "message": "StructuredCard official_picks key absent or empty; falling back to extract_official_picks (text parsing)",
         })
         picks = rt.extract_official_picks(analysis, slate, card_date, source)
-    picks.extend(rt._approved_prop_records(card_date, source))  # approved admin props, if any
+    if not is_advanced_structured:
+        picks.extend(rt._approved_prop_records(card_date, source))  # legacy/admin path only
     had_pre_guard_picks = bool(picks)
     if not had_pre_guard_picks and _stats_only_card_mode() and source in _PUBLIC_SOURCES and analysis:
         # Both structured path and legacy parser returned 0 picks.

@@ -1,8 +1,7 @@
-"""Build a StructuredCard from AI analysis + slate data.
+"""Build StructuredCard picks from quant-ranked, verified slate objects.
 
-No Telegram-formatted-text parsing.  Uses section headings (the structural
-contract between prompt and builder) to identify picks, then enriches each
-pick with game data, quant scores, and odds from the slate.
+The advanced path never recovers official picks from Telegram text. Generated
+analysis is display content; official picks come from quant and market objects.
 """
 from __future__ import annotations
 
@@ -100,13 +99,18 @@ def _advanced_market_candidates(
             opponent = None
             if picked_team:
                 opponent = home if _normalize_team(picked_team) == _normalize_team(away) else away
+            direction = "over" if outcome.lower().startswith("over") else "under" if outcome.lower().startswith("under") else None
+            selection_text = picked_team or outcome
+            if line is not None:
+                selection_text = f"{selection_text} {line}"
             pick = OfficialPick(
                 pick_id=_pick_id_from_parts([card_date, str(game_pk), section, market_type, picked_team or outcome, str(line)]),
                 sport="mlb", league="MLB", card_date=card_date,
                 game_pk=int(game_pk) if game_pk is not None else None,
                 game_id=int(game_pk) if game_pk is not None else None,
                 game_time_et=_game_time_et(game), away_team=away, home_team=home,
-                selected_team=picked_team, opponent=opponent, market_type=market_type,
+                selected_team=picked_team, selection=selection_text, pick_text=selection_text,
+                direction=direction, opponent=opponent, market_type=market_type,
                 market_line=line, line=line, odds=odds, posted_line=line, sportsbook=str(sportsbook or ""),
                 line_verified=True, edge_score=edge, confidence=quant.get("confidence"),
                 risk_level=quant.get("risk_level"), data_quality_grade=quant.get("data_quality_grade"),

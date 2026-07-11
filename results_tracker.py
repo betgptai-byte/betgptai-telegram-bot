@@ -28,7 +28,7 @@ MLB_GAME_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{game_id}/feed/live"
 REQUEST_TIMEOUT = 20
 DIVIDER = "━━━━━━━━━━━━"
 VALID_MARKET_TYPES = {
-    "moneyline", "f5_moneyline", "runline", "total", "team_total", "parlay"
+    "play_of_day", "moneyline", "f5_moneyline", "runline", "game_total", "total", "team_total", "parlay"
 }
 V20_SCORE_FIELDS = (
     "sp_score", "offense_score", "bullpen_score", "defense_score",
@@ -1708,7 +1708,7 @@ def _grade_single(pick: dict[str, Any], final_games: dict[int, dict[str, Any]]) 
         pick.get("selected_team") or pick.get("pick_text") or pick.get("selection") or ""
     )
     pick_text = str(pick.get("pick_text") or pick.get("selection") or selection)
-    if pick_type == "moneyline":
+    if pick_type in {"moneyline", "play_of_day"}:
         scores = _team_scores(selection, game)
         if not scores:
             return PENDING_RESULT
@@ -1731,14 +1731,14 @@ def _grade_single(pick: dict[str, Any], final_games: dict[int, dict[str, Any]]) 
             return PENDING_RESULT
         adjusted_score = scores[0] + spread
         return "win" if adjusted_score > scores[1] else "loss" if adjusted_score < scores[1] else "push"
-    if pick_type == "total":
+    if pick_type in {"total", "game_total"}:
         total_line = pick.get("line") if isinstance(pick.get("line"), (int, float)) else _selection_point(pick_text, "total")
         if total_line is None:
             return PENDING_RESULT
         final_total = game["away_score"] + game["home_score"]
         if final_total == total_line:
             return "push"
-        wants_over = pick_text.lower().startswith("over")
+        wants_over = str(pick.get("direction") or pick_text).lower().startswith("over")
         return "win" if (final_total > total_line) == wants_over else "loss"
     if pick_type == "team_total":
         team_total = _parse_team_total(pick_text)
@@ -1818,10 +1818,12 @@ def _summary(picks: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 MARKET_RESULT_GROUPS = {
+    "play_of_day": "play_of_day",
     "moneyline": "moneyline",
     "f5_moneyline": "f5_moneyline",
     "runline": "runline",
     "totals": "total",
+    "game_totals": "game_total",
     "team_totals": "team_total",
     "parlays": "parlay",
 }
@@ -2169,7 +2171,7 @@ def grade_mlb_picks_for_date(target_date: str | None = None) -> dict[str, int]:
         if pick["market_type"] != "parlay":
             if not (pick.get("game_pk") or pick.get("game_id")):
                 missing_required.append("game_id")
-            if pick["market_type"] not in {"total"} and not pick.get("selected_team"):
+            if pick["market_type"] not in {"total", "game_total"} and not pick.get("selected_team"):
                 missing_required.append("selected_team")
         if missing_required:
             missing_metadata += 1

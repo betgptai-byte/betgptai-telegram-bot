@@ -21,6 +21,9 @@ class OfficialPick:
     away_team: str | None = None
     home_team: str | None = None
     selected_team: str | None = None
+    selection: str | None = None
+    pick_text: str | None = None
+    direction: str | None = None
     opponent: str | None = None
     market_type: str = "moneyline"
     market_line: float | None = None

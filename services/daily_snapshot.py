@@ -177,7 +177,7 @@ def _build_snapshot(
     f5_picks = [p for p in regular if (p.get("market_type") or p.get("market") or "").lower() in {"f5_moneyline", "f5"}]
     game_totals = [p for p in regular if (p.get("market_type") or p.get("market") or "").lower() in {"total", "game_total", "totals"}]
     team_totals = [p for p in regular if (p.get("market_type") or p.get("market") or "").lower() in {"team_total", "team_totals", "tt"}]
-    safe_parlay = [p for p in regular if str(p.get("pick_text") or "").startswith("SAFE") or str(p.get("market_type") or "").lower() == "parlay"]
+    safe_parlay = [p for p in regular if p.get("parlay_leg") or str(p.get("pick_text") or "").startswith("SAFE") or str(p.get("market_type") or "").lower() == "parlay"]
     core_five = [p for p in regular if str(p.get("category") or "").lower() == "core_five"]
     props = [p for p in regular if str(p.get("market_type") or p.get("market") or "").lower() in {"player_prop", "prop", "hitter_prop", "pitcher_prop"}]
 

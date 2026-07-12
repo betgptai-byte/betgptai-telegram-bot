@@ -118,6 +118,7 @@ from player_props_engine import (
     build_player_props_lab,
     player_props_engine_available,
     render_hitprops_debug,
+    render_fanduel_props_debug,
     render_hits_by_team_card,
     render_prop_debug,
     render_prop_type_card,
@@ -2954,6 +2955,8 @@ async def _send_props_lab(
             card = render_prop_debug(payload)
         elif mode == "hitprops_debug":
             card = render_hitprops_debug(payload)
+        elif mode == "fanduel_debug":
+            card = render_fanduel_props_debug(payload)
         elif mode == "test":
             card = render_props_test(payload)
         else:
@@ -3964,6 +3967,11 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
         f"Runline contexts: {payload.get('runline_contexts', 0)}",
         f"Total contexts: {payload.get('total_contexts', 0)}",
         f"Team total contexts: {payload.get('team_total_contexts', 0)}",
+        f"Team-name matches: {payload.get('team_name_matches', 0)}",
+        f"Time-window rejections: {payload.get('time_window_rejections', 0)}",
+        f"Date rejections: {payload.get('date_rejections', 0)}",
+        f"Missing-team rejections: {payload.get('missing_team_rejections', 0)}",
+        f"Doubleheader closest-time matches: {payload.get('doubleheader_closest_time_matches', 0)}",
         f"Markets: {payload.get('markets_requested')}",
         f"Games returned: {payload.get('games_returned')}",
     ]
@@ -4012,6 +4020,19 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
         lines.append("Sample unmatched odds:")
         for item in unmatched_odds[:8]:
             lines.append(f"- {item.get('away_team')} @ {item.get('home_team')} ({item.get('commence_time')})")
+    mapping = payload.get("unmatched_mapping_diagnostics") if isinstance(payload.get("unmatched_mapping_diagnostics"), list) else []
+    if mapping:
+        lines.extend(["", "Sharp unmatched mapping diagnostics:"])
+        for item in mapping[:10]:
+            lines.extend([
+                f"- Raw Sharp: {item.get('sharp_away')} @ {item.get('sharp_home')}",
+                f"  Normalized Sharp: {item.get('sharp_normalized_away')}@{item.get('sharp_normalized_home')}",
+                f"  Local ET start: {item.get('sharp_local_start') or 'Unavailable'}",
+                f"  Closest MLB: {item.get('mlb_away')} @ {item.get('mlb_home')}",
+                f"  Normalized MLB: {item.get('mlb_normalized_away')}@{item.get('mlb_normalized_home')}",
+                f"  Time difference minutes: {item.get('time_difference_minutes')}",
+                f"  Rejection reason: {item.get('rejection_reason')}",
+            ])
     return "\n".join(lines).strip()
 
 
@@ -4219,8 +4240,10 @@ async def sharp_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 f"Hit prop rows: {counts.get('player_hits', 0)}",
                 f"Total bases rows: {counts.get('player_total_bases', 0)}",
                 f"HR prop rows: {counts.get('player_home_runs', 0)}",
-                f"Pitcher K rows: {counts.get('pitcher_strikeouts', 0)}",
+                f"Pitcher K rows: {int(counts.get('pitcher_strikeouts', 0)) + int(counts.get('player_strikeouts', 0))}",
                 f"Rejected game-market rows: {result.get('rejected_game_market_rows', 0)}",
+                f"First prop row: {result.get('first_prop_row') or 'None'}",
+                f"First grouped prop: {result.get('first_grouped_prop') or 'None'}",
                 f"Error: {result.get('error') or 'None'}",
             ]
             await update.message.reply_text("\n".join(lines))
@@ -5112,6 +5135,12 @@ async def hitprops_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """Owner-only focused Hit Props Engine diagnostics."""
     del context
     await _send_props_lab(update, "hitprops_debug")
+
+
+async def props_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only sportsbook-specific prop diagnostics."""
+    mode = "fanduel_debug" if any(arg.lower() == "fanduel" for arg in (context.args or [])) else "debug"
+    await _send_props_lab(update, mode)
 
 
 async def props_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6597,6 +6626,8 @@ async def main() -> None:
     application.add_handler(CommandHandler("props_test", props_test))
     application.add_handler(CommandHandler("prop_debug", prop_debug))
     application.add_handler(CommandHandler("hitprops_debug", hitprops_debug))
+    application.add_handler(CommandHandler("hit_props_debug", hitprops_debug))
+    application.add_handler(CommandHandler("props_debug", props_debug))
     application.add_handler(CommandHandler("approve_prop", approve_prop_command))
     application.add_handler(CommandHandler("soccer_full", soccer_owner_card))
     application.add_handler(CommandHandler("btts", soccer_owner_card))

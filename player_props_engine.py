@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,8 @@ APPROVED_PROPS_FILE = data_file("approved_props.json")
 EASTERN = ZoneInfo("America/New_York")
 MLB_PEOPLE_URL = "https://statsapi.mlb.com/api/v1/people"
 REQUEST_TIMEOUT = 10
+PROP_BOOK = os.getenv("PROP_BOOK", "fanduel").strip().lower() or "fanduel"
+GAME_MARKET_BOOK = os.getenv("GAME_MARKET_BOOK", "draftkings").strip().lower() or "draftkings"
 
 SUPPORTED_PROP_TYPES = (
     "hits",
@@ -711,6 +714,12 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
     players_scanned = 0
     pitchers_scanned = 0
     games_scanned = len(slate)
+    fanduel_payload: dict[str, Any] = {}
+    try:
+        from api.sharp_odds_client import fetch_mlb_props
+        fanduel_payload = fetch_mlb_props(card_date) if PROP_BOOK == "fanduel" else {}
+    except Exception as error:
+        fanduel_payload = {"rows": [], "grouped_props": [], "error": str(error)}
 
     matchup_result = build_slate_matchups(slate) if slate else {"games": [], "debug": {}}
     matchup_games = matchup_result.get("games", [])
@@ -757,6 +766,62 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
                 f"{reason}"
             )
     all_props = verified_props
+    market_map = {
+        "hits": {"player_hits"}, "2_plus_hits": {"player_hits"},
+        "total_bases": {"player_total_bases"}, "home_runs": {"player_home_runs"},
+        "rbis": {"player_rbis"}, "runs": {"player_runs"},
+        "strikeouts": {"pitcher_strikeouts", "player_strikeouts"},
+    }
+    grouped_fanduel = fanduel_payload.get("grouped_props") if isinstance(fanduel_payload.get("grouped_props"), list) else []
+    matched_players: set[str] = set()
+    market_rejections: list[str] = []
+    from api.sharp_client import _normalize_team as normalize_team
+    def normalize_player(value: Any) -> str:
+        return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+    for prop in all_props:
+        supported_markets = market_map.get(str(prop.get("prop_type") or ""))
+        if not supported_markets:
+            continue
+        pname = normalize_player(prop.get("player_name"))
+        desired_lines = {"hits": 0.5, "2_plus_hits": 1.5, "total_bases": 1.5, "home_runs": 0.5, "rbis": 0.5, "runs": 0.5}
+        expected_line = desired_lines.get(str(prop.get("prop_type") or ""))
+        match = next((item for item in grouped_fanduel
+            if normalize_player(item.get("player_name")) == pname
+            and str(item.get("market_type") or "") in supported_markets
+            and (expected_line is None or _num(item.get("line")) is None or abs((_num(item.get("line")) or 0) - expected_line) < 0.01)
+            and (not item.get("team") or normalize_team(str(item.get("team"))) == normalize_team(str(prop.get("team_name") or prop.get("team") or "")))
+        ), None)
+        if match:
+            prop.update({
+                "line": match.get("line"), "odds": match.get("over_odds"),
+                "over_odds": match.get("over_odds"), "under_odds": match.get("under_odds"),
+                "selection": "Over", "line_verified": bool(match.get("line_verified")),
+                "sportsbook": "fanduel", "provider": "sharpapi",
+                "source": "sharpapi_fanduel_props", "fanduel_market_verified": True,
+            })
+            projected, implied, edge, value_note = _ev_fields(float(prop.get("raw_score") or 50), prop.get("odds"))
+            prop.update({"projected_probability": projected, "implied_probability": implied, "edge": edge, "value_note": value_note})
+            matched_players.add(pname)
+        else:
+            prop["fanduel_market_verified"] = False
+            market_rejections.append(f"{prop.get('player_name')} {prop.get('prop_type')}: no matching FanDuel market")
+
+    if grouped_fanduel:
+        filtered_props: list[dict[str, Any]] = []
+        for prop in all_props:
+            prop_type = str(prop.get("prop_type") or "")
+            if prop_type in market_map and not prop.get("fanduel_market_verified"):
+                continue
+            if prop_type == "hits" and (_num(prop.get("line")) != 0.5 or prop.get("selection") != "Over"):
+                market_rejections.append(f"{prop.get('player_name')} hits: official candidate requires Over 0.5")
+                continue
+            if prop_type == "total_bases":
+                park = str(_dict(prop.get("debug_context")).get("park_factor") or "").lower()
+                if float(prop.get("raw_score") or 0) < 62 or "pitcher" in park:
+                    market_rejections.append(f"{prop.get('player_name')} total_bases: power/contact or park gate failed")
+                    continue
+            filtered_props.append(prop)
+        all_props = filtered_props
     all_props = sorted(all_props, key=lambda item: item.get("raw_score", 0), reverse=True)
     grouped = {
         prop_type: [prop for prop in all_props if prop.get("prop_type") == prop_type]
@@ -835,6 +900,18 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
             "top_raw_candidates": all_props[:15],
             "missing_fields": missing_data,
             "sp_batter_matchup": matchup_debug,
+            "fanduel_props": {
+                "raw_rows": int(fanduel_payload.get("raw_rows") or 0),
+                "grouped_props": len(grouped_fanduel),
+                "matched_players": len(matched_players),
+                "lineup_confirmed_count": sum(1 for prop in all_props if _dict(prop.get("lineup_verification")).get("state") == "Confirmed"),
+                "scratched_rejected_count": int(reason_counts.get("scratched") or 0),
+                "official_hit_prop_candidates": len([prop for prop in all_props if prop.get("prop_type") == "hits" and prop.get("fanduel_market_verified")]),
+                "hr_watch_candidates": len([prop for prop in all_props if prop.get("prop_type") == "home_runs" and prop.get("fanduel_market_verified")]),
+                "k_prop_candidates": len([prop for prop in all_props if prop.get("prop_type") == "strikeouts" and prop.get("fanduel_market_verified")]),
+                "rejections": market_rejections[:50],
+                "first_grouped_prop": fanduel_payload.get("first_grouped_prop"),
+            },
         },
         "source_status": {
             "mlb_stats_api": bool(slate),
@@ -1206,7 +1283,42 @@ def render_hitprops_debug(payload: dict[str, Any]) -> str:
     ])
     if int(debug.get("final_props_created") or final_count or 0) <= 0:
         lines.extend(["", "No qualified props available."])
+    hit_candidates = candidates.get("hits", []) if isinstance(candidates, dict) else []
+    lines.extend(["", "Top 10 Over 0.5 Hit candidates:"])
+    for prop in hit_candidates[:10]:
+        lineup = _dict(prop.get("lineup_verification"))
+        lines.append(
+            f"- {prop.get('player_name')} | {prop.get('team_name')} vs {prop.get('opponent_name')} | "
+            f"pitcher {prop.get('debug_context', {}).get('opposing_pitcher')} | "
+            f"lineup {lineup.get('state') or lineup.get('status')} spot {lineup.get('lineup_spot')} | "
+            f"Over {prop.get('line')} ({prop.get('odds')}) | edge {prop.get('edge')} score {prop.get('raw_score')}"
+        )
+    if not hit_candidates:
+        lines.append("- None")
+    fanduel = debug.get("fanduel_props") if isinstance(debug.get("fanduel_props"), dict) else {}
+    rejection_items = fanduel.get("rejections") or []
+    lines.extend(["", "FanDuel rejection reasons:"])
+    lines.extend(f"- {reason}" for reason in rejection_items[:20])
+    if not rejection_items:
+        lines.append("- None")
     return "\n".join(lines).strip()
+
+
+def render_fanduel_props_debug(payload: dict[str, Any]) -> str:
+    debug = payload.get("debug") if isinstance(payload.get("debug"), dict) else {}
+    fanduel = debug.get("fanduel_props") if isinstance(debug.get("fanduel_props"), dict) else {}
+    return (
+        "🧪 FANDUEL PROPS DEBUG\n\n"
+        f"Raw FanDuel rows: {fanduel.get('raw_rows', 0)}\n"
+        f"Grouped props: {fanduel.get('grouped_props', 0)}\n"
+        f"Matched players: {fanduel.get('matched_players', 0)}\n"
+        f"Lineup confirmed count: {fanduel.get('lineup_confirmed_count', 0)}\n"
+        f"Scratched rejected count: {fanduel.get('scratched_rejected_count', 0)}\n"
+        f"Official hit prop candidates: {fanduel.get('official_hit_prop_candidates', 0)}\n"
+        f"HR watch candidates: {fanduel.get('hr_watch_candidates', 0)}\n"
+        f"K prop candidates: {fanduel.get('k_prop_candidates', 0)}\n"
+        f"First grouped prop: {fanduel.get('first_grouped_prop') or 'None'}"
+    )
 
 
 def render_props_test(payload: dict[str, Any]) -> str:

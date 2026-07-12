@@ -27,7 +27,7 @@ from thesportsdb_data import (
 )
 from weather_data import merge_weather_data
 from game_time import game_sort_key
-from time_utils import mlb_local_game_date, mlb_utc_query_window
+from time_utils import mlb_local_game_date, mlb_utc_query_window, to_et
 
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
@@ -260,8 +260,14 @@ def _normalize_team(team_name: str) -> str:
     return TEAM_ALIASES.get(normalized, normalized)
 
 
-def _game_key(away_team: str, home_team: str) -> frozenset[str]:
-    return frozenset((_normalize_team(away_team), _normalize_team(home_team)))
+def _game_key(away_team: str, home_team: str) -> tuple[str, str]:
+    """Ordered normalized matchup key: away@home."""
+    return _normalize_team(away_team), _normalize_team(home_team)
+
+
+def _game_key_text(away_team: str, home_team: str) -> str:
+    away, home = _game_key(away_team, home_team)
+    return f"{away}@{home}"
 
 
 def _clean_bookmakers(odds_game: dict[str, Any]) -> list[dict[str, Any]]:
@@ -316,19 +322,29 @@ def _parse_api_time(value: str | None) -> datetime | None:
 
 
 def _closest_odds_game(game: dict[str, Any], candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    match, _, _ = _closest_odds_game_detail(game, candidates)
+    return match
+
+
+def _closest_odds_game_detail(
+    game: dict[str, Any], candidates: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, float | None, str | None]:
     if not candidates:
-        return None
+        return None, None, "team_name_mismatch"
     game_time = _parse_api_time(game.get("game_time"))
     if game_time is None:
-        return candidates.pop(0)
+        return None, None, "missing_mlb_start_time"
     match = min(candidates, key=lambda candidate: abs((game_time - _parse_api_time(
         candidate.get("commence_time"))).total_seconds()) if _parse_api_time(
         candidate.get("commence_time")) else float("inf"))
     match_time = _parse_api_time(match.get("commence_time"))
-    if match_time is None or abs((game_time - match_time).total_seconds()) > 12 * 60 * 60:
-        return None
+    if match_time is None:
+        return None, None, "missing_sharp_start_time"
+    difference_minutes = abs((game_time - match_time).total_seconds()) / 60.0
+    if difference_minutes > 12 * 60:
+        return None, difference_minutes, "time_window_mismatch"
     candidates.remove(match)
-    return match
+    return match, difference_minutes, None
 
 
 def combine_schedule_and_odds(schedule: list[dict[str, Any]], odds: list[dict[str, Any]], card_date: str | None = None) -> list[dict[str, Any]]:
@@ -336,7 +352,7 @@ def combine_schedule_and_odds(schedule: list[dict[str, Any]], odds: list[dict[st
     from api.sharp_odds_client import build_game_market_context
     from time_utils import mlb_local_game_date
 
-    by_game: dict[frozenset[str], list[dict[str, Any]]] = {}
+    by_game: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for odds_game in odds:
         if card_date and mlb_local_game_date(odds_game.get("commence_time")) != card_date:
             continue
@@ -518,6 +534,12 @@ def odds_debug_payload(
         "utc_query_window": list(mlb_utc_query_window(event_date or selected_date)) if sport_lower == "mlb" else None,
         "sharp_local_date_rows": 0,
         "mlb_local_date_games": 0,
+        "team_name_matches": 0,
+        "time_window_rejections": 0,
+        "date_rejections": 0,
+        "missing_team_rejections": 0,
+        "doubleheader_closest_time_matches": 0,
+        "unmatched_mapping_diagnostics": [],
     }
 
     schedule: list[dict[str, Any]] = []
@@ -623,6 +645,8 @@ def odds_debug_payload(
         payload["accepted_game_market_rows"] = int(diagnostic.get("accepted_game_market_rows") or 0)
         payload["rejected_prop_rows"] = int(diagnostic.get("rejected_prop_rows") or 0)
         payload["sharp_local_date_rows"] = int(diagnostic.get("sharp_local_date_rows") or 0)
+        payload["date_rejections"] = sum(int(attempt.get("rejected_wrong_local_date") or 0) for attempt in diagnostic.get("attempts") or [])
+        payload["missing_team_rejections"] = int(diagnostic.get("rejected_missing_team_fields") or 0)
         payload["utc_query_window"] = diagnostic.get("utc_query_window") or payload["utc_query_window"]
         payload["accepted_prop_rows"] = int(prop_diagnostic.get("accepted_prop_rows") or 0)
         counts = diagnostic.get("market_counts") or {}
@@ -652,28 +676,36 @@ def odds_debug_payload(
             endpoint=SHARP_ENDPOINT_ODDS,
         )
     if schedule:
-        odds_keys: dict[frozenset[str], list[dict[str, Any]]] = {}
+        odds_keys: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for odds_game in odds:
             if mlb_local_game_date(odds_game.get("commence_time")) != selected_date:
                 continue
             odds_keys.setdefault(_game_key(odds_game.get("away_team", ""), odds_game.get("home_team", "")), []).append(odds_game)
-        matched_keys = set()
         matched_odds_ids: set[int] = set()
         for game in schedule:
             key = _game_key(game.get("away_team", ""), game.get("home_team", ""))
-            match = _closest_odds_game(game, odds_keys.get(key, []))
+            candidates = odds_keys.get(key, [])
+            candidate_count = len(candidates)
+            if candidates:
+                payload["team_name_matches"] += 1
+            match, difference_minutes, rejection = _closest_odds_game_detail(game, candidates)
             if match:
-                matched_keys.add(key)
                 matched_odds_ids.add(id(match))
                 payload["matched_to_mlb_game_pk"] += 1
+                if candidate_count > 1:
+                    payload["doubleheader_closest_time_matches"] += 1
                 if payload["first_matched_game"] is None:
                     payload["first_matched_game"] = f"{game.get('away_team')} @ {game.get('home_team')}"
             else:
+                if rejection == "time_window_mismatch":
+                    payload["time_window_rejections"] += 1
                 payload["unmatched_mlb_games"].append({
                     "game_pk": game.get("game_pk"),
                     "away_team": game.get("away_team"),
                     "home_team": game.get("home_team"),
-                    "normalized_key": sorted(key),
+                    "normalized_key": _game_key_text(game.get("away_team", ""), game.get("home_team", "")),
+                    "rejection_reason": rejection,
+                    "time_difference_minutes": difference_minutes,
                 })
         for key, odds_games in odds_keys.items():
             for odds_game in odds_games:
@@ -684,7 +716,31 @@ def odds_debug_payload(
                     "away_team": odds_game.get("away_team"),
                     "home_team": odds_game.get("home_team"),
                     "commence_time": odds_game.get("commence_time"),
-                    "normalized_key": sorted(key),
+                    "normalized_key": _game_key_text(odds_game.get("away_team", ""), odds_game.get("home_team", "")),
+                })
+                sharp_time = _parse_api_time(odds_game.get("commence_time"))
+                exact_mlb = [game for game in schedule if _game_key(game.get("away_team", ""), game.get("home_team", "")) == key]
+                reversed_mlb = [game for game in schedule if _game_key(game.get("home_team", ""), game.get("away_team", "")) == key]
+                pool = exact_mlb or reversed_mlb or schedule
+                closest = min(
+                    pool,
+                    key=lambda game: abs((_parse_api_time(game.get("game_time")) - sharp_time).total_seconds())
+                    if sharp_time and _parse_api_time(game.get("game_time")) else float("inf"),
+                ) if pool else None
+                closest_time = _parse_api_time(closest.get("game_time")) if closest else None
+                diff = abs((closest_time - sharp_time).total_seconds()) / 60.0 if closest_time and sharp_time else None
+                reason = "reversed_home_away_diagnostic" if reversed_mlb and not exact_mlb else "time_window_mismatch" if exact_mlb and diff is not None and diff > 720 else "team_name_mismatch"
+                local_start = to_et(sharp_time)
+                payload["unmatched_mapping_diagnostics"].append({
+                    "sharp_away": odds_game.get("away_team"), "sharp_home": odds_game.get("home_team"),
+                    "sharp_normalized_away": key[0], "sharp_normalized_home": key[1],
+                    "sharp_local_start": local_start.isoformat() if local_start else None,
+                    "mlb_away": closest.get("away_team") if closest else None,
+                    "mlb_home": closest.get("home_team") if closest else None,
+                    "mlb_normalized_away": _normalize_team(closest.get("away_team", "")) if closest else None,
+                    "mlb_normalized_home": _normalize_team(closest.get("home_team", "")) if closest else None,
+                    "time_difference_minutes": round(diff, 1) if diff is not None else None,
+                    "rejection_reason": reason,
                 })
     if payload.get("accepted_game_market_rows"):
         payload["provider"] = "sharpapi"

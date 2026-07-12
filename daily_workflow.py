@@ -801,6 +801,8 @@ def _footer() -> str:
 
 
 def _best_hit_text(card_date: str) -> str:
+    if os.getenv("PROP_PUBLIC_ENABLED", "false").strip().lower() not in {"1", "true", "yes", "on"}:
+        return "⚾ BEST HIT PROP\n\nPublic player props are disabled pending lineup verification."
     payload = _read_json(data_file("best_hit_prop.json"), {})
     prop = None
     if isinstance(payload, dict):
@@ -809,6 +811,18 @@ def _best_hit_text(card_date: str) -> str:
             prop = day.get("prop")
     if not isinstance(prop, dict):
         return "⚾ BEST HIT PROP\n\nBest Hit Prop is pending final verification."
+    lineup = prop.get("lineup_verification") if isinstance(prop.get("lineup_verification"), dict) else {}
+    lab = _read_json(data_file("props_lab.json"), {})
+    day = lab.get(card_date) if isinstance(lab, dict) and isinstance(lab.get(card_date), dict) else {}
+    cached_id = str(prop.get("prop_id") or "")
+    cached_player = str(prop.get("player_name") or "").strip().lower()
+    lab_match = next((item for item in day.get("all_props", []) if isinstance(item, dict) and (
+        (cached_id and str(item.get("prop_id") or "") == cached_id)
+        or (cached_player and str(item.get("player_name") or "").strip().lower() == cached_player and item.get("prop_type") == "hits")
+    )), None)
+    scratch_passed = isinstance(lab_match, dict) and lab_match.get("status") != "invalidated" and bool(lab_match.get("line_verified"))
+    if not lineup.get("verified") or lineup.get("state") == "Scratched" or prop.get("status") == "invalidated" or not scratch_passed:
+        return "⚾ BEST HIT PROP\n\nBest Hit Prop is pending verified lineup and scratch checks."
     return (
         "⚾ BEST HIT PROP\n\n"
         f"👤 {prop.get('player_name', 'Player')}\n"

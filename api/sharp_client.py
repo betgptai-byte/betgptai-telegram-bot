@@ -124,6 +124,25 @@ def odds_api_backup_only() -> bool:
 # ── Normalization ──────────────────────────────────────────────────────────
 def _normalize_team(name: str) -> str:
     import re
+    abbreviations = {
+        "ari": "Arizona Diamondbacks", "atl": "Atlanta Braves", "bal": "Baltimore Orioles",
+        "bos": "Boston Red Sox", "chc": "Chicago Cubs", "cws": "Chicago White Sox",
+        "cin": "Cincinnati Reds", "cle": "Cleveland Guardians", "col": "Colorado Rockies",
+        "det": "Detroit Tigers", "hou": "Houston Astros", "kc": "Kansas City Royals",
+        "laa": "Los Angeles Angels", "lad": "Los Angeles Dodgers", "mia": "Miami Marlins",
+        "mil": "Milwaukee Brewers", "min": "Minnesota Twins", "nym": "New York Mets",
+        "nyy": "New York Yankees", "ath": "Athletics", "oak": "Athletics",
+        "phi": "Philadelphia Phillies", "pit": "Pittsburgh Pirates", "sd": "San Diego Padres",
+        "sea": "Seattle Mariners", "sf": "San Francisco Giants", "stl": "St. Louis Cardinals",
+        "tb": "Tampa Bay Rays", "tex": "Texas Rangers", "tor": "Toronto Blue Jays",
+        "wsh": "Washington Nationals",
+    }
+    tokens = re.findall(r"[a-z0-9]+", str(name or "").lower())
+    tokens = [token for token in tokens if token != "the"]
+    if tokens and tokens[0] in abbreviations:
+        name = abbreviations[tokens[0]]
+    else:
+        name = " ".join(tokens)
     normalized = re.sub(r"[^a-z0-9]", "", name.lower())
     TEAM_ALIASES = {
         "arizonadiamondbacks": "diamondbacks", "arizonadbacks": "diamondbacks",
@@ -229,7 +248,7 @@ def parse_sharp_response(data: Any, *, endpoint: str = "/odds") -> dict[str, Any
             # A top-level row `id` is commonly an odds-row id, not a game id.
             # Group flat rows by explicit event/game id plus matchup/time.
             event_id = str(row.get("event_id") or row.get("game_id") or "")
-            key = (event_id, away, home, start)
+            key = (event_id, _normalize_team(away), _normalize_team(home), start)
             event = grouped.setdefault(key, {"id": event_id, "away_team": away, "home_team": home, "commence_time": start, "bookmakers": []})
             book_key = str(row.get("sportsbook") or row.get("bookmaker") or "sharpapi")
             book = next((item for item in event["bookmakers"] if item["key"] == book_key), None)

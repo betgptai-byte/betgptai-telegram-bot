@@ -51,8 +51,8 @@ from time_utils import mlb_local_game_date, mlb_utc_query_window
 
 logger = logging.getLogger(__name__)
 
-GAME_MARKET_BOOK = "draftkings"
-PROP_MARKET_BOOK = "fanduel"
+GAME_MARKET_BOOK = os.getenv("GAME_MARKET_BOOK", "draftkings").strip().lower() or "draftkings"
+PROP_MARKET_BOOK = os.getenv("PROP_BOOK", "fanduel").strip().lower() or "fanduel"
 ADVANCED_GAME_MARKETS = {
     "moneyline", "money_line", "h2h", "ml", "spread", "runline", "run_line",
     "game_spread", "total", "game_total", "total_runs", "over_under", "team_total",
@@ -60,7 +60,7 @@ ADVANCED_GAME_MARKETS = {
 }
 PROP_MARKETS = {
     "player_hits", "player_total_bases", "player_home_runs", "pitcher_strikeouts",
-    "player_strikeouts", "player_rbis", "player_runs",
+    "player_strikeouts", "player_rbis", "player_runs", "player_hits_runs_rbis",
 }
 _GAME_MARKET_GROUPS = {
     "moneyline": {"moneyline", "money_line", "h2h", "ml"},
@@ -737,15 +737,62 @@ def fetch_mlb_game_markets(event_date: str | None = None) -> dict[str, Any]:
 
 def fetch_mlb_props(event_date: str | None = None) -> dict[str, Any]:
     """Fetch only FanDuel player props; never feed these rows to game context."""
-    markets = "player_hits,player_total_bases,player_home_runs,pitcher_strikeouts"
+    markets = (
+        "player_hits,player_total_bases,player_home_runs,player_rbis,player_runs,"
+        "player_hits_runs_rbis,pitcher_strikeouts,player_strikeouts"
+    )
     rows, attempt = _filtered_market_request(sportsbook=PROP_MARKET_BOOK, markets=markets, kind="prop", card_date=event_date)
     counts = {market: sum(1 for row in rows if _market_name(row) == market) for market in PROP_MARKETS}
+    grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    import re
+    for row in rows:
+        market = _market_name(row)
+        raw_selection = str(row.get("selection") or row.get("outcome") or "").strip()
+        player = str(row.get("player_name") or row.get("player") or row.get("participant") or "").strip()
+        if not player:
+            player = re.sub(r"(?i)\b(over|under)\b.*$", "", raw_selection).strip(" -")
+        line_raw = row.get("line") if row.get("line") is not None else row.get("point")
+        try:
+            line = float(line_raw)
+        except (TypeError, ValueError):
+            line_match = re.search(r"(\d+(?:\.\d+)?)", raw_selection)
+            line = float(line_match.group(1)) if line_match else None
+        direction_text = str(row.get("side") or row.get("over_under") or row.get("direction") or raw_selection).lower()
+        direction = "over" if "over" in direction_text else "under" if "under" in direction_text else ""
+        home = str(row.get("home_team") or "")
+        away = str(row.get("away_team") or "")
+        team = str(row.get("team") or row.get("player_team") or row.get("participant_team") or "")
+        opponent = home if team and _normalize_team_name(team) == _normalize_team_name(away) else away if team else ""
+        start = row.get("start_time") or row.get("event_start_time") or row.get("commence_time") or row.get("starts_at")
+        event_id = str(row.get("event_id") or row.get("game_id") or f"{away}@{home}@{start}")
+        key = (event_id, re.sub(r"[^a-z0-9]", "", player.lower()), market, str(line))
+        prop = grouped.setdefault(key, {
+            "provider": "sharpapi", "sportsbook": PROP_MARKET_BOOK,
+            "market_type": market, "player_name": player, "team": team,
+            "opponent": opponent, "game_id": row.get("game_id") or row.get("event_id") or row.get("id") or event_id,
+            "home_team": home, "away_team": away, "selection": "Over",
+            "line": line, "over_odds": None, "under_odds": None,
+            "odds_american": None, "start_time": start, "line_verified": line is not None,
+            "source": "sharpapi_fanduel_props",
+        })
+        price = row.get("odds_american") if row.get("odds_american") is not None else row.get("odds")
+        if direction == "over":
+            prop["over_odds"] = price
+            prop["odds_american"] = price
+        elif direction == "under":
+            prop["under_odds"] = price
+        elif prop["odds_american"] is None:
+            prop["odds_american"] = price
+    grouped_props = list(grouped.values())
     result = {
         "provider": "sharpapi", "sportsbook": PROP_MARKET_BOOK, "rows": rows,
+        "grouped_props": grouped_props,
         "attempts": [attempt], "raw_rows": attempt["rows_returned"],
         "accepted_prop_rows": len(rows), "rejected_game_market_rows": attempt["rejected_game_market_rows"],
         "market_counts": counts, "status": "available" if rows else "unavailable",
         "error": None if rows else "fanduel_props_unavailable",
+        "first_prop_row": rows[0] if rows else None,
+        "first_grouped_prop": grouped_props[0] if grouped_props else None,
     }
     global _LAST_PROP_MARKET_DIAGNOSTIC
     _LAST_PROP_MARKET_DIAGNOSTIC = result

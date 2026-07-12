@@ -824,13 +824,22 @@ def _best_hit_text(card_date: str) -> str:
     official_shape_ok = bool(official_hits) and all(
         item.get("prop_type") == "hits" and item.get("selection") == "Over"
         and item.get("line") == 0.5 and item.get("line_verified")
+        and item.get("odds_verified") and item.get("over_odds") is not None
+        and ((item.get("edge_score") is not None and item.get("edge_score") > 0)
+             or float(item.get("model_score") or item.get("raw_score") or 0) >= 70)
         and isinstance(item.get("lineup_verification"), dict)
         and item["lineup_verification"].get("verified")
-        and item["lineup_verification"].get("state") != "Scratched"
+        and item["lineup_verification"].get("state") == "Confirmed"
+        and isinstance(item.get("player_verification"), dict)
+        and item["player_verification"].get("verified")
+        and item["player_verification"].get("active_roster", True)
         and item.get("status") != "invalidated"
         for item in official_hits if isinstance(item, dict)
     )
-    scratch_passed = isinstance(lab_match, dict) and lab_match.get("status") != "invalidated" and bool(lab_match.get("line_verified"))
+    scratch_passed = (
+        isinstance(lab_match, dict) and lab_match.get("status") != "invalidated"
+        and bool(lab_match.get("line_verified")) and bool(lab_match.get("odds_verified"))
+    )
     if not official_shape_ok or not lineup.get("verified") or lineup.get("state") == "Scratched" or prop.get("status") == "invalidated" or not scratch_passed:
         return "⚾ BEST HIT PROP\n\nBest Hit Prop is pending verified lineup and scratch checks."
     return (

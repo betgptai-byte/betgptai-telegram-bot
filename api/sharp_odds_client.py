@@ -776,11 +776,12 @@ def fetch_mlb_props(event_date: str | None = None) -> dict[str, Any]:
             "home_team": home, "away_team": away, "selection": "Over",
             "line": line, "over_odds": None, "under_odds": None,
             "odds_american": None, "start_time": start, "line_verified": line is not None,
+            "odds_verified": False,
             "source": "sharpapi_fanduel_props",
             "player_id": row.get("player_id") or row.get("mlbam_id"),
             "selection_type": "over", "paired_market": False,
-            "status": "missing_team_context" if not team else "available",
-            "rejection_reason": "missing_team_context" if not team else None,
+            "status": "missing_player_team_context" if not team else "available",
+            "rejection_reason": "missing_player_team_context" if not team else None,
         })
         price = row.get("odds_american") if row.get("odds_american") is not None else row.get("odds")
         if direction == "over":
@@ -792,6 +793,7 @@ def fetch_mlb_props(event_date: str | None = None) -> dict[str, Any]:
             prop["odds_american"] = price
     for prop in grouped.values():
         prop["paired_market"] = prop.get("over_odds") is not None and prop.get("under_odds") is not None
+        prop["odds_verified"] = prop.get("over_odds") is not None or prop.get("under_odds") is not None
         if prop.get("over_odds") is None and prop.get("under_odds") is not None:
             prop["odds_american"] = prop.get("under_odds")
             prop["selection_type"] = "under"
@@ -807,7 +809,11 @@ def fetch_mlb_props(event_date: str | None = None) -> dict[str, Any]:
         "first_grouped_prop": grouped_props[0] if grouped_props else None,
         "paired_markets": sum(1 for prop in grouped_props if prop.get("paired_market")),
         "single_side_markets": sum(1 for prop in grouped_props if not prop.get("paired_market")),
-        "missing_team_props": sum(1 for prop in grouped_props if not prop.get("team")),
+        "missing_player_team_context": sum(1 for prop in grouped_props if not prop.get("team")),
+        "missing_event_teams": sum(
+            1 for prop in grouped_props
+            if not prop.get("home_team") or not prop.get("away_team")
+        ),
     }
     global _LAST_PROP_MARKET_DIAGNOSTIC
     _LAST_PROP_MARKET_DIAGNOSTIC = result

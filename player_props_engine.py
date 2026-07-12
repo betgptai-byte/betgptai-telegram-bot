@@ -750,11 +750,6 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
             all_props.extend(hitter_props + pitcher_props)
             rejected.extend(hitter_rejected + pitcher_rejected)
 
-    top_candidates_before_filter = sorted(
-        all_props,
-        key=lambda item: item.get("raw_score", 0),
-        reverse=True,
-    )[:25]
     raw_candidate_count = len(all_props)
     verified_props: list[dict[str, Any]] = []
     for prop in all_props:
@@ -767,6 +762,13 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
                 f"{reason}"
             )
     all_props = verified_props
+    # This diagnostic must never promote stale/minor-league candidates that
+    # failed active-roster and current-slate verification.
+    top_candidates_before_filter = sorted(
+        all_props,
+        key=lambda item: item.get("raw_score", 0),
+        reverse=True,
+    )[:25]
     market_map = {
         "hits": {"player_hits"}, "2_plus_hits": {"player_hits"},
         "total_bases": {"player_total_bases"}, "home_runs": {"player_home_runs"},
@@ -843,11 +845,21 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
                 "line": match.get("line"), "odds": match.get("over_odds"),
                 "over_odds": match.get("over_odds"), "under_odds": match.get("under_odds"),
                 "selection": "Over", "line_verified": bool(match.get("line_verified")),
+                "odds_verified": bool(match.get("odds_verified") or match.get("over_odds") is not None),
                 "sportsbook": "fanduel", "provider": "sharpapi",
                 "source": "sharpapi_fanduel_props", "fanduel_market_verified": True,
             })
             projected, implied, edge, value_note = _ev_fields(float(prop.get("raw_score") or 50), prop.get("odds"))
-            prop.update({"projected_probability": projected, "implied_probability": implied, "edge": edge, "value_note": value_note})
+            edge_text = f"{edge:.4f}" if edge is not None else "unavailable"
+            verified_note = f"FanDuel line verified. Model score: {float(prop.get('raw_score') or 0):.1f}. Edge: {edge_text}."
+            if edge is not None and edge <= 0:
+                verified_note += " Negative EV at current price — admin watch only."
+            prop.update({
+                "projected_probability": projected, "implied_probability": implied,
+                "edge": edge, "edge_score": edge, "model_score": float(prop.get("raw_score") or 0),
+                "value_note": verified_note,
+                "reason": f"{str(prop.get('reason') or '').replace('Model lean — odds not verified.', '').strip()} {verified_note}".strip(),
+            })
             matched_players.add(pname)
         else:
             prop["fanduel_market_verified"] = False
@@ -875,6 +887,27 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
         prop_type: [prop for prop in all_props if prop.get("prop_type") == prop_type]
         for prop_type in SUPPORTED_PROP_TYPES
     }
+    def official_hit_ready(prop: dict[str, Any]) -> bool:
+        lineup = _dict(prop.get("lineup_verification"))
+        player = _dict(prop.get("player_verification"))
+        edge = _num(prop.get("edge_score") if prop.get("edge_score") is not None else prop.get("edge"))
+        score = _num(prop.get("model_score") if prop.get("model_score") is not None else prop.get("raw_score")) or 0
+        return bool(
+            prop.get("prop_type") == "hits"
+            and _num(prop.get("line")) == 0.5
+            and prop.get("selection") == "Over"
+            and prop.get("over_odds") is not None
+            and prop.get("line_verified") and prop.get("odds_verified")
+            and lineup.get("verified") and lineup.get("state") == "Confirmed"
+            and player.get("verified") and player.get("active_roster", True)
+            and prop.get("status") != "invalidated"
+            and ((edge is not None and edge > 0) or score >= 70)
+        )
+    official_hit_props = [prop for prop in grouped["hits"] if official_hit_ready(prop)]
+    admin_hit_watch = [
+        prop for prop in grouped["hits"]
+        if prop.get("fanduel_market_verified") and prop not in official_hit_props
+    ]
     teams_playing: list[str] = []
     for game in slate:
         for team in (game.get("away_team"), game.get("home_team")):
@@ -914,7 +947,8 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
         "teams_playing": teams_playing,
         "all_props": all_props,
         "candidates": grouped,
-        "official_hit_props": [prop for prop in grouped["hits"] if prop.get("fanduel_market_verified") and _num(prop.get("line")) == 0.5],
+        "official_hit_props": official_hit_props,
+        "admin_hit_watch": admin_hit_watch,
         "total_bases_watch": [prop for prop in grouped["total_bases"] if prop.get("fanduel_market_verified")],
         "hr_watch_candidates": [prop for prop in grouped["home_runs"] if prop.get("fanduel_market_verified")],
         "rbi_runs_watch": [prop for prop in all_props if prop.get("prop_type") in {"rbis", "runs"} and prop.get("fanduel_market_verified")],
@@ -960,7 +994,8 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
                 "matched_players": len(matched_players),
                 "lineup_confirmed_count": sum(1 for prop in all_props if _dict(prop.get("lineup_verification")).get("state") == "Confirmed"),
                 "scratched_rejected_count": int(reason_counts.get("scratched") or 0),
-                "official_hit_prop_candidates": len([prop for prop in all_props if prop.get("prop_type") == "hits" and prop.get("fanduel_market_verified")]),
+                "official_hit_prop_candidates": len(official_hit_props),
+                "admin_hit_watch_candidates": len(admin_hit_watch),
                 "hr_watch_candidates": len([prop for prop in all_props if prop.get("prop_type") == "home_runs" and prop.get("fanduel_market_verified")]),
                 "k_prop_candidates": len([prop for prop in all_props if prop.get("prop_type") == "strikeouts" and prop.get("fanduel_market_verified")]),
                 "rejections": market_rejections[:50],
@@ -1341,8 +1376,9 @@ def render_hitprops_debug(payload: dict[str, Any]) -> str:
     ])
     if int(debug.get("final_props_created") or final_count or 0) <= 0:
         lines.extend(["", "No qualified props available."])
-    hit_candidates = candidates.get("hits", []) if isinstance(candidates, dict) else []
-    lines.extend(["", "Top Over 0.5 Hit Candidates:"])
+    hit_candidates = payload.get("official_hit_props", []) if isinstance(payload, dict) else []
+    admin_watch = payload.get("admin_hit_watch", []) if isinstance(payload, dict) else []
+    lines.extend(["", "Official Hit Props:"])
     for idx, prop in enumerate(hit_candidates[:10], start=1):
         lineup = _dict(prop.get("lineup_verification"))
         lines.extend([
@@ -1356,6 +1392,15 @@ def render_hitprops_debug(payload: dict[str, Any]) -> str:
         ])
     if not hit_candidates:
         lines.append("No official Over 0.5 hit props available from FanDuel right now.")
+    lines.extend(["", "Admin Watch:"])
+    for idx, prop in enumerate(admin_watch[:10], start=1):
+        lines.append(
+            f"{idx}. {prop.get('player_name')} — {prop.get('team_name')} vs {prop.get('opponent_name')} — "
+            f"Over {prop.get('line')} Hits — {prop.get('odds')} — edge {prop.get('edge')} — "
+            f"{prop.get('value_note') or 'Below public qualification threshold.'}"
+        )
+    if not admin_watch:
+        lines.append("- None")
     fanduel = debug.get("fanduel_props") if isinstance(debug.get("fanduel_props"), dict) else {}
     counts = fanduel.get("rejection_counts") if isinstance(fanduel.get("rejection_counts"), dict) else {}
     lines.extend([
@@ -1397,6 +1442,7 @@ def render_fanduel_props_debug(payload: dict[str, Any]) -> str:
                 f"{lineup.get('state') or lineup.get('status')} — edge {prop.get('edge')}"
             )
     add_section("Official Hit Props:", payload.get("official_hit_props") or [], "Over {line} Hits")
+    add_section("Admin Hit Watch:", payload.get("admin_hit_watch") or [], "Over {line} Hits — Admin Watch Only")
     add_section("Total Bases Watch:", payload.get("total_bases_watch") or [], "Over {line} TB")
     add_section("HR Watch:", payload.get("hr_watch_candidates") or [], "HR")
     add_section("RBI/Runs Watch:", payload.get("rbi_runs_watch") or [], "Over {line}")

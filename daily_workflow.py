@@ -820,8 +820,18 @@ def _best_hit_text(card_date: str) -> str:
         (cached_id and str(item.get("prop_id") or "") == cached_id)
         or (cached_player and str(item.get("player_name") or "").strip().lower() == cached_player and item.get("prop_type") == "hits")
     )), None)
+    official_hits = day.get("official_hit_props") if isinstance(day.get("official_hit_props"), list) else []
+    official_shape_ok = bool(official_hits) and all(
+        item.get("prop_type") == "hits" and item.get("selection") == "Over"
+        and item.get("line") == 0.5 and item.get("line_verified")
+        and isinstance(item.get("lineup_verification"), dict)
+        and item["lineup_verification"].get("verified")
+        and item["lineup_verification"].get("state") != "Scratched"
+        and item.get("status") != "invalidated"
+        for item in official_hits if isinstance(item, dict)
+    )
     scratch_passed = isinstance(lab_match, dict) and lab_match.get("status") != "invalidated" and bool(lab_match.get("line_verified"))
-    if not lineup.get("verified") or lineup.get("state") == "Scratched" or prop.get("status") == "invalidated" or not scratch_passed:
+    if not official_shape_ok or not lineup.get("verified") or lineup.get("state") == "Scratched" or prop.get("status") == "invalidated" or not scratch_passed:
         return "⚾ BEST HIT PROP\n\nBest Hit Prop is pending verified lineup and scratch checks."
     return (
         "⚾ BEST HIT PROP\n\n"

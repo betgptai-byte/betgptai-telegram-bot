@@ -743,7 +743,7 @@ def fetch_mlb_props(event_date: str | None = None) -> dict[str, Any]:
     )
     rows, attempt = _filtered_market_request(sportsbook=PROP_MARKET_BOOK, markets=markets, kind="prop", card_date=event_date)
     counts = {market: sum(1 for row in rows if _market_name(row) == market) for market in PROP_MARKETS}
-    grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    grouped: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
     import re
     for row in rows:
         market = _market_name(row)
@@ -757,15 +757,18 @@ def fetch_mlb_props(event_date: str | None = None) -> dict[str, Any]:
         except (TypeError, ValueError):
             line_match = re.search(r"(\d+(?:\.\d+)?)", raw_selection)
             line = float(line_match.group(1)) if line_match else None
-        direction_text = str(row.get("side") or row.get("over_under") or row.get("direction") or raw_selection).lower()
+        direction_text = str(row.get("selection_type") or row.get("side") or row.get("over_under") or row.get("direction") or raw_selection).lower()
         direction = "over" if "over" in direction_text else "under" if "under" in direction_text else ""
-        home = str(row.get("home_team") or "")
-        away = str(row.get("away_team") or "")
-        team = str(row.get("team") or row.get("player_team") or row.get("participant_team") or "")
+        home_obj = row.get("home") if isinstance(row.get("home"), dict) else {}
+        away_obj = row.get("away") if isinstance(row.get("away"), dict) else {}
+        home = str(row.get("home_team") or home_obj.get("name") or "")
+        away = str(row.get("away_team") or away_obj.get("name") or "")
+        team_value = row.get("team") or row.get("player_team") or row.get("participant_team") or ""
+        team = str(team_value.get("name") if isinstance(team_value, dict) else team_value)
         opponent = home if team and _normalize_team_name(team) == _normalize_team_name(away) else away if team else ""
         start = row.get("start_time") or row.get("event_start_time") or row.get("commence_time") or row.get("starts_at")
         event_id = str(row.get("event_id") or row.get("game_id") or f"{away}@{home}@{start}")
-        key = (event_id, re.sub(r"[^a-z0-9]", "", player.lower()), market, str(line))
+        key = (event_id, re.sub(r"[^a-z0-9]", "", player.lower()), market, str(line), PROP_MARKET_BOOK)
         prop = grouped.setdefault(key, {
             "provider": "sharpapi", "sportsbook": PROP_MARKET_BOOK,
             "market_type": market, "player_name": player, "team": team,
@@ -774,6 +777,10 @@ def fetch_mlb_props(event_date: str | None = None) -> dict[str, Any]:
             "line": line, "over_odds": None, "under_odds": None,
             "odds_american": None, "start_time": start, "line_verified": line is not None,
             "source": "sharpapi_fanduel_props",
+            "player_id": row.get("player_id") or row.get("mlbam_id"),
+            "selection_type": "over", "paired_market": False,
+            "status": "missing_team_context" if not team else "available",
+            "rejection_reason": "missing_team_context" if not team else None,
         })
         price = row.get("odds_american") if row.get("odds_american") is not None else row.get("odds")
         if direction == "over":
@@ -783,6 +790,11 @@ def fetch_mlb_props(event_date: str | None = None) -> dict[str, Any]:
             prop["under_odds"] = price
         elif prop["odds_american"] is None:
             prop["odds_american"] = price
+    for prop in grouped.values():
+        prop["paired_market"] = prop.get("over_odds") is not None and prop.get("under_odds") is not None
+        if prop.get("over_odds") is None and prop.get("under_odds") is not None:
+            prop["odds_american"] = prop.get("under_odds")
+            prop["selection_type"] = "under"
     grouped_props = list(grouped.values())
     result = {
         "provider": "sharpapi", "sportsbook": PROP_MARKET_BOOK, "rows": rows,
@@ -793,6 +805,9 @@ def fetch_mlb_props(event_date: str | None = None) -> dict[str, Any]:
         "error": None if rows else "fanduel_props_unavailable",
         "first_prop_row": rows[0] if rows else None,
         "first_grouped_prop": grouped_props[0] if grouped_props else None,
+        "paired_markets": sum(1 for prop in grouped_props if prop.get("paired_market")),
+        "single_side_markets": sum(1 for prop in grouped_props if not prop.get("paired_market")),
+        "missing_team_props": sum(1 for prop in grouped_props if not prop.get("team")),
     }
     global _LAST_PROP_MARKET_DIAGNOSTIC
     _LAST_PROP_MARKET_DIAGNOSTIC = result

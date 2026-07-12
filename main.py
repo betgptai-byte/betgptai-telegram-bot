@@ -4232,18 +4232,32 @@ async def sharp_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if mode == "props":
             result = await asyncio.to_thread(fetch_mlb_props, official_sports_date().isoformat())
             counts = result.get("market_counts") or {}
+            first = result.get("first_grouped_prop") if isinstance(result.get("first_grouped_prop"), dict) else {}
             lines = [
                 "🔍 SHARP API PROBE — MLB PROPS",
-                f"Sharp API Enabled: {'YES' if sharp_api_enabled() else 'NO'}",
-                f"Base URL: {_base_url()}", "Auth Method: X-API-Key",
-                f"Sportsbook used: {result.get('sportsbook', 'fanduel')}",
-                f"Hit prop rows: {counts.get('player_hits', 0)}",
-                f"Total bases rows: {counts.get('player_total_bases', 0)}",
-                f"HR prop rows: {counts.get('player_home_runs', 0)}",
-                f"Pitcher K rows: {int(counts.get('pitcher_strikeouts', 0)) + int(counts.get('player_strikeouts', 0))}",
+                f"Sportsbook: {str(result.get('sportsbook', 'fanduel')).title()}",
+                "Rows:",
+                f"- Hits: {counts.get('player_hits', 0)}",
+                f"- Total Bases: {counts.get('player_total_bases', 0)}",
+                f"- HR: {counts.get('player_home_runs', 0)}",
+                f"- RBI: {counts.get('player_rbis', 0)}",
+                f"- Runs: {counts.get('player_runs', 0)}",
+                f"- Pitcher Ks: {int(counts.get('pitcher_strikeouts', 0)) + int(counts.get('player_strikeouts', 0))}",
+                "", "Grouped:",
+                f"- Total grouped props: {len(result.get('grouped_props') or [])}",
+                f"- Paired Over/Under: {result.get('paired_markets', 0)}",
+                f"- Single-side only: {result.get('single_side_markets', 0)}",
+                f"- Missing team: {result.get('missing_team_props', 0)}",
                 f"Rejected game-market rows: {result.get('rejected_game_market_rows', 0)}",
-                f"First prop row: {result.get('first_prop_row') or 'None'}",
-                f"First grouped prop: {result.get('first_grouped_prop') or 'None'}",
+                "", "First grouped prop:",
+                f"Player: {first.get('player_name') or 'None'}",
+                f"Market: {first.get('market_type') or 'None'}",
+                f"Line: {first.get('line')}",
+                f"Over odds: {first.get('over_odds')}",
+                f"Under odds: {first.get('under_odds')}",
+                f"Teams: {first.get('away_team')} @ {first.get('home_team')} | player team={first.get('team') or 'unknown'}",
+                f"Start: {first.get('start_time') or 'None'}",
+                f"Status: {first.get('status') or 'available'}",
                 f"Error: {result.get('error') or 'None'}",
             ]
             await update.message.reply_text("\n".join(lines))

@@ -27,6 +27,7 @@ from thesportsdb_data import (
 )
 from weather_data import merge_weather_data
 from game_time import game_sort_key
+from time_utils import mlb_local_game_date, mlb_utc_query_window
 
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
@@ -330,16 +331,21 @@ def _closest_odds_game(game: dict[str, Any], candidates: list[dict[str, Any]]) -
     return match
 
 
-def combine_schedule_and_odds(schedule: list[dict[str, Any]], odds: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def combine_schedule_and_odds(schedule: list[dict[str, Any]], odds: list[dict[str, Any]], card_date: str | None = None) -> list[dict[str, Any]]:
     """Match odds events to MLB games by normalized team names and start time."""
     from api.sharp_odds_client import build_game_market_context
+    from time_utils import mlb_local_game_date
 
     by_game: dict[frozenset[str], list[dict[str, Any]]] = {}
     for odds_game in odds:
+        if card_date and mlb_local_game_date(odds_game.get("commence_time")) != card_date:
+            continue
         by_game.setdefault(_game_key(odds_game.get("away_team", ""), odds_game.get("home_team", "")), []).append(odds_game)
     provider = _detect_odds_provider(odds)
     combined = []
     for game in schedule:
+        if card_date and mlb_local_game_date(game.get("game_time")) != card_date:
+            continue
         odds_game = _closest_odds_game(game, by_game.get(_game_key(game["away_team"], game["home_team"]), []))
         bookmakers = _clean_bookmakers(odds_game) if odds_game else []
         best_prices = _best_available_prices(bookmakers)
@@ -414,8 +420,7 @@ def _build_sharp_url(sport_param: str, league: str | None, event_date: str | Non
     if sportsbook:
         params["sportsbook"] = sportsbook
     if event_date:
-        params["commenceTimeFrom"] = f"{event_date}T00:00:00Z"
-        params["commenceTimeTo"] = f"{event_date}T23:59:59Z"
+        params["commenceTimeFrom"], params["commenceTimeTo"] = mlb_utc_query_window(event_date)
     import urllib.parse
     return f"{base}{ep}?{urllib.parse.urlencode(params)}"
 
@@ -497,6 +502,10 @@ def odds_debug_payload(
         "team_total_contexts": 0,
         "game_market_sportsbook": "draftkings",
         "prop_sportsbook": "fanduel",
+        "requested_card_date_et": event_date or selected_date,
+        "utc_query_window": list(mlb_utc_query_window(event_date or selected_date)) if sport_lower == "mlb" else None,
+        "sharp_local_date_rows": 0,
+        "mlb_local_date_games": 0,
     }
 
     schedule: list[dict[str, Any]] = []
@@ -505,6 +514,9 @@ def odds_debug_payload(
         try:
             schedule = get_mlb_schedule(selected_date)
             payload["mlb_schedule_games"] = len(schedule)
+            local_schedule = [game for game in schedule if mlb_local_game_date(game.get("game_time")) == selected_date]
+            payload["mlb_local_date_games"] = len(local_schedule)
+            schedule = local_schedule
         except Exception as error:
             payload["errors"].append(f"MLB schedule unavailable: {error}")
 
@@ -563,8 +575,8 @@ def odds_debug_payload(
         kwargs: dict[str, Any] = {"sport": sport_lower}
         if league:
             kwargs["league"] = league
-        if event_date:
-            kwargs["event_date"] = event_date
+        if event_date or sport_lower == "mlb":
+            kwargs["event_date"] = event_date or selected_date
         odds = fetch_odds(**kwargs)
         payload["provider"] = _detect_odds_provider(odds)
         payload["odds_api_status_code"] = 200
@@ -598,6 +610,8 @@ def odds_debug_payload(
         payload["sharp_raw_rows"] = int(diagnostic.get("raw_rows") or 0)
         payload["accepted_game_market_rows"] = int(diagnostic.get("accepted_game_market_rows") or 0)
         payload["rejected_prop_rows"] = int(diagnostic.get("rejected_prop_rows") or 0)
+        payload["sharp_local_date_rows"] = int(diagnostic.get("sharp_local_date_rows") or 0)
+        payload["utc_query_window"] = diagnostic.get("utc_query_window") or payload["utc_query_window"]
         payload["accepted_prop_rows"] = int(prop_diagnostic.get("accepted_prop_rows") or 0)
         counts = diagnostic.get("market_counts") or {}
         payload["moneyline_contexts"] = int(counts.get("moneyline") or 0)
@@ -628,13 +642,17 @@ def odds_debug_payload(
     if schedule:
         odds_keys: dict[frozenset[str], list[dict[str, Any]]] = {}
         for odds_game in odds:
+            if mlb_local_game_date(odds_game.get("commence_time")) != selected_date:
+                continue
             odds_keys.setdefault(_game_key(odds_game.get("away_team", ""), odds_game.get("home_team", "")), []).append(odds_game)
         matched_keys = set()
+        matched_odds_ids: set[int] = set()
         for game in schedule:
             key = _game_key(game.get("away_team", ""), game.get("home_team", ""))
-            match = _closest_odds_game(game, list(odds_keys.get(key, [])))
+            match = _closest_odds_game(game, odds_keys.get(key, []))
             if match:
                 matched_keys.add(key)
+                matched_odds_ids.add(id(match))
                 payload["matched_to_mlb_game_pk"] += 1
                 if payload["first_matched_game"] is None:
                     payload["first_matched_game"] = f"{game.get('away_team')} @ {game.get('home_team')}"
@@ -646,8 +664,9 @@ def odds_debug_payload(
                     "normalized_key": sorted(key),
                 })
         for key, odds_games in odds_keys.items():
-            if key not in matched_keys:
-                odds_game = odds_games[0]
+            for odds_game in odds_games:
+                if id(odds_game) in matched_odds_ids:
+                    continue
                 payload["unmatched_odds_games"].append({
                     "id": odds_game.get("id"),
                     "away_team": odds_game.get("away_team"),
@@ -795,10 +814,10 @@ def get_combined_slate(
 
     try:
         from services.odds_provider_router import fetch_odds, enrich_slate_market_context
-        odds = fetch_odds()
+        odds = fetch_odds(event_date=selected_date)
         if odds:
             provider = _detect_odds_provider(odds)
-            slate = combine_schedule_and_odds(slate, odds)
+            slate = combine_schedule_and_odds(slate, odds, selected_date)
             slate = enrich_slate_market_context(slate, odds, provider)
         else:
             raise MLBDataError("Odds provider router returned empty")

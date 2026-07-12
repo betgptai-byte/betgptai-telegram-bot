@@ -47,6 +47,7 @@ from api.sharp_client import (
     sharp_api_key,
 )
 from core.market import MarketContext
+from time_utils import mlb_local_game_date, mlb_utc_query_window
 
 logger = logging.getLogger(__name__)
 
@@ -310,8 +311,7 @@ def build_sharp_odds_url(
         if sportsbook:
             params["sportsbook"] = sportsbook
     if event_date:
-        params["commenceTimeFrom"] = f"{event_date}T00:00:00Z"
-        params["commenceTimeTo"] = f"{event_date}T23:59:59Z"
+        params["commenceTimeFrom"], params["commenceTimeTo"] = mlb_utc_query_window(event_date)
     import urllib.parse
     return f"{base}{ep}?{urllib.parse.urlencode(params)}"
 
@@ -379,8 +379,7 @@ def _sharpen_request(
         if sportsbook:
             params["sportsbook"] = sportsbook
     if event_date:
-        params["commenceTimeFrom"] = f"{event_date}T00:00:00Z"
-        params["commenceTimeTo"] = f"{event_date}T23:59:59Z"
+        params["commenceTimeFrom"], params["commenceTimeTo"] = mlb_utc_query_window(event_date)
 
     headers = {"X-API-Key": api_key}
     resp = _do_sharp_request(url, params, headers)
@@ -551,8 +550,7 @@ def _sharpen_request_for_probe(
         if sportsbook:
             params["sportsbook"] = sportsbook
     if event_date:
-        params["commenceTimeFrom"] = f"{event_date}T00:00:00Z"
-        params["commenceTimeTo"] = f"{event_date}T23:59:59Z"
+        params["commenceTimeFrom"], params["commenceTimeTo"] = mlb_utc_query_window(event_date)
 
     headers = {"X-API-Key": api_key}
     resp = _do_sharp_request(url, params, headers)
@@ -607,7 +605,7 @@ def _market_group(market: str) -> str | None:
     return next((group for group, aliases in _GAME_MARKET_GROUPS.items() if market in aliases), None)
 
 
-def _filtered_market_request(*, sportsbook: str, markets: str, kind: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _filtered_market_request(*, sportsbook: str, markets: str, kind: str, card_date: str | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     api_key = sharp_api_key()
     if not api_key:
         raise SharpAPIError("SHARP_API_KEY is missing from .env.")
@@ -617,6 +615,10 @@ def _filtered_market_request(*, sportsbook: str, markets: str, kind: str) -> tup
         "sport": "baseball", "league": "mlb", "sportsbook": sportsbook,
         "market": markets, "limit": "200",
     }
+    utc_window: tuple[str, str] | None = None
+    if card_date:
+        utc_window = mlb_utc_query_window(card_date)
+        params["commenceTimeFrom"], params["commenceTimeTo"] = utc_window
     response = _do_sharp_request(url, params, {"X-API-Key": api_key})
     attempt = {
         "endpoint": endpoint, "http_status": response.status_code,
@@ -625,6 +627,8 @@ def _filtered_market_request(*, sportsbook: str, markets: str, kind: str) -> tup
         "rejected_prop_rows": 0, "rejected_game_market_rows": 0,
         "rejected_missing_team_fields": 0, "top_level_keys": [], "error": None,
         "first_rejected_prop_market": None,
+        "utc_query_window": list(utc_window) if utc_window else None,
+        "local_date_rows": 0, "rejected_wrong_local_date": 0,
     }
     if response.status_code == 401:
         attempt["error"] = "auth_failed"
@@ -646,6 +650,12 @@ def _filtered_market_request(*, sportsbook: str, markets: str, kind: str) -> tup
     accepted: list[dict[str, Any]] = []
     for row in rows:
         market = _market_name(row)
+        start_time = row.get("start_time") or row.get("event_start_time") or row.get("commence_time") or row.get("starts_at") or row.get("scheduled_at")
+        if card_date:
+            if mlb_local_game_date(start_time) != card_date:
+                attempt["rejected_wrong_local_date"] += 1
+                continue
+            attempt["local_date_rows"] += 1
         has_teams = bool(row.get("home_team") and row.get("away_team"))
         if kind == "game":
             if market in PROP_MARKETS or market.startswith("player_") or market.startswith("pitcher_"):
@@ -674,7 +684,6 @@ def _filtered_market_request(*, sportsbook: str, markets: str, kind: str) -> tup
 
 def fetch_mlb_game_markets(event_date: str | None = None) -> dict[str, Any]:
     """Fetch only DraftKings MLB game markets for advanced card enrichment."""
-    del event_date  # Sharp current-odds endpoint is already scoped to live/upcoming rows.
     attempts: list[dict[str, Any]] = []
     accepted: list[dict[str, Any]] = []
     request_sets = [
@@ -687,7 +696,7 @@ def fetch_mlb_game_markets(event_date: str | None = None) -> dict[str, Any]:
     ]
     seen_rows: set[str] = set()
     for markets in request_sets:
-        rows, attempt = _filtered_market_request(sportsbook=GAME_MARKET_BOOK, markets=markets, kind="game")
+        rows, attempt = _filtered_market_request(sportsbook=GAME_MARKET_BOOK, markets=markets, kind="game", card_date=event_date)
         attempts.append(attempt)
         for row in rows:
             signature = json.dumps(row, sort_keys=True, default=str)
@@ -708,6 +717,7 @@ def fetch_mlb_game_markets(event_date: str | None = None) -> dict[str, Any]:
         "odds": parsed.get("odds") or [], "attempts": attempts,
         "raw_rows": sum(int(attempt.get("rows_returned") or 0) for attempt in attempts),
         "accepted_game_market_rows": len(accepted), "rejected_prop_rows": rejected_props,
+        "sharp_local_date_rows": sum(int(attempt.get("local_date_rows") or 0) for attempt in attempts),
         "rejected_missing_team_fields": missing_teams, "market_counts": counts,
         "events_returned": int(parsed.get("events_returned") or 0),
         "first_accepted_matchup": f"{first.get('away_team')} @ {first.get('home_team')}" if first else None,
@@ -715,6 +725,8 @@ def fetch_mlb_game_markets(event_date: str | None = None) -> dict[str, Any]:
         "first_rejected_prop_market": next((market for attempt in attempts for market in [attempt.get("first_rejected_prop_market")] if market), None),
         "status": "available" if accepted else "unavailable",
         "error": None if accepted else "draftkings_game_markets_unavailable",
+        "requested_card_date_et": event_date,
+        "utc_query_window": list(mlb_utc_query_window(event_date)) if event_date else None,
     }
     global _LAST_GAME_MARKET_DIAGNOSTIC
     _LAST_GAME_MARKET_DIAGNOSTIC = result
@@ -725,9 +737,8 @@ def fetch_mlb_game_markets(event_date: str | None = None) -> dict[str, Any]:
 
 def fetch_mlb_props(event_date: str | None = None) -> dict[str, Any]:
     """Fetch only FanDuel player props; never feed these rows to game context."""
-    del event_date
     markets = "player_hits,player_total_bases,player_home_runs,pitcher_strikeouts"
-    rows, attempt = _filtered_market_request(sportsbook=PROP_MARKET_BOOK, markets=markets, kind="prop")
+    rows, attempt = _filtered_market_request(sportsbook=PROP_MARKET_BOOK, markets=markets, kind="prop", card_date=event_date)
     counts = {market: sum(1 for row in rows if _market_name(row) == market) for market in PROP_MARKETS}
     result = {
         "provider": "sharpapi", "sportsbook": PROP_MARKET_BOOK, "rows": rows,

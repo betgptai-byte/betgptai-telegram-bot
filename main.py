@@ -206,7 +206,7 @@ from daily_workflow import (
     get_first_mlb_pitch,
     workflow_status,
 )
-from time_utils import now_et, to_et
+from time_utils import mlb_local_game_date, now_et, to_et
 from quality_gate import render_prepost_quality_gate, run_prepost_quality_gate
 from bot.callbacks.router import register_callback_router
 
@@ -3912,6 +3912,8 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
     lines = [
         "🧪 BETGPTAI ODDS DEBUG",
         f"📅 Requested Date: {event_date}",
+        f"Requested Card Date ET: {payload.get('requested_card_date_et', event_date)}",
+        f"UTC Query Window: {payload.get('utc_query_window') or 'N/A'}",
         f"🏅 Sport: {sport_label}",
         "",
         "── Sharp API ──",
@@ -3938,6 +3940,9 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
         f"Active provider: {payload.get('provider') or 'None'}",
         f"Provider: {payload.get('provider') or 'None'}",
         f"Sharp raw rows: {payload.get('sharp_raw_rows', 0)}",
+        f"Sharp rows returned: {payload.get('sharp_raw_rows', 0)}",
+        f"Sharp local-date rows: {payload.get('sharp_local_date_rows', 0)}",
+        f"MLB local-date games: {payload.get('mlb_local_date_games', 0)}",
         f"Accepted game-market rows: {payload.get('accepted_game_market_rows', 0)}",
         f"Rejected prop rows: {payload.get('rejected_prop_rows', 0)}",
         f"Accepted prop rows: {payload.get('accepted_prop_rows', 0)}",
@@ -4506,9 +4511,9 @@ async def confidence_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text(f"/confidence_debug failed: {error!r}")
 
 
-async def _build_card_debug_text() -> str:
+async def _build_card_debug_text(selected_date: str | None = None, *, include_started: bool = False) -> str:
     """Build owner-only card diagnostics shared by slash command and callback."""
-    selected_date = official_sports_date().isoformat()
+    selected_date = selected_date or official_sports_date().isoformat()
     sections: list[str] = []
     save_result: dict[str, Any] = {}
     skip_reason = ""
@@ -4519,27 +4524,35 @@ async def _build_card_debug_text() -> str:
     odds_events_returned = 0
     odds_provider_used = "none"
     matched_odds_games = 0
-    slate = await asyncio.to_thread(
+    full_slate = await asyncio.to_thread(
         get_combined_slate,
         os.getenv("ODDS_API_KEY", ""),
         game_date=selected_date,
         highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
     )
-    slate = upcoming_mlb_slate(slate)
+    full_slate = [game for game in full_slate if mlb_local_game_date(game.get("game_time")) == selected_date]
+    slate = full_slate if include_started else upcoming_mlb_slate(full_slate)
+    if not slate:
+        return (
+            f"🧪 BETGPTAI CARD DEBUG\n📅 Date: {display_date(selected_date)}\n\n"
+            "No upcoming games remain for this card date. Use --include-started or test tomorrow."
+        )
     if slate:
         odds_events_returned = sum(1 for g in slate if g.get("odds_status") == "available")
         matched_odds_games = odds_events_returned
         first_ctx = slate[0].get("market_context", {})
         odds_provider_used = first_ctx.get("provider", "none") if first_ctx else "none"
     market_context_found = any(bool(game.get("best_available_prices")) for game in slate)
-    if not slate:
-        raise RuntimeError("No upcoming MLB games available for card debug.")
     try:
-        analysis = await analyze_mlb_slate(
-            slate,
-            os.getenv("OPENAI_API_KEY", ""),
-            os.getenv("ANTHROPIC_API_KEY", ""),
-        )
+        if include_started:
+            analysis = build_fallback_card(slate)
+            skip_reason = "Historical/include-started debug uses deterministic fallback display sections."
+        else:
+            analysis = await analyze_mlb_slate(
+                slate,
+                os.getenv("OPENAI_API_KEY", ""),
+                os.getenv("ANTHROPIC_API_KEY", ""),
+            )
     except Exception as error:
         skip_reason = f"AI unavailable; fallback card used: {error}"
         analysis = build_fallback_card(slate)
@@ -4705,15 +4718,27 @@ async def _build_card_debug_text() -> str:
 
 async def card_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner-only: build a card, attempt persistence, and explain skipped picks."""
-    del context
     user_id = update.effective_user.id if update.effective_user else None
     if user_id != OWNER_TELEGRAM_ID:
         return
     if not update.message:
         return
+    args = context.args or []
+    include_started = "--include-started" in args
+    selected_date = official_sports_date().isoformat()
+    for idx, arg in enumerate(args):
+        if arg == "--date" and idx + 1 < len(args):
+            selected_date = args[idx + 1]
+        elif arg.startswith("--date="):
+            selected_date = arg.split("=", 1)[1]
+    try:
+        datetime.strptime(selected_date, "%Y-%m-%d")
+    except ValueError:
+        await update.message.reply_text("Invalid --date. Use YYYY-MM-DD.")
+        return
     try:
         await update.message.reply_text("⏳ Building card debug snapshot...")
-        await _send_long_message(update, await _build_card_debug_text())
+        await _send_long_message(update, await _build_card_debug_text(selected_date, include_started=include_started))
     except Exception as error:
         logging.exception("/card_debug failed")
         await update.message.reply_text(f"/card_debug failed:\n{error!r}")

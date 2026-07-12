@@ -467,6 +467,7 @@ def odds_debug_payload(
     event_date: str | None = None,
     include_started: bool = False,
     parsed_flags: list[str] | None = None,
+    max_pages: int = 5,
 ) -> dict[str, Any]:
     """Owner-only diagnostics for odds providers by sport."""
     from api.sharp_odds_client import ALL_SPORTSBOOKS, MLB_MAPPINGS, SHARP_ENDPOINT_BEST_ODDS, SHARP_ENDPOINT_ODDS, SHARP_SPORT_MAP, _active_endpoint, _use_best_odds, default_sportsbook, game_market_diagnostic, health as sharp_health, prop_market_diagnostic, secondary_sportsbook, sharp_api_enabled, sharp_api_key
@@ -540,6 +541,12 @@ def odds_debug_payload(
         "missing_team_rejections": 0,
         "doubleheader_closest_time_matches": 0,
         "unmatched_mapping_diagnostics": [],
+        "sharp_pages_fetched": 0,
+        "sharp_pagination_has_more": False,
+        "sharp_pagination_truncated": False,
+        "sharp_total_rows_collected": 0,
+        "sharp_unique_rows": 0,
+        "sharp_rows_by_event": {},
     }
 
     schedule: list[dict[str, Any]] = []
@@ -606,7 +613,7 @@ def odds_debug_payload(
     odds: list[dict[str, Any]] = []
     try:
         from services.odds_provider_router import fetch_odds
-        kwargs: dict[str, Any] = {"sport": sport_lower}
+        kwargs: dict[str, Any] = {"sport": sport_lower, "max_pages": max_pages}
         if league:
             kwargs["league"] = league
         if event_date or sport_lower == "mlb":
@@ -655,6 +662,12 @@ def odds_debug_payload(
         payload["total_contexts"] = int(counts.get("total") or 0)
         payload["team_total_contexts"] = int(counts.get("team_total") or 0)
         payload["events_returned"] = int(diagnostic.get("events_returned") or 0)
+        payload["sharp_pages_fetched"] = int(diagnostic.get("pages_fetched") or 0)
+        payload["sharp_pagination_has_more"] = bool(diagnostic.get("pagination_has_more"))
+        payload["sharp_pagination_truncated"] = bool(diagnostic.get("pagination_truncated"))
+        payload["sharp_total_rows_collected"] = int(diagnostic.get("total_rows_collected") or 0)
+        payload["sharp_unique_rows"] = int(diagnostic.get("unique_rows") or 0)
+        payload["sharp_rows_by_event"] = diagnostic.get("rows_by_event") or {}
         payload["active_sportsbook"] = diagnostic.get("sportsbook") or "draftkings"
         if diagnostic.get("error"):
             payload["errors"].append(str(diagnostic["error"]))

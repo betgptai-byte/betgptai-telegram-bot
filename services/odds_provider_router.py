@@ -45,6 +45,7 @@ def fetch_odds(
     sport: str = "mlb",
     league: str | None = None,
     event_date: str | None = None,
+    max_pages: int = 5,
 ) -> list[dict[str, Any]]:
     """Fetch odds for *sport* — Sharp primary, Odds API fallback (MLB only).
 
@@ -71,7 +72,10 @@ def fetch_odds(
         try:
             cfg = SHARP_SPORT_MAP[sport_lower]
             league_param = league or cfg.get("league")
-            odds = sharp_get_odds(sport=sport_lower, league=league_param, event_date=event_date)
+            odds = sharp_get_odds(
+                sport=sport_lower, league=league_param, event_date=event_date,
+                max_pages=max_pages,
+            )
             if odds:
                 logger.info(
                     "Odds provider router: Sharp API for %s (%d events, league=%s)",

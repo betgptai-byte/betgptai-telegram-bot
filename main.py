@@ -3957,6 +3957,10 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
     use_best = payload.get("use_best_odds", True)
     auth = payload.get("auth_method", "X-API-Key header only")
     sb_counts: dict[str, int] = payload.get("sportsbook_game_counts") or {}
+    rows_by_event = payload.get("sharp_rows_by_event") if isinstance(payload.get("sharp_rows_by_event"), dict) else {}
+    rows_by_event_preview = ", ".join(
+        f"{event_id}:{count}" for event_id, count in list(rows_by_event.items())[:10]
+    ) or "None"
     lines = [
         "🧪 BETGPTAI ODDS DEBUG",
         f"Parsed sport: {payload.get('parsed_sport', sport)}",
@@ -3993,6 +3997,12 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
         f"Active provider: {payload.get('provider') or 'None'}",
         f"Provider: {payload.get('provider') or 'None'}",
         f"Sharp raw rows: {payload.get('sharp_raw_rows', 0)}",
+        f"Sharp pages fetched: {payload.get('sharp_pages_fetched', 0)}",
+        f"Sharp pagination has_more: {'YES' if payload.get('sharp_pagination_has_more') else 'NO'}",
+        f"Sharp pagination truncated: {'YES' if payload.get('sharp_pagination_truncated') else 'NO'}",
+        f"Sharp total rows collected: {payload.get('sharp_total_rows_collected', 0)}",
+        f"Sharp unique rows: {payload.get('sharp_unique_rows', 0)}",
+        f"Rows by event (first 10): {rows_by_event_preview}",
         f"Sharp rows returned: {payload.get('sharp_raw_rows', 0)}",
         f"Sharp local-date rows: {payload.get('sharp_local_date_rows', 0)}",
         f"MLB local-date games: {payload.get('mlb_local_date_games', 0)}",
@@ -4118,7 +4128,11 @@ def _parse_debug_command_args(args: list[str], *, allow_league: bool = True) -> 
         league = None
     if sport == "mlb":
         league = None
-    return {"sport": sport, "league": league, "event_date": event_date, "include_started": include_started, "flags": flags}
+    return {
+        "sport": sport, "league": league, "event_date": event_date,
+        "include_started": include_started, "full_pagination": "--full-pagination" in flags,
+        "flags": flags,
+    }
 
 
 async def odds_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4139,6 +4153,7 @@ async def odds_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     league = parsed["league"]
     event_date = parsed["event_date"]
     include_started = bool(parsed["include_started"])
+    max_pages = 10 if parsed.get("full_pagination") else 5
     if event_date:
         try:
             datetime.strptime(event_date, "%Y-%m-%d")
@@ -4162,6 +4177,7 @@ async def odds_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             event_date,
             include_started,
             parsed["flags"],
+            max_pages,
         )
         await _send_long_message(update, _render_odds_debug_payload(payload, selected_date))
     except Exception as error:
@@ -4272,10 +4288,11 @@ async def sharp_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("/sharp_probe currently supports: mlb")
         return
     mode = (context.args[1].strip().lower() if len(context.args or []) > 1 else "game_markets")
+    max_pages = 10 if "--full-pagination" in (context.args or []) else 5
     from api.sharp_odds_client import _base_url, fetch_mlb_game_markets, fetch_mlb_props, sharp_api_enabled
     try:
         if mode == "props":
-            result = await asyncio.to_thread(fetch_mlb_props, official_sports_date().isoformat())
+            result = await asyncio.to_thread(fetch_mlb_props, official_sports_date().isoformat(), max_pages)
             counts = result.get("market_counts") or {}
             first = result.get("first_grouped_prop") if isinstance(result.get("first_grouped_prop"), dict) else {}
             lines = [
@@ -4295,6 +4312,10 @@ async def sharp_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 f"- Missing player team context: {result.get('missing_player_team_context', 0)}",
                 f"- Missing event teams: {result.get('missing_event_teams', 0)}",
                 f"Rejected game-market rows: {result.get('rejected_game_market_rows', 0)}",
+                f"Pages fetched: {result.get('pages_fetched', 0)}",
+                f"Total rows collected: {result.get('total_rows_collected', 0)}",
+                f"Unique rows: {result.get('unique_rows', 0)}",
+                f"Pagination truncated: {'YES' if result.get('pagination_truncated') else 'NO'}",
                 "", "First grouped prop:",
                 f"Player: {first.get('player_name') or 'None'}",
                 f"Market: {first.get('market_type') or 'None'}",
@@ -4308,7 +4329,7 @@ async def sharp_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             ]
             await update.message.reply_text("\n".join(lines))
             return
-        result = await asyncio.to_thread(fetch_mlb_game_markets, official_sports_date().isoformat())
+        result = await asyncio.to_thread(fetch_mlb_game_markets, official_sports_date().isoformat(), max_pages)
         counts = result.get("market_counts") or {}
         lines = [
             "🔍 SHARP API PROBE — MLB GAME MARKETS",
@@ -4316,6 +4337,17 @@ async def sharp_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"Base URL: {_base_url()}",
             "Auth Method: X-API-Key",
             f"Sportsbook used: {result.get('sportsbook', 'draftkings')}",
+            f"Pages fetched: {result.get('pages_fetched', 0)}",
+            f"Total rows collected: {result.get('total_rows_collected', 0)}",
+            f"Unique rows: {result.get('unique_rows', 0)}",
+            f"Events found: {result.get('events_found', 0)}",
+            f"Pagination has_more: {'YES' if result.get('pagination_has_more') else 'NO'}",
+            f"pagination_truncated={'true' if result.get('pagination_truncated') else 'false'}",
+            "Rows per first 10 events:",
+            *[
+                f"- {event_id}: {count}"
+                for event_id, count in list((result.get("rows_by_event") or {}).items())[:10]
+            ],
             "Endpoint attempts:",
         ]
         for attempt in result.get("attempts") or []:

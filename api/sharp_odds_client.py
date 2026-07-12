@@ -71,6 +71,7 @@ _GAME_MARKET_GROUPS = {
 }
 _LAST_GAME_MARKET_DIAGNOSTIC: dict[str, Any] = {}
 _LAST_PROP_MARKET_DIAGNOSTIC: dict[str, Any] = {}
+_LAST_PAGINATION_DIAGNOSTIC: dict[str, Any] = {}
 
 # ── Sport mapping ───────────────────────────────────────────────────────────
 # Sharp API parameters per sport.
@@ -132,6 +133,7 @@ __all__ = [
     "get_soccer_odds",
     "fetch_mlb_game_markets",
     "fetch_mlb_props",
+    "fetch_sharp_odds_paginated",
     "game_market_diagnostic",
     "prop_market_diagnostic",
     "ADVANCED_GAME_MARKETS",
@@ -597,6 +599,97 @@ def _flat_rows(payload: Any) -> tuple[list[dict[str, Any]], list[str]]:
     return [row for row in rows if isinstance(row, dict)], keys
 
 
+def _sharp_row_key(row: dict[str, Any]) -> tuple[str, ...]:
+    if row.get("id") not in (None, ""):
+        return ("id", str(row.get("id")))
+    return (
+        "fields", str(row.get("event_id") or row.get("game_id") or ""),
+        str(row.get("sportsbook") or row.get("bookmaker") or "").lower(),
+        _market_name(row),
+        str(row.get("selection") or row.get("outcome") or "").lower(),
+        str(row.get("line") if row.get("line") is not None else row.get("point") or ""),
+        str(row.get("selection_type") or row.get("side") or "").lower(),
+    )
+
+
+def _fetch_sharp_odds_paginated(params: dict[str, Any], max_pages: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    api_key = sharp_api_key()
+    if not api_key:
+        raise SharpAPIError("SHARP_API_KEY is missing from .env.")
+    url = f"{_base_url()}{SHARP_ENDPOINT_ODDS}"
+    page_params = {**params, "limit": "200"}
+    unique: dict[tuple[str, ...], dict[str, Any]] = {}
+    pages_fetched = 0
+    total_rows = 0
+    top_level_keys: set[str] = set()
+    final_has_more = False
+    last_status: int | None = None
+    rows_by_event: dict[str, int] = {}
+    pagination_truncated = False
+    error: str | None = None
+    while pages_fetched < max(1, max_pages):
+        response = _do_sharp_request(url, page_params, {"X-API-Key": api_key})
+        last_status = response.status_code
+        if response.status_code == 401:
+            error = "auth_failed"
+            break
+        if response.status_code == 429:
+            error = "rate_limited"
+            break
+        if response.status_code != 200:
+            error = f"http_error_{response.status_code}"
+            break
+        try:
+            payload = response.json()
+        except Exception:
+            error = "parse_failed"
+            break
+        rows, keys = _flat_rows(payload)
+        top_level_keys.update(keys)
+        pages_fetched += 1
+        total_rows += len(rows)
+        for row in rows:
+            unique.setdefault(_sharp_row_key(row), dict(row))
+            event_key = str(row.get("event_id") or row.get("game_id") or f"{row.get('away_team')}@{row.get('home_team')}")
+            rows_by_event[event_key] = rows_by_event.get(event_key, 0) + 1
+        pagination = payload.get("pagination") if isinstance(payload, dict) and isinstance(payload.get("pagination"), dict) else {}
+        final_has_more = bool(pagination.get("has_more"))
+        logger.info(
+            "Sharp pagination endpoint=/odds page=%d status=%s keys=%s rows=%d unique=%d has_more=%s",
+            pages_fetched, response.status_code, keys, len(rows), len(unique), final_has_more,
+        )
+        if not final_has_more:
+            break
+        next_cursor = pagination.get("next_cursor")
+        next_offset = pagination.get("next_offset")
+        page_params.pop("cursor", None)
+        page_params.pop("offset", None)
+        if next_cursor not in (None, ""):
+            page_params["cursor"] = str(next_cursor)
+        elif next_offset not in (None, ""):
+            page_params["offset"] = str(next_offset)
+        else:
+            break
+    if final_has_more and pages_fetched >= max(1, max_pages):
+        pagination_truncated = True
+    diagnostic = {
+        "http_status": last_status, "pages_fetched": pages_fetched,
+        "pagination_has_more": final_has_more, "pagination_truncated": pagination_truncated,
+        "total_rows_collected": total_rows, "unique_rows": len(unique),
+        "top_level_keys": sorted(top_level_keys), "rows_by_event": rows_by_event,
+        "error": error,
+    }
+    global _LAST_PAGINATION_DIAGNOSTIC
+    _LAST_PAGINATION_DIAGNOSTIC = diagnostic
+    return list(unique.values()), diagnostic
+
+
+def fetch_sharp_odds_paginated(params: dict, max_pages: int = 10) -> list[dict]:
+    """Collect and deduplicate all available Sharp `/odds` pages."""
+    rows, _ = _fetch_sharp_odds_paginated(params, max_pages=max_pages)
+    return rows
+
+
 def _market_name(row: dict[str, Any]) -> str:
     return str(row.get("market_type") or row.get("market") or "").strip().lower()
 
@@ -605,7 +698,7 @@ def _market_group(market: str) -> str | None:
     return next((group for group, aliases in _GAME_MARKET_GROUPS.items() if market in aliases), None)
 
 
-def _filtered_market_request(*, sportsbook: str, markets: str, kind: str, card_date: str | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _filtered_market_request(*, sportsbook: str, markets: str, kind: str, card_date: str | None = None, max_pages: int = 5) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     api_key = sharp_api_key()
     if not api_key:
         raise SharpAPIError("SHARP_API_KEY is missing from .env.")
@@ -619,9 +712,9 @@ def _filtered_market_request(*, sportsbook: str, markets: str, kind: str, card_d
     if card_date:
         utc_window = mlb_utc_query_window(card_date)
         params["commenceTimeFrom"], params["commenceTimeTo"] = utc_window
-    response = _do_sharp_request(url, params, {"X-API-Key": api_key})
+    rows, pagination = _fetch_sharp_odds_paginated(params, max_pages=max_pages)
     attempt = {
-        "endpoint": endpoint, "http_status": response.status_code,
+        "endpoint": endpoint, "http_status": pagination.get("http_status"),
         "market_requested": markets, "sportsbook": sportsbook,
         "rows_returned": 0, "accepted_rows": 0, "rejected_rows": 0,
         "rejected_prop_rows": 0, "rejected_game_market_rows": 0,
@@ -629,23 +722,20 @@ def _filtered_market_request(*, sportsbook: str, markets: str, kind: str, card_d
         "first_rejected_prop_market": None,
         "utc_query_window": list(utc_window) if utc_window else None,
         "local_date_rows": 0, "rejected_wrong_local_date": 0,
+        "pages_fetched": pagination.get("pages_fetched", 0),
+        "pagination_has_more": pagination.get("pagination_has_more", False),
+        "pagination_truncated": pagination.get("pagination_truncated", False),
+        "total_rows_collected": pagination.get("total_rows_collected", 0),
+        "unique_rows": pagination.get("unique_rows", 0),
+        "rows_by_event": pagination.get("rows_by_event", {}),
     }
-    if response.status_code == 401:
-        attempt["error"] = "auth_failed"
+    if pagination.get("error") and not rows:
+        attempt["error"] = pagination["error"]
         return [], attempt
-    if response.status_code == 429:
-        attempt["error"] = "rate_limited"
-        return [], attempt
-    if response.status_code != 200:
-        attempt["error"] = f"http_error_{response.status_code}"
-        return [], attempt
-    try:
-        payload = response.json()
-    except Exception:
-        attempt["error"] = "parse_failed"
-        return [], attempt
-    rows, keys = _flat_rows(payload)
-    attempt["top_level_keys"] = keys
+    if pagination.get("error"):
+        attempt["error"] = pagination["error"]
+        attempt["pagination_truncated"] = True
+    attempt["top_level_keys"] = pagination.get("top_level_keys", [])
     attempt["rows_returned"] = len(rows)
     accepted: list[dict[str, Any]] = []
     for row in rows:
@@ -676,13 +766,13 @@ def _filtered_market_request(*, sportsbook: str, markets: str, kind: str, card_d
     attempt["accepted_rows"] = len(accepted)
     logger.info(
         "Sharp filtered endpoint=%s sportsbook=%s market=%s status=%s rows=%d accepted=%d rejected=%d",
-        endpoint, sportsbook, markets, response.status_code, len(rows), len(accepted),
+        endpoint, sportsbook, markets, pagination.get("http_status"), len(rows), len(accepted),
         attempt["rejected_rows"] + attempt["rejected_prop_rows"] + attempt["rejected_game_market_rows"] + attempt["rejected_missing_team_fields"],
     )
     return accepted, attempt
 
 
-def fetch_mlb_game_markets(event_date: str | None = None) -> dict[str, Any]:
+def fetch_mlb_game_markets(event_date: str | None = None, max_pages: int = 5) -> dict[str, Any]:
     """Fetch only DraftKings MLB game markets for advanced card enrichment."""
     attempts: list[dict[str, Any]] = []
     accepted: list[dict[str, Any]] = []
@@ -696,7 +786,10 @@ def fetch_mlb_game_markets(event_date: str | None = None) -> dict[str, Any]:
     ]
     seen_rows: set[str] = set()
     for markets in request_sets:
-        rows, attempt = _filtered_market_request(sportsbook=GAME_MARKET_BOOK, markets=markets, kind="game", card_date=event_date)
+        rows, attempt = _filtered_market_request(
+            sportsbook=GAME_MARKET_BOOK, markets=markets, kind="game",
+            card_date=event_date, max_pages=max_pages,
+        )
         attempts.append(attempt)
         for row in rows:
             signature = json.dumps(row, sort_keys=True, default=str)
@@ -711,6 +804,10 @@ def fetch_mlb_game_markets(event_date: str | None = None) -> dict[str, Any]:
     rejected_props = sum(int(attempt.get("rejected_prop_rows") or 0) for attempt in attempts)
     missing_teams = sum(int(attempt.get("rejected_missing_team_fields") or 0) for attempt in attempts)
     first = accepted[0] if accepted else {}
+    rows_by_event: dict[str, int] = {}
+    for attempt in attempts:
+        for event_id, count in (attempt.get("rows_by_event") or {}).items():
+            rows_by_event[str(event_id)] = rows_by_event.get(str(event_id), 0) + int(count or 0)
     result = {
         "provider": "sharpapi", "sportsbook": GAME_MARKET_BOOK,
         "events": parsed.get("events") or parsed.get("odds") or [],
@@ -727,6 +824,13 @@ def fetch_mlb_game_markets(event_date: str | None = None) -> dict[str, Any]:
         "error": None if accepted else "draftkings_game_markets_unavailable",
         "requested_card_date_et": event_date,
         "utc_query_window": list(mlb_utc_query_window(event_date)) if event_date else None,
+        "pages_fetched": sum(int(attempt.get("pages_fetched") or 0) for attempt in attempts),
+        "pagination_has_more": any(bool(attempt.get("pagination_has_more")) for attempt in attempts),
+        "pagination_truncated": any(bool(attempt.get("pagination_truncated")) for attempt in attempts),
+        "total_rows_collected": sum(int(attempt.get("total_rows_collected") or 0) for attempt in attempts),
+        "unique_rows": len(seen_rows),
+        "rows_by_event": rows_by_event,
+        "events_found": len(rows_by_event),
     }
     global _LAST_GAME_MARKET_DIAGNOSTIC
     _LAST_GAME_MARKET_DIAGNOSTIC = result
@@ -735,13 +839,16 @@ def fetch_mlb_game_markets(event_date: str | None = None) -> dict[str, Any]:
     return result
 
 
-def fetch_mlb_props(event_date: str | None = None) -> dict[str, Any]:
+def fetch_mlb_props(event_date: str | None = None, max_pages: int = 5) -> dict[str, Any]:
     """Fetch only FanDuel player props; never feed these rows to game context."""
     markets = (
         "player_hits,player_total_bases,player_home_runs,player_rbis,player_runs,"
         "player_hits_runs_rbis,pitcher_strikeouts,player_strikeouts"
     )
-    rows, attempt = _filtered_market_request(sportsbook=PROP_MARKET_BOOK, markets=markets, kind="prop", card_date=event_date)
+    rows, attempt = _filtered_market_request(
+        sportsbook=PROP_MARKET_BOOK, markets=markets, kind="prop",
+        card_date=event_date, max_pages=max_pages,
+    )
     counts = {market: sum(1 for row in rows if _market_name(row) == market) for market in PROP_MARKETS}
     grouped: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
     import re
@@ -814,6 +921,12 @@ def fetch_mlb_props(event_date: str | None = None) -> dict[str, Any]:
             1 for prop in grouped_props
             if not prop.get("home_team") or not prop.get("away_team")
         ),
+        "pages_fetched": int(attempt.get("pages_fetched") or 0),
+        "pagination_has_more": bool(attempt.get("pagination_has_more")),
+        "pagination_truncated": bool(attempt.get("pagination_truncated")),
+        "total_rows_collected": int(attempt.get("total_rows_collected") or 0),
+        "unique_rows": int(attempt.get("unique_rows") or 0),
+        "rows_by_event": attempt.get("rows_by_event") or {},
     }
     global _LAST_PROP_MARKET_DIAGNOSTIC
     _LAST_PROP_MARKET_DIAGNOSTIC = result
@@ -832,6 +945,7 @@ def get_odds(
     sport: str = "mlb",
     league: str | None = None,
     event_date: str | None = None,
+    max_pages: int = 5,
 ) -> list[dict[str, Any]]:
     """Fetch odds for any supported sport from the Sharp API.
 
@@ -866,7 +980,7 @@ def get_odds(
 
     # ── MLB: isolated DraftKings game markets only ────────────────────────
     if sport_lower == "mlb":
-        result = fetch_mlb_game_markets(event_date=event_date)
+        result = fetch_mlb_game_markets(event_date=event_date, max_pages=max_pages)
         return list(result.get("odds") or [])
 
     # ── Non-MLB sports ────────────────────────────────────────────────────

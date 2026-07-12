@@ -5003,6 +5003,19 @@ async def simple_card_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 for reason, count in (card.get("dk_odds_attach_failure_reasons") or {}).items()
             ],
             "",
+            f"Game Edge Engine: {'ON' if card.get('game_edge_engine_on') else 'OFF'}",
+            f"Reports generated: {card.get('game_edge_reports_generated', 0)}",
+            f"Pass games: {card.get('game_edge_pass_games', 0)}",
+            f"Qualified picks: {card.get('game_edge_qualified_picks', 0)}",
+            f"Top edge: {((card.get('game_edge_top') or {}).get('official_pick_candidate') or {}).get('selection') or 'None'} — {(card.get('game_edge_top') or {}).get('overall_edge_score')}",
+            "Best market distribution:",
+            f"- ML: {(card.get('game_edge_market_distribution') or {}).get('moneyline', 0)}",
+            f"- F5: {(card.get('game_edge_market_distribution') or {}).get('f5_moneyline', 0)}",
+            f"- RL: {(card.get('game_edge_market_distribution') or {}).get('runline', 0)}",
+            f"- TT: {(card.get('game_edge_market_distribution') or {}).get('team_total', 0)}",
+            f"- Total: {(card.get('game_edge_market_distribution') or {}).get('game_total', 0)}",
+            f"- Pass: {(card.get('game_edge_market_distribution') or {}).get('pass', 0)}",
+            "",
             "Picks by market:",
             f"- Play of the Day: {counts.get('play_of_day', 0)}",
             f"- Moneylines: {counts.get('moneyline', 0)}",
@@ -5019,6 +5032,34 @@ async def simple_card_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     except Exception as error:
         logging.exception("/simple_card_debug failed")
         await update.message.reply_text(f"❌ Simple card debug failed:\n{error!r}")
+
+
+async def game_edge_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only detailed structured MLB game-edge diagnostics."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    try:
+        from services.mlb_game_edge_engine import render_game_edge_debug
+        card = await asyncio.to_thread(build_simple_mlb_card, official_sports_date().isoformat())
+        await _send_long_message(update, render_game_edge_debug(card.get("game_edge_reports") or []))
+    except Exception as error:
+        logging.exception("/game_edge_debug failed")
+        await update.message.reply_text(f"❌ Game edge debug failed:\n{error!r}")
+
+
+async def game_edge_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only compact MLB game-edge ranking."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    try:
+        from services.mlb_game_edge_engine import render_game_edge_summary
+        card = await asyncio.to_thread(build_simple_mlb_card, official_sports_date().isoformat())
+        await _send_long_message(update, render_game_edge_summary(card.get("game_edge_reports") or []))
+    except Exception as error:
+        logging.exception("/game_edge_summary failed")
+        await update.message.reply_text(f"❌ Game edge summary failed:\n{error!r}")
 
 
 async def simple_generate_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6612,6 +6653,8 @@ async def main() -> None:
     application.add_handler(CommandHandler("simple_card_debug", simple_card_debug))
     SYSTEM_LOG.info("Registered command: /simple_card_debug")
     print("Registered command: /simple_card_debug", flush=True)
+    application.add_handler(CommandHandler("game_edge_debug", game_edge_debug))
+    application.add_handler(CommandHandler("game_edge_summary", game_edge_summary))
     application.add_handler(CommandHandler("simple_generate_today", simple_generate_today))
     SYSTEM_LOG.info("Registered command: /simple_generate_today")
     print("Registered command: /simple_generate_today", flush=True)

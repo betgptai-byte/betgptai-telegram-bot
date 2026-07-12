@@ -278,18 +278,45 @@ def build_simple_mlb_card(card_date: str | None = None) -> dict:
         except Exception as error:  # pragma: no cover - import/setup failure
             errors.append(f"quant_enrich_failed: {error!r}")
 
+    edge_reports: list[dict[str, Any]] = []
+    edge_engine_on = False
+    try:
+        from services.mlb_game_edge_engine import build_game_edge_reports
+        edge_reports = build_game_edge_reports(slate)
+        edge_engine_on = bool(edge_reports)
+    except Exception as error:  # live-path fallback is intentional
+        errors.append(f"game_edge_engine_failed_fallback_simple_scoring: {error!r}")
+    reports_by_game = {
+        str(report.get("game_pk") or report.get("game_id")): report
+        for report in edge_reports
+    }
+
     candidates: list[dict[str, Any]] = []
     for game in slate:
         quant = _quant_for(game)
-        team, opponent = _favored_side(game)
+        report = reports_by_game.get(str(game.get("game_pk") or game.get("game_id")))
+        candidate_pick = report.get("official_pick_candidate") if isinstance(report, dict) and isinstance(report.get("official_pick_candidate"), dict) else {}
+        team = str(candidate_pick.get("team") or "")
+        if not team:
+            team, opponent = _favored_side(game)
+        else:
+            opponent = str(game.get("home_team") if team == game.get("away_team") else game.get("away_team"))
+        pick_quant = dict(quant)
+        if isinstance(report, dict):
+            pick_quant.update({
+                "final_edge_score": report.get("overall_edge_score"),
+                "confidence": report.get("confidence_grade"),
+                "model_version": "mlb_game_edge_engine_v1",
+            })
         candidates.append({
             "game": game,
             "team": team,
             "opponent": opponent,
-            "quant": quant,
-            "edge": float(quant.get("final_edge_score") or 0.0),
-            "confidence": quant.get("confidence"),
+            "quant": pick_quant,
+            "edge": float(report.get("overall_edge_score") if isinstance(report, dict) else quant.get("final_edge_score") or 0.0),
+            "confidence": report.get("confidence_grade") if isinstance(report, dict) else quant.get("confidence"),
             "risk": quant.get("risk_level"),
+            "edge_report": report,
         })
 
     # Rank by edge score (highest first); fall back to insertion order.
@@ -311,7 +338,16 @@ def build_simple_mlb_card(card_date: str | None = None) -> dict:
               exclude: set[Any] | None = None, skip: int = 0) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         scanned = 0
-        for cand in candidates:
+        market_candidates = sorted(
+            candidates,
+            key=lambda cand: (
+                str((cand.get("edge_report") or {}).get("best_market") or "") == market,
+                str((cand.get("edge_report") or {}).get("best_market") or "") != "pass",
+                cand["edge"],
+            ),
+            reverse=True,
+        )
+        for cand in market_candidates:
             if len(out) >= n:
                 break
             if exclude and _gid(cand) in exclude:
@@ -330,7 +366,7 @@ def build_simple_mlb_card(card_date: str | None = None) -> dict:
 
     # Play of the Day: single highest-edge pick.
     play_of_day: list[dict[str, Any]] = _take(1, "play_of_day")
-    pod_game = {_gid(c) for c in candidates[:1]} if play_of_day else set()
+    pod_game = {play_of_day[0].get("game_id")} if play_of_day else set()
 
     # Top 5 Moneylines (exclude the headline game to avoid exact duplication).
     moneylines: list[dict[str, Any]] = _take(5, "moneyline", exclude=pod_game)
@@ -367,6 +403,12 @@ def build_simple_mlb_card(card_date: str | None = None) -> dict:
         and (pick.get("odds_american") is not None or pick.get("posted_odds") is not None)
     ]
     live_mode = bool(verified_picks)
+    pass_games = sum(1 for report in edge_reports if report.get("best_market") == "pass")
+    qualified_reports = [report for report in edge_reports if report.get("best_market") != "pass"]
+    market_distribution = {
+        market: sum(1 for report in edge_reports if report.get("best_market") == market)
+        for market in ("moneyline", "f5_moneyline", "runline", "team_total", "game_total", "pass")
+    }
     card = {
         "source": SOURCE,
         "date": selected_date,
@@ -388,6 +430,13 @@ def build_simple_mlb_card(card_date: str | None = None) -> dict:
         "dk_odds_attach_success": attach_debug["success"],
         "dk_odds_attach_failures": attach_debug["failures"],
         "dk_odds_attach_failure_reasons": attach_debug["failure_reasons"],
+        "game_edge_engine_on": edge_engine_on,
+        "game_edge_reports_generated": len(edge_reports),
+        "game_edge_pass_games": pass_games,
+        "game_edge_qualified_picks": len(qualified_reports),
+        "game_edge_top": edge_reports[0] if edge_reports else None,
+        "game_edge_market_distribution": market_distribution,
+        "game_edge_reports": edge_reports,
         "picks": picks,
         "parlay": [leg["id"] for leg in parlay_legs],
         "sections": {

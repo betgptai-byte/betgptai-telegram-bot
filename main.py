@@ -4944,11 +4944,21 @@ async def simple_card_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         card = await asyncio.to_thread(build_simple_mlb_card, selected_date)
         counts = card.get("counts", {})
         errors = card.get("errors", [])
+        picks = [pick for pick in card.get("picks", []) if isinstance(pick, dict)]
+        picks_with_dk = [
+            pick for pick in picks
+            if pick.get("sportsbook") == "draftkings" and pick.get("line_verified")
+            and (pick.get("odds_american") is not None or pick.get("posted_odds") is not None)
+        ]
         path = services_simple_path(selected_date)
         lines = [
             "🧪 SIMPLE MLB CARD DEBUG",
             f"📅 Date: {selected_date}",
-            f"Mode: {'Stats Only' if card.get('stats_only') else 'Normal'}",
+            f"Market Mode: {card.get('market_mode', 'stats_only')}",
+            f"DraftKings Lines Verified: {'YES' if card.get('draftkings_lines_verified') else 'NO'}",
+            f"Matched DK Games: {card.get('market_context_matched_games', 0)}",
+            f"Picks with DK odds: {len(picks_with_dk)}",
+            f"Picks without odds: {len(picks) - len(picks_with_dk)}",
             "",
             "Picks by market:",
             f"- Play of the Day: {counts.get('play_of_day', 0)}",

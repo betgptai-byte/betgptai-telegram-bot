@@ -99,6 +99,37 @@ def _stable_id(*parts: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
+def _draftkings_reference(game: dict[str, Any], market: str, team: str) -> dict[str, Any] | None:
+    """Find the matching DK reference row after the stats model chooses a side."""
+    from api.sharp_client import _normalize_team
+
+    expected_market = {
+        "play_of_day": "h2h", "moneyline": "h2h",
+        "f5_moneyline": "f5_h2h", "runline": "spreads",
+        "game_total": "totals", "team_total": "team_totals",
+    }.get(market)
+    if not expected_market:
+        return None
+    prices = game.get("best_available_prices")
+    if not isinstance(prices, list):
+        return None
+    target = _normalize_team(team)
+    for row in prices:
+        if not isinstance(row, dict) or str(row.get("market") or "").lower() != expected_market:
+            continue
+        book = str(row.get("bookmaker_key") or row.get("bookmaker") or "").lower()
+        if book != "draftkings":
+            continue
+        outcome = str(row.get("outcome") or row.get("description") or "")
+        if expected_market not in {"totals"} and target not in _normalize_team(outcome):
+            continue
+        odds = row.get("price") if row.get("price") is not None else row.get("odds_american")
+        if odds is None:
+            continue
+        return row
+    return None
+
+
 def _make_pick(
     card_date: str,
     market: str,
@@ -113,6 +144,13 @@ def _make_pick(
     game_pk = game.get("game_pk") or game.get("game_id")
     edge = quant.get("final_edge_score")
     confidence = quant.get("confidence")
+    reference = _draftkings_reference(game, market, team)
+    reference_line = reference.get("point") if reference else line
+    reference_odds = (
+        reference.get("price") if reference and reference.get("price") is not None
+        else reference.get("odds_american") if reference else None
+    )
+    verified = bool(reference and reference_odds is not None)
     return {
         "id": _stable_id(SOURCE, card_date, str(game_pk), market, team, str(line or "")),
         "date": card_date,
@@ -123,11 +161,14 @@ def _make_pick(
         "pick": f"{team} ({market})",
         "confidence": confidence,
         "edge_score": edge,
-        "market_mode": MARKET_MODE,
-        "odds_status": "unavailable",
-        "sportsbook": "none",
-        "posted_line": line,
-        "line_verified": False,
+        "market_mode": "live_odds" if verified else "stats_only",
+        "odds_status": "available" if verified else "unavailable",
+        "sportsbook": "draftkings" if verified else "none",
+        "odds_american": reference_odds,
+        "posted_odds": reference_odds,
+        "posted_line": reference_line,
+        "line": reference_line,
+        "line_verified": verified,
         "trackable": True,
         "source": SOURCE,
         "parlay_leg": parlay_leg,
@@ -258,13 +299,27 @@ def build_simple_mlb_card(card_date: str | None = None) -> dict:
     # Core Five: the next 5 best edges after the Top 5 Moneylines.
     core_five: list[dict[str, Any]] = _take(5, "moneyline", exclude=pod_game, skip=len(moneylines))
 
+    verified_picks = [
+        pick for pick in picks
+        if pick.get("sportsbook") == "draftkings" and pick.get("line_verified")
+        and (pick.get("odds_american") is not None or pick.get("posted_odds") is not None)
+    ]
+    matched_dk_games = {
+        str(pick.get("game_id")) for pick in verified_picks if pick.get("game_id") is not None
+    }
+    live_mode = bool(verified_picks)
     card = {
         "source": SOURCE,
         "date": selected_date,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "market_mode": MARKET_MODE,
-        "stats_only": stats_mode,
-        "odds_status": "unavailable" if stats_mode else "available",
+        "market_mode": "live_odds" if live_mode else "stats_only",
+        "stats_only": not live_mode,
+        "odds_status": "available" if live_mode else "unavailable",
+        "game_market_book": "draftkings",
+        "prop_book": "fanduel",
+        "draftkings_lines_verified": live_mode,
+        "fanduel_props_verified": False,
+        "market_context_matched_games": len(matched_dk_games),
         "picks": picks,
         "parlay": [leg["id"] for leg in parlay_legs],
         "sections": {
@@ -399,8 +454,11 @@ def export_simple_card_to_official_picks(card_date: str | None = None) -> dict:
             "edge_score": sp.get("edge_score"),
             "confidence": sp.get("confidence"),
             "sportsbook": sp.get("sportsbook", "none"),
+            "odds": sp.get("odds_american") if sp.get("odds_american") is not None else sp.get("posted_odds"),
+            "posted_odds": sp.get("posted_odds") if sp.get("posted_odds") is not None else sp.get("odds_american"),
             "odds_status": sp.get("odds_status", "unavailable"),
-            "market_mode": "stats_only",
+            "line_verified": bool(sp.get("line_verified")),
+            "market_mode": sp.get("market_mode", "stats_only"),
             "trackable": True,
             "source": "simple_mlb_card_v1",
             "snapshot_source": "simple_card_bridge",
@@ -502,6 +560,52 @@ def _format_market_label(market_type: str) -> str:
     }.get(normalized, "Pick")
 
 
+def _format_odds(odds_american: Any) -> str:
+    """Return signed American odds in parentheses, or an empty string."""
+    if odds_american in (None, ""):
+        return ""
+    try:
+        odds = int(float(odds_american))
+    except (TypeError, ValueError):
+        return ""
+    return f"({odds:+d})"
+
+
+def _format_line(market_type: str, posted_line: Any, direction: str | None = None) -> str:
+    """Format a verified market line using public betting notation."""
+    market = str(market_type or "").strip().lower()
+    if posted_line in (None, ""):
+        return _format_market_label(market)
+    try:
+        number = float(posted_line)
+        unsigned = f"{number:g}"
+        signed = f"{number:+g}"
+    except (TypeError, ValueError):
+        unsigned = signed = str(posted_line)
+    side = str(direction or "").strip().title()
+    if market in {"runline", "run_line"}:
+        return f"RL {signed}"
+    if market in {"game_total", "total"}:
+        return f"{side or 'Total'} {unsigned}"
+    if market == "team_total":
+        return f"Team Total {side or 'Total'} {unsigned}"
+    return _format_market_label(market)
+
+
+def _has_verified_draftkings_lines(card: dict) -> bool:
+    """True only when a public game pick carries a verified DK price."""
+    picks = card.get("picks") if isinstance(card.get("picks"), list) else []
+    public_markets = {"play_of_day", "moneyline", "f5_moneyline", "runline", "game_total", "team_total"}
+    return any(
+        isinstance(pick, dict)
+        and str(pick.get("market_type") or pick.get("market") or "").lower() in public_markets
+        and str(pick.get("sportsbook") or "").lower() == "draftkings"
+        and bool(pick.get("line_verified"))
+        and (pick.get("odds_american") is not None or pick.get("posted_odds") is not None)
+        for pick in picks
+    )
+
+
 def _format_pick_public(pick: dict) -> str:
     """Render one simple-card pick without leaking technical market names."""
     selection = str(
@@ -509,18 +613,25 @@ def _format_pick_public(pick: dict) -> str:
         or pick.get("pick") or "Pick unavailable"
     ).strip()
     market = str(pick.get("market_type") or pick.get("market") or "")
-    label = _format_market_label(market)
+    normalized_market = market.strip().lower()
+    direction = str(pick.get("direction") or "").strip().lower()
+    if not direction and selection.lower() in {"over", "under"}:
+        direction = selection.lower()
+    if normalized_market in {"game_total", "total"} and selection.lower() in {"over", "under"}:
+        selection = "Game Total"
     line = pick.get("posted_line")
     if line is None:
         line = pick.get("line")
-    if line is not None and label in {"RL", "Game Total", "Team Total"}:
-        try:
-            line_number = float(line)
-            line_text = f"{line_number:+g}" if label == "RL" else f"{line_number:g}"
-        except (TypeError, ValueError):
-            line_text = str(line)
-        return f"{selection} {line_text} {label}".strip()
-    return f"{selection} {label}".strip()
+    market_text = _format_line(market, line, direction)
+    if normalized_market in {"game_total", "total"} and selection == "Game Total":
+        market_text = market_text.removeprefix("Game Total ")
+    odds = pick.get("odds_american")
+    if odds is None:
+        odds = pick.get("posted_odds")
+    odds_text = _format_odds(odds) if (
+        pick.get("line_verified") and str(pick.get("sportsbook") or "").lower() == "draftkings"
+    ) else ""
+    return " ".join(part for part in (selection, market_text, odds_text) if part).strip()
 
 
 def render_simple_mlb_card(card: dict) -> str:
@@ -528,17 +639,10 @@ def render_simple_mlb_card(card: dict) -> str:
     picks = [pick for pick in card.get("picks", []) if isinstance(pick, dict)]
     by_id = {str(pick.get("id")): pick for pick in picks if pick.get("id")}
     sections = card.get("sections", {}) if isinstance(card.get("sections"), dict) else {}
-    market_mode = str(card.get("market_mode") or "stats_only").lower()
-    mode_label = "Live Odds" if market_mode == "live_odds" else "Stats-Based"
-    sportsbooks = [
-        str(value).strip() for value in (
-            card.get("game_market_sportsbook"), card.get("sportsbook"),
-            *(pick.get("sportsbook") for pick in picks),
-        )
-        if value and str(value).strip().lower() not in {"none", "unavailable"}
-    ]
-    game_book = next((book for book in sportsbooks if book.lower() == "draftkings"), sportsbooks[0] if sportsbooks else "")
-    prop_book = next((book for book in sportsbooks if book.lower() == "fanduel"), "")
+    has_dk_lines = _has_verified_draftkings_lines(card)
+    mode_label = "DraftKings Reference Lines" if has_dk_lines else "Stats-Based"
+    game_book = "DraftKings" if has_dk_lines else "Not matched"
+    prop_book = "FanDuel"
     separator = "━━━━━━━━━━━━━━"
     number_icons = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟")
     blocks: list[list[str]] = [[
@@ -548,10 +652,8 @@ def render_simple_mlb_card(card: dict) -> str:
         f"📊 Mode: {mode_label}",
     ]]
     book_labels = {"draftkings": "DraftKings", "fanduel": "FanDuel"}
-    if game_book:
-        blocks[0].append(f"📚 Game Lines: {book_labels.get(game_book.lower(), game_book)}")
-    if prop_book:
-        blocks[0].append(f"🎯 Props: {book_labels.get(prop_book.lower(), prop_book)}")
+    blocks[0].append(f"📚 Game Lines: {book_labels.get(game_book.lower(), game_book)}")
+    blocks[0].append(f"🎯 Props: {book_labels.get(prop_book.lower(), prop_book)}")
 
     def _unique(ids: list[str]) -> list[dict[str, Any]]:
         unique: list[dict[str, Any]] = []
@@ -587,9 +689,14 @@ def render_simple_mlb_card(card: dict) -> str:
     _block("📈 RUN LINE LEANS", sections.get("runlines", []))
     _block("🧩 SAFE 2-LEG PARLAY", card.get("parlay", []), checkmarks=True)
     _block("⚾ CORE FIVE", sections.get("core_five", []))
+    reminder = (
+        "DraftKings lines used as market reference. Odds may move."
+        if has_dk_lines else
+        "Stats-based card. Odds vary by sportsbook."
+    )
     blocks.append([
         "⚠️ Reminder:",
-        "Stats-based card. Odds vary by sportsbook.",
+        reminder,
         "Verify final lines and lineups before placing any wager.",
         "",
         "@betgptai",

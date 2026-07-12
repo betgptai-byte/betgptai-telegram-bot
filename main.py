@@ -4989,8 +4989,19 @@ async def simple_card_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             f"Market Mode: {card.get('market_mode', 'stats_only')}",
             f"DraftKings Lines Verified: {'YES' if card.get('draftkings_lines_verified') else 'NO'}",
             f"Matched DK Games: {card.get('market_context_matched_games', 0)}",
+            f"DK market context games available: {card.get('dk_market_context_games_available', 0)}",
+            f"DK market context source: {card.get('dk_market_context_source', 'none')}",
+            f"DK market context rows used: {card.get('dk_market_context_rows_used', 0)}",
+            f"DK odds attach attempts: {card.get('dk_odds_attach_attempts', 0)}",
+            f"DK odds attach success: {card.get('dk_odds_attach_success', 0)}",
+            f"DK odds attach failures: {card.get('dk_odds_attach_failures', 0)}",
             f"Picks with DK odds: {len(picks_with_dk)}",
             f"Picks without odds: {len(picks) - len(picks_with_dk)}",
+            "Attach failure reasons:",
+            *[
+                f"- {reason}: {count}"
+                for reason, count in (card.get("dk_odds_attach_failure_reasons") or {}).items()
+            ],
             "",
             "Picks by market:",
             f"- Play of the Day: {counts.get('play_of_day', 0)}",

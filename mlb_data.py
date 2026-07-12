@@ -804,7 +804,8 @@ def _sportsdb_baseball_schedule(selected_date: str) -> list[dict[str, Any]]:
 
 
 def get_combined_slate(
-    odds_api_key: str, game_date: str | None = None, highlightly_api_key: str = ""
+    odds_api_key: str, game_date: str | None = None, highlightly_api_key: str = "",
+    odds_max_pages: int = 5,
 ) -> list[dict[str, Any]]:
     """Run MLB -> Savant -> Highlightly -> weather -> odds safely."""
     selected_date = game_date or date.today().isoformat()
@@ -895,7 +896,7 @@ def get_combined_slate(
 
     try:
         from services.odds_provider_router import fetch_odds, enrich_slate_market_context
-        odds = fetch_odds(event_date=selected_date)
+        odds = fetch_odds(event_date=selected_date, max_pages=odds_max_pages)
         if odds:
             provider = _detect_odds_provider(odds)
             slate = combine_schedule_and_odds(slate, odds, selected_date)

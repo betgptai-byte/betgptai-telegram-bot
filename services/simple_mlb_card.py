@@ -99,8 +99,10 @@ def _stable_id(*parts: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def _draftkings_reference(game: dict[str, Any], market: str, team: str) -> dict[str, Any] | None:
-    """Find the matching DK reference row after the stats model chooses a side."""
+def _draftkings_reference_detail(
+    game: dict[str, Any], market: str, team: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Find the matching DK row or return an exact attachment failure."""
     from api.sharp_client import _normalize_team
 
     expected_market = {
@@ -109,25 +111,43 @@ def _draftkings_reference(game: dict[str, Any], market: str, team: str) -> dict[
         "game_total": "totals", "team_total": "team_totals",
     }.get(market)
     if not expected_market:
-        return None
+        return None, "market_missing"
     prices = game.get("best_available_prices")
-    if not isinstance(prices, list):
-        return None
+    context = game.get("market_context") if isinstance(game.get("market_context"), dict) else {}
+    if not isinstance(prices, list) or not prices or not context.get("market_context_available"):
+        return None, "game_not_matched"
+    market_rows = [
+        row for row in prices
+        if isinstance(row, dict)
+        and str(row.get("market") or "").lower() == expected_market
+        and str(row.get("bookmaker_key") or row.get("bookmaker") or "").lower() == "draftkings"
+    ]
+    if not market_rows:
+        return None, "f5_market_missing" if market == "f5_moneyline" else "market_missing"
     target = _normalize_team(team)
-    for row in prices:
-        if not isinstance(row, dict) or str(row.get("market") or "").lower() != expected_market:
-            continue
-        book = str(row.get("bookmaker_key") or row.get("bookmaker") or "").lower()
-        if book != "draftkings":
-            continue
+    selection_rows: list[dict[str, Any]] = []
+    for row in market_rows:
         outcome = str(row.get("outcome") or row.get("description") or "")
         if expected_market not in {"totals"} and target not in _normalize_team(outcome):
+            continue
+        selection_rows.append(row)
+    if not selection_rows:
+        return None, "selection_missing"
+    for row in selection_rows:
+        if expected_market in {"spreads", "totals", "team_totals"} and row.get("point") is None:
             continue
         odds = row.get("price") if row.get("price") is not None else row.get("odds_american")
         if odds is None:
             continue
-        return row
-    return None
+        return row, None
+    if expected_market in {"spreads", "totals", "team_totals"} and all(row.get("point") is None for row in selection_rows):
+        return None, "line_missing"
+    return None, "odds_missing"
+
+
+def _draftkings_reference(game: dict[str, Any], market: str, team: str) -> dict[str, Any] | None:
+    reference, _ = _draftkings_reference_detail(game, market, team)
+    return reference
 
 
 def _make_pick(
@@ -140,11 +160,20 @@ def _make_pick(
     *,
     line: float | None = None,
     parlay_leg: bool = False,
+    attach_debug: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     game_pk = game.get("game_pk") or game.get("game_id")
     edge = quant.get("final_edge_score")
     confidence = quant.get("confidence")
-    reference = _draftkings_reference(game, market, team)
+    reference, attach_reason = _draftkings_reference_detail(game, market, team)
+    if attach_debug is not None:
+        attach_debug["attempts"] += 1
+        if reference:
+            attach_debug["success"] += 1
+        else:
+            attach_debug["failures"] += 1
+            reason = "market_missing" if attach_reason == "f5_market_missing" else str(attach_reason or "market_missing")
+            attach_debug["failure_reasons"][reason] += 1
     reference_line = reference.get("point") if reference else line
     reference_odds = (
         reference.get("price") if reference and reference.get("price") is not None
@@ -169,6 +198,7 @@ def _make_pick(
         "posted_line": reference_line,
         "line": reference_line,
         "line_verified": verified,
+        "odds_attach_reason": None if verified else attach_reason,
         "trackable": True,
         "source": SOURCE,
         "parlay_leg": parlay_leg,
@@ -180,6 +210,7 @@ def _make_pick(
 def build_simple_mlb_card(card_date: str | None = None) -> dict:
     """Build a stats-only MLB card dict directly from the enriched slate."""
     from ai_analysis import upcoming_mlb_slate
+    from api.sharp_odds_client import game_market_diagnostic
     from mlb_data import get_combined_slate
     from quant_engine import score_game
 
@@ -192,15 +223,36 @@ def build_simple_mlb_card(card_date: str | None = None) -> dict:
             os.getenv("ODDS_API_KEY", ""),
             game_date=selected_date,
             highlightly_api_key=os.getenv("HIGHLIGHTLY_API_KEY", ""),
+            odds_max_pages=10,
         )
     except Exception as error:  # pragma: no cover - network/IO dependent
         errors.append(f"slate_load_failed: {error!r}")
 
+    dk_context_debug: dict[str, Any] = {
+        "games_available": 0, "matched_games": 0, "source": "none", "rows_used": 0,
+        "pages_fetched": 0, "pagination_truncated": False,
+    }
+    if raw_slate:
+        try:
+            dk_result = game_market_diagnostic()
+            dk_context_debug.update({
+                "games_available": int(dk_result.get("events_found") or dk_result.get("events_returned") or 0),
+                "source": "paginated/full" if dk_result.get("accepted_game_market_rows") else "none",
+                "rows_used": int(dk_result.get("accepted_game_market_rows") or 0),
+                "pages_fetched": int(dk_result.get("pages_fetched") or 0),
+                "pagination_truncated": bool(dk_result.get("pagination_truncated")),
+            })
+            dk_context_debug["matched_games"] = sum(
+                1 for game in raw_slate
+                if isinstance(game.get("market_context"), dict)
+                and game["market_context"].get("market_context_available")
+            )
+        except Exception as error:  # pragma: no cover - network/rate dependent
+            errors.append(f"full_dk_market_context_diagnostic_failed: {error!r}")
+
     slate = upcoming_mlb_slate(raw_slate) if raw_slate else []
     if not slate:
         errors.append("No upcoming MLB games available for card date.")
-
-    stats_mode = _stats_mode_active(slate)
 
     if slate:
         try:
@@ -244,6 +296,13 @@ def build_simple_mlb_card(card_date: str | None = None) -> dict:
     candidates.sort(key=lambda c: c["edge"], reverse=True)
 
     picks: list[dict[str, Any]] = []
+    attach_debug: dict[str, Any] = {
+        "attempts": 0, "success": 0, "failures": 0,
+        "failure_reasons": {
+            "game_not_matched": 0, "market_missing": 0,
+            "selection_missing": 0, "line_missing": 0, "odds_missing": 0,
+        },
+    }
 
     def _gid(cand: dict[str, Any]) -> Any:
         return cand["game"].get("game_pk") or cand["game"].get("game_id")
@@ -262,7 +321,10 @@ def build_simple_mlb_card(card_date: str | None = None) -> dict:
             scanned += 1
             if scanned <= skip:
                 continue
-            picks.append(_make_pick(selected_date, market, cand["game"], cand["team"], cand["opponent"], cand["quant"]))
+            picks.append(_make_pick(
+                selected_date, market, cand["game"], cand["team"], cand["opponent"], cand["quant"],
+                attach_debug=attach_debug,
+            ))
             out.append(picks[-1])
         return out
 
@@ -291,7 +353,7 @@ def build_simple_mlb_card(card_date: str | None = None) -> dict:
             break
         leg = _make_pick(
             selected_date, "moneyline", cand["game"], cand["team"], cand["opponent"],
-            cand["quant"], parlay_leg=True,
+            cand["quant"], parlay_leg=True, attach_debug=attach_debug,
         )
         picks.append(leg)
         parlay_legs.append(leg)
@@ -304,9 +366,6 @@ def build_simple_mlb_card(card_date: str | None = None) -> dict:
         if pick.get("sportsbook") == "draftkings" and pick.get("line_verified")
         and (pick.get("odds_american") is not None or pick.get("posted_odds") is not None)
     ]
-    matched_dk_games = {
-        str(pick.get("game_id")) for pick in verified_picks if pick.get("game_id") is not None
-    }
     live_mode = bool(verified_picks)
     card = {
         "source": SOURCE,
@@ -319,7 +378,16 @@ def build_simple_mlb_card(card_date: str | None = None) -> dict:
         "prop_book": "fanduel",
         "draftkings_lines_verified": live_mode,
         "fanduel_props_verified": False,
-        "market_context_matched_games": len(matched_dk_games),
+        "market_context_matched_games": dk_context_debug["matched_games"],
+        "dk_market_context_games_available": dk_context_debug["games_available"],
+        "dk_market_context_source": dk_context_debug["source"],
+        "dk_market_context_rows_used": dk_context_debug["rows_used"],
+        "dk_market_context_pages_fetched": dk_context_debug["pages_fetched"],
+        "dk_market_context_pagination_truncated": dk_context_debug["pagination_truncated"],
+        "dk_odds_attach_attempts": attach_debug["attempts"],
+        "dk_odds_attach_success": attach_debug["success"],
+        "dk_odds_attach_failures": attach_debug["failures"],
+        "dk_odds_attach_failure_reasons": attach_debug["failure_reasons"],
         "picks": picks,
         "parlay": [leg["id"] for leg in parlay_legs],
         "sections": {

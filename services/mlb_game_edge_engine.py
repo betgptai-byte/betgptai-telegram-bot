@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import os
+from datetime import datetime
 from typing import Any
 
 SOURCE = "mlb_game_edge_engine_v1"
@@ -47,6 +48,44 @@ def _context_for(context: dict | None, game: dict[str, Any]) -> dict[str, Any]:
     return value if isinstance(value, dict) else context if any(k in context for k in ("away", "home", "weather", "lineups")) else {}
 
 
+def _pitcher_facts(game: dict[str, Any], side: str, override: dict[str, Any]) -> dict[str, Any]:
+    stats = _dict(override.get(side)) or _dict(game.get(f"{side}_pitcher_stats"))
+    innings, strikeouts, walks = _num(stats.get("IP")), _num(stats.get("K")), _num(stats.get("BB"))
+    return {
+        "name": game.get(f"{side}_pitcher") or game.get(f"{side}_probable_pitcher") or "Starter",
+        "era": _num(stats.get("ERA") or stats.get("era")),
+        "whip": _num(stats.get("WHIP") or stats.get("whip")),
+        "fip": _num(stats.get("FIP") or stats.get("fip")),
+        "k_pct": _num(stats.get("K%") or stats.get("k_pct")),
+        "bb_pct": _num(stats.get("BB%") or stats.get("bb_pct")),
+        "k_per_9": (strikeouts * 9 / innings) if innings and strikeouts is not None else None,
+        "bb_per_9": (walks * 9 / innings) if innings and walks is not None else None,
+        "recent_era": _num(_dict(stats.get("recent") or stats.get("recent_form")).get("ERA")),
+        "split_era": _num(_dict(stats.get("home_split" if side == "home" else "away_split")).get("ERA")),
+    }
+
+
+def _offense_facts(game: dict[str, Any], side: str, savant: dict[str, Any]) -> dict[str, Any]:
+    team = _dict(savant.get(f"{side}_team")) or _dict(_dict(game.get("savant")).get(f"{side}_team"))
+    stats = _dict(game.get(f"{side}_team_stats"))
+    return {
+        "ops": _num(team.get("OPS") or stats.get("OPS")),
+        "wrc_plus": _num(team.get("wRC+") or stats.get("wRC+")),
+        "iso": _num(team.get("ISO") or stats.get("ISO")),
+        "xwoba": _num(team.get("xwOBA") or stats.get("xwOBA")),
+        "k_pct": _num(team.get("K%") or stats.get("K%")),
+    }
+
+
+def _bullpen_facts(game: dict[str, Any], side: str, override: dict[str, Any]) -> dict[str, Any]:
+    stats = _dict(override.get(side)) or _dict(game.get(f"{side}_bullpen")) or _dict(_dict(game.get("bullpen")).get(side))
+    return {
+        "era": _num(stats.get("ERA")), "whip": _num(stats.get("WHIP")),
+        "recent_workload": _num(stats.get("innings_last_3_days") or stats.get("recent_workload")),
+        "closer_available": stats.get("closer_available"),
+    }
+
+
 def _pitcher_score(game: dict[str, Any], side: str, override: dict[str, Any]) -> tuple[float, str]:
     stats = _dict(override.get(side)) or _dict(game.get(f"{side}_pitcher_stats"))
     innings = _num(stats.get("IP"))
@@ -68,8 +107,14 @@ def _pitcher_score(game: dict[str, Any], side: str, override: dict[str, Any]) ->
     split = _dict(stats.get("home_split" if side == "home" else "away_split"))
     score += _metric(split.get("ERA"), 4.15, 2.0, lower=True)
     name = game.get(f"{side}_pitcher") or game.get(f"{side}_probable_pitcher") or "Starter"
-    available = [key for key in ("ERA", "WHIP", "FIP", "IP", "H", "HR", "K", "BB") if stats.get(key) not in (None, "", "unavailable")]
-    return _clamp(score), f"{name}: {', '.join(available) if available else 'limited verified pitcher metrics'}"
+    facts = _pitcher_facts(game, side, override)
+    details = []
+    if facts["era"] is not None: details.append(f"{facts['era']:.2f} ERA")
+    if facts["whip"] is not None: details.append(f"{facts['whip']:.2f} WHIP")
+    if facts["k_pct"] is not None: details.append(f"{facts['k_pct']:.1f}% K rate")
+    elif facts["k_per_9"] is not None: details.append(f"{facts['k_per_9']:.1f} K/9")
+    if facts["bb_pct"] is not None: details.append(f"{facts['bb_pct']:.1f}% BB rate")
+    return _clamp(score), f"{name}: {', '.join(details) if details else 'starter data available, but detailed split fields incomplete'}"
 
 
 def _offense_score(game: dict[str, Any], side: str, savant: dict[str, Any]) -> tuple[float, str]:
@@ -217,6 +262,7 @@ def build_game_edge_reports(
         if not any(available.values()): red_flags.append("market_not_verified")
         if abs(away_sp - home_sp) < 4: red_flags.append("starter_volatility")
         if bp_team != selected_team and abs(away_bp - home_bp) >= 8: red_flags.append("bullpen_conflict")
+        if sum(team == selected_team for team in (sp_team, off_team, bp_team)) < 2: red_flags.append("conflicting_signals")
         if overall < 70: red_flags.append("low_edge")
 
         best_market = "pass"
@@ -247,58 +293,181 @@ def build_game_edge_reports(
         pass_reason = None
         if best_market == "pass":
             pass_reason = "Signals conflicted, lineup/market verification was incomplete, or overall edge was below 70."
+        watch_market = "f5_moneyline" if sp_team == selected_team and sp_score >= 68 else "moneyline"
+        watchlist = bool(
+            best_market == "pass" and (
+                60 <= overall < 70
+                or (sp_team == selected_team and sp_score >= 68 and (not lineup_confirmed or not any(available.values())))
+            )
+        )
+        market_lines = []
+        for market_name, market_row in available.items():
+            if not market_row:
+                continue
+            market_lines.append({
+                "market": market_name,
+                "selection": market_row.get("outcome") or market_row.get("description"),
+                "line": market_row.get("point"),
+                "odds_american": market_row.get("price") if market_row.get("price") is not None else market_row.get("odds_american"),
+            })
         key_reason = f"{sp_team} SP {sp_score}; {off_team} offense {off_score}; {bp_team} bullpen {bp_score}"
         reports.append({
             "game_id": game.get("game_id") or game.get("game_pk"), "game_pk": game.get("game_pk") or game.get("game_id"),
             "away_team": away, "home_team": home, "start_time": game.get("game_time") or game.get("start_time"),
-            "sp_edge": {"team": sp_team, "score": sp_score, "reason": f"{away_sp_reason}; {home_sp_reason}"},
-            "offense_edge": {"team": off_team, "score": off_score, "reason": "OPS vs handedness, wRC+, ISO, K%, Statcast, recent scoring, and top-lineup strength"},
-            "bullpen_edge": {"team": bp_team, "score": bp_score, "reason": "ERA/WHIP, workload, leverage usage, closer availability, and mismatch"},
+            "sp_edge": {"team": sp_team, "score": sp_score, "reason": f"{away_sp_reason}; {home_sp_reason}", "away": _pitcher_facts(game, "away", pitcher_override), "home": _pitcher_facts(game, "home", pitcher_override)},
+            "offense_edge": {"team": off_team, "score": off_score, "reason": "OPS vs handedness, wRC+, ISO, K%, Statcast, recent scoring, and top-lineup strength", "away": _offense_facts(game, "away", pitcher_override), "home": _offense_facts(game, "home", pitcher_override)},
+            "bullpen_edge": {"team": bp_team, "score": bp_score, "reason": "ERA/WHIP, workload, leverage usage, closer availability, and mismatch", "away": _bullpen_facts(game, "away", bullpen_override), "home": _bullpen_facts(game, "home", bullpen_override)},
             "weather_park_edge": weather,
             "recent_form_edge": {"team": recent_team, "score": recent_score, "reason": "Recent wins and scoring form"},
             "h2h_trend_edge": {"team": h2h_team, "score": h2h_score, "reason": "Small-weight head-to-head context"},
-            "market_value": {"market": best_market, "score": market_score, "sportsbook": "draftkings", "line_verified": market_verified, "reason": "Verified DraftKings reference" if market_verified else "No matching verified DraftKings row"},
+            "market_value": {"market": best_market, "score": market_score, "sportsbook": "draftkings", "line_verified": market_verified, "reference_lines_verified": bool(market_lines), "reason": "Verified DraftKings reference" if market_verified else "No matching verified DraftKings row", "available_lines": market_lines},
             "best_market": best_market,
             "official_pick_candidate": {"market_type": best_market, "team": selected_team, "selection": selection, "line": line, "odds_american": odds, "confidence": overall, "edge_score": overall, "source": SOURCE},
             "overall_edge_score": overall, "confidence_grade": "Elite" if overall >= 85 else "Strong" if overall >= 75 else "Lean" if overall >= 70 else "Pass",
             "key_reason": key_reason, "red_flags": red_flags, "pass_reason": pass_reason,
+            "watchlist": watchlist, "watch_market": watch_market,
         })
     return sorted(reports, key=lambda report: float(report.get("overall_edge_score") or 0), reverse=True)
 
 
-def render_game_edge_debug(reports: list[dict[str, Any]]) -> str:
-    lines = ["🧪 MLB GAME EDGE ENGINE v1", f"Reports: {len(reports)}"]
+_MARKET_LABELS = {
+    "moneyline": "ML", "f5_moneyline": "F5 ML", "runline": "RL",
+    "team_total": "Team Total", "game_total": "Game Total", "pass": "Pass",
+}
+_FLAG_LABELS = {
+    "lineup_not_confirmed": "Lineup not confirmed",
+    "low_edge": "No clear model edge",
+    "market_not_verified": "DraftKings line not verified",
+    "starter_volatility": "Starter volatility",
+    "bullpen_conflict": "Conflicting bullpen signal",
+    "conflicting_signals": "Conflicting SP/offense/bullpen signals",
+    "weather_risk": "Weather risk",
+}
+
+
+def _report_date(card_date: str | None, reports: list[dict[str, Any]]) -> str:
+    value = card_date or (str(reports[0].get("start_time") or "")[:10] if reports else "")
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").strftime("%m/%d/%Y")
+    except ValueError:
+        return value or "Date unavailable"
+
+
+def _format_sp_edge_text(report: dict[str, Any]) -> str:
+    edge = _dict(report.get("sp_edge"))
+    team = str(edge.get("team") or "Team")
+    side = "away" if team == report.get("away_team") else "home"
+    facts = _dict(edge.get(side))
+    pieces = []
+    if facts.get("era") is not None: pieces.append(f"{facts['era']:.2f} ERA")
+    if facts.get("whip") is not None: pieces.append(f"{facts['whip']:.2f} WHIP")
+    if facts.get("k_pct") is not None: pieces.append(f"{facts['k_pct']:.1f}% K rate")
+    elif facts.get("k_per_9") is not None: pieces.append(f"{facts['k_per_9']:.1f} K/9")
+    if facts.get("bb_pct") is not None: pieces.append(f"{facts['bb_pct']:.1f}% BB rate")
+    pitcher = facts.get("name") or "Starter"
+    if pieces:
+        return f"{pitcher} owns the cleaner {', '.join(pieces)} profile."
+    return f"{pitcher} has the better starter profile, but detailed split fields are incomplete."
+
+
+def _format_offense_edge_text(report: dict[str, Any]) -> str:
+    edge = _dict(report.get("offense_edge"))
+    team = str(edge.get("team") or "One offense")
+    side = "away" if team == report.get("away_team") else "home"
+    facts = _dict(edge.get(side))
+    pieces = []
+    if facts.get("ops") is not None: pieces.append(f"{facts['ops']:.3f} OPS")
+    if facts.get("wrc_plus") is not None: pieces.append(f"{facts['wrc_plus']:.0f} wRC+")
+    if facts.get("xwoba") is not None: pieces.append(f"{facts['xwoba']:.3f} xwOBA")
+    if not pieces:
+        return "Detailed offense splits are incomplete; no decisive offense edge is confirmed."
+    return f"{team} rates better in {', '.join(pieces)}."
+
+
+def _format_bullpen_edge_text(report: dict[str, Any]) -> str:
+    edge = _dict(report.get("bullpen_edge"))
+    team = str(edge.get("team") or "One bullpen")
+    side = "away" if team == report.get("away_team") else "home"
+    facts = _dict(edge.get(side))
+    pieces = []
+    if facts.get("era") is not None: pieces.append(f"{facts['era']:.2f} ERA")
+    if facts.get("whip") is not None: pieces.append(f"{facts['whip']:.2f} WHIP")
+    if not pieces:
+        return "Bullpen detail is limited; no decisive relief edge is confirmed."
+    return f"{team} has the stronger bullpen profile ({', '.join(pieces)})."
+
+
+def _format_market_text(report: dict[str, Any]) -> str:
+    market = _dict(report.get("market_value"))
+    lines = market.get("available_lines") if isinstance(market.get("available_lines"), list) else []
+    formatted = []
+    for row in lines[:4]:
+        odds = _num(row.get("odds_american"))
+        odds_text = f" ({int(odds):+d})" if odds is not None else ""
+        label = _MARKET_LABELS.get(str(row.get("market")), str(row.get("market") or "Market"))
+        point = f" {float(row['line']):+g}" if row.get("line") is not None and row.get("market") == "runline" else ""
+        formatted.append(f"{row.get('selection')} {label}{point}{odds_text}")
+    verified = "verified" if market.get("reference_lines_verified") else "not verified"
+    return f"DraftKings line: {verified}. Best available: {', '.join(formatted) if formatted else 'No matching reference line'}."
+
+
+def _format_watchouts(report: dict[str, Any]) -> str:
+    return "; ".join(_FLAG_LABELS.get(flag, str(flag).replace("_", " ").title()) for flag in report.get("red_flags") or []) or "No major watchouts"
+
+
+def _format_decision_text(report: dict[str, Any]) -> str:
+    candidate = _dict(report.get("official_pick_candidate"))
+    market = str(report.get("best_market") or "pass")
+    if market == "pass":
+        return f"PASS — {report.get('pass_reason') or 'signals do not align clearly enough.'}"
+    return f"✅ {candidate.get('team')} {_MARKET_LABELS.get(market, market.title())} — {report.get('key_reason')}"
+
+
+def render_game_edge_debug(reports: list[dict[str, Any]], card_date: str | None = None) -> str:
+    lines = ["🧪 MLB GAME EDGE REPORT", f"📅 {_report_date(card_date, reports)}", f"Reports: {len(reports)}"]
     for report in reports:
         candidate = _dict(report.get("official_pick_candidate"))
+        best_market = str(report.get("best_market") or "pass")
+        lean_market = report.get("watch_market") if best_market == "pass" else best_market
         lines.extend([
-            "", f"Game: {report.get('away_team')} @ {report.get('home_team')}",
-            f"SP Edge: {_dict(report.get('sp_edge')).get('team')} — {_dict(report.get('sp_edge')).get('score')} — {_dict(report.get('sp_edge')).get('reason')}",
-            f"Offense Edge: {_dict(report.get('offense_edge')).get('team')} — {_dict(report.get('offense_edge')).get('score')} — {_dict(report.get('offense_edge')).get('reason')}",
-            f"Bullpen Edge: {_dict(report.get('bullpen_edge')).get('team')} — {_dict(report.get('bullpen_edge')).get('score')} — {_dict(report.get('bullpen_edge')).get('reason')}",
-            f"Weather/Park: {_dict(report.get('weather_park_edge')).get('side')} — {_dict(report.get('weather_park_edge')).get('score')} — {_dict(report.get('weather_park_edge')).get('reason')}",
-            f"Market Value: {_dict(report.get('market_value')).get('score')} — verified={_dict(report.get('market_value')).get('line_verified')} — {_dict(report.get('market_value')).get('reason')}",
-            f"Best Market: {report.get('best_market')}",
-            f"Candidate Pick: {candidate.get('selection')} — {candidate.get('market_type')} — {candidate.get('odds_american')}",
-            f"Confidence: {candidate.get('confidence')} ({report.get('confidence_grade')})",
-            f"Red Flags: {', '.join(report.get('red_flags') or []) or 'None'}",
-            f"Pass Reason: {report.get('pass_reason') or 'None'}",
+            "", "━━━━━━━━━━━━━━",
+            f"{report.get('away_team')} @ {report.get('home_team')}",
+            f"Lean: {candidate.get('team')} {_MARKET_LABELS.get(str(lean_market), 'ML')} Watch",
+            f"Best Market: {_MARKET_LABELS.get(best_market, best_market.title())}",
+            f"• SP edge: {_format_sp_edge_text(report)}",
+            f"• Offense: {_format_offense_edge_text(report)}",
+            f"• Bullpen: {_format_bullpen_edge_text(report)}",
+            f"Market: {_format_market_text(report)}",
+            f"Watchouts: {_format_watchouts(report)}",
+            f"Decision: {_format_decision_text(report)}",
         ])
-    lines.extend(["", "TOP 5 OVERALL EDGE REPORTS"])
-    for index, report in enumerate(reports[:5], start=1):
-        candidate = _dict(report.get("official_pick_candidate"))
-        lines.append(f"{index}. {candidate.get('selection')} — {report.get('best_market')} — {report.get('overall_edge_score')} — {report.get('key_reason')}")
     return "\n".join(lines).strip()
 
 
-def render_game_edge_summary(reports: list[dict[str, Any]]) -> str:
-    lines = ["⚾ MLB GAME EDGE SUMMARY"]
+def render_game_edge_summary(reports: list[dict[str, Any]], card_date: str | None = None) -> str:
     qualified = [report for report in reports if report.get("best_market") != "pass"]
-    for index, report in enumerate(qualified[:10], start=1):
-        candidate = _dict(report.get("official_pick_candidate"))
-        lines.append(
-            f"{index}. {candidate.get('selection')} — {report.get('best_market')} — "
-            f"{report.get('overall_edge_score')} — {report.get('key_reason')}"
-        )
-    if not qualified:
-        lines.append("No games cleared the 70-point qualification and verification gates.")
+    watchlist = [report for report in reports if report.get("watchlist")]
+    passed = [report for report in reports if report.get("best_market") == "pass" and not report.get("watchlist")]
+    lines = ["⚾ MLB EDGE SUMMARY", f"📅 {_report_date(card_date, reports)}", "", "✅ Qualified Picks"]
+    if qualified:
+        for index, report in enumerate(qualified[:10], start=1):
+            candidate = _dict(report.get("official_pick_candidate"))
+            lines.extend([f"{index}. {candidate.get('team')} — {_MARKET_LABELS.get(str(report.get('best_market')), 'Pick')}", "   Why: SP/offense/bullpen edge with a verified DraftKings reference."])
+    else:
+        lines.append("- None")
+    lines.extend(["", "👀 Watchlist"])
+    if watchlist:
+        for index, report in enumerate(watchlist[:10], start=1):
+            candidate = _dict(report.get("official_pick_candidate"))
+            lines.extend([f"{index}. {candidate.get('team')} — {_MARKET_LABELS.get(str(report.get('watch_market')), 'ML')} Watch", f"   Why: {_format_watchouts(report)}."])
+    else:
+        lines.append("- None")
+    reason_counts: dict[str, int] = {}
+    for report in passed:
+        for flag in report.get("red_flags") or []:
+            reason_counts[flag] = reason_counts.get(flag, 0) + 1
+    lines.extend(["", "🚫 Passed Games", f"Passes: {len(passed)}", "Main reasons:"])
+    for flag, _ in sorted(reason_counts.items(), key=lambda item: item[1], reverse=True)[:3]:
+        lines.append(f"• {_FLAG_LABELS.get(flag, flag.replace('_', ' ').title())}")
+    if not reason_counts: lines.append("• None")
     return "\n".join(lines).strip()

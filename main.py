@@ -5005,9 +5005,13 @@ async def simple_card_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "",
             f"Game Edge Engine: {'ON' if card.get('game_edge_engine_on') else 'OFF'}",
             f"Reports generated: {card.get('game_edge_reports_generated', 0)}",
-            f"Pass games: {card.get('game_edge_pass_games', 0)}",
             f"Qualified picks: {card.get('game_edge_qualified_picks', 0)}",
-            f"Top edge: {((card.get('game_edge_top') or {}).get('official_pick_candidate') or {}).get('selection') or 'None'} — {(card.get('game_edge_top') or {}).get('overall_edge_score')}",
+            f"Watchlist: {card.get('game_edge_watchlist', 0)}",
+            f"Passed games: {card.get('game_edge_pass_games', 0)}",
+            "Main pass reasons:",
+            f"- Lineup not confirmed: {(card.get('game_edge_pass_reason_counts') or {}).get('lineup_not_confirmed', 0)}",
+            f"- DraftKings market not verified: {(card.get('game_edge_pass_reason_counts') or {}).get('market_not_verified', 0)}",
+            f"- Conflicting signals: {(card.get('game_edge_pass_reason_counts') or {}).get('conflicting_signals', 0)}",
             "Best market distribution:",
             f"- ML: {(card.get('game_edge_market_distribution') or {}).get('moneyline', 0)}",
             f"- F5: {(card.get('game_edge_market_distribution') or {}).get('f5_moneyline', 0)}",
@@ -5041,8 +5045,9 @@ async def game_edge_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     try:
         from services.mlb_game_edge_engine import render_game_edge_debug
-        card = await asyncio.to_thread(build_simple_mlb_card, official_sports_date().isoformat())
-        await _send_long_message(update, render_game_edge_debug(card.get("game_edge_reports") or []))
+        selected_date = official_sports_date().isoformat()
+        card = await asyncio.to_thread(build_simple_mlb_card, selected_date)
+        await _send_long_message(update, render_game_edge_debug(card.get("game_edge_reports") or [], selected_date))
     except Exception as error:
         logging.exception("/game_edge_debug failed")
         await update.message.reply_text(f"❌ Game edge debug failed:\n{error!r}")
@@ -5055,8 +5060,9 @@ async def game_edge_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     try:
         from services.mlb_game_edge_engine import render_game_edge_summary
-        card = await asyncio.to_thread(build_simple_mlb_card, official_sports_date().isoformat())
-        await _send_long_message(update, render_game_edge_summary(card.get("game_edge_reports") or []))
+        selected_date = official_sports_date().isoformat()
+        card = await asyncio.to_thread(build_simple_mlb_card, selected_date)
+        await _send_long_message(update, render_game_edge_summary(card.get("game_edge_reports") or [], selected_date))
     except Exception as error:
         logging.exception("/game_edge_summary failed")
         await update.message.reply_text(f"❌ Game edge summary failed:\n{error!r}")

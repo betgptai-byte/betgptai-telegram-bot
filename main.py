@@ -3911,6 +3911,10 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
     sb_counts: dict[str, int] = payload.get("sportsbook_game_counts") or {}
     lines = [
         "🧪 BETGPTAI ODDS DEBUG",
+        f"Parsed sport: {payload.get('parsed_sport', sport)}",
+        f"Parsed league: {payload.get('parsed_league') or 'None'}",
+        f"Parsed flags: {', '.join(payload.get('parsed_flags') or []) or 'None'}",
+        f"Include Started: {'YES' if payload.get('include_started') else 'NO'}",
         f"📅 Requested Date: {event_date}",
         f"Requested Card Date ET: {payload.get('requested_card_date_et', event_date)}",
         f"UTC Query Window: {payload.get('utc_query_window') or 'N/A'}",
@@ -3925,6 +3929,7 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
         f"Cache age: {cache_str}",
         f"Cache fresh: {'yes' if sharp.get('cache_fresh') else 'no'}",
         f"Sportsbook used: {active_sb or 'none'}",
+        f"Sharp League: {payload.get('sharp_league') or 'none'}",
     ]
     if sb_counts:
         for sb_name, sb_count in sb_counts.items():
@@ -4010,6 +4015,46 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
     return "\n".join(lines).strip()
 
 
+def _parse_debug_command_args(args: list[str], *, allow_league: bool = True) -> dict[str, Any]:
+    """Separate debug positional values from flags without cross-contamination."""
+    supported = {"mlb", "soccer", "nba", "nfl", "nhl"}
+    sport = "mlb"
+    index = 0
+    if args and args[0].strip().lower() in supported:
+        sport = args[0].strip().lower()
+        index = 1
+    include_started = False
+    event_date: str | None = None
+    flags: list[str] = []
+    league_parts: list[str] = []
+    while index < len(args):
+        token = args[index].strip()
+        if token == "--include-started":
+            include_started = True
+            flags.append(token)
+        elif token == "--date":
+            flags.append(token)
+            if index + 1 < len(args) and not args[index + 1].startswith("--"):
+                event_date = args[index + 1].strip()
+                index += 1
+        elif token.startswith("--date="):
+            flags.append("--date")
+            event_date = token.split("=", 1)[1].strip()
+        elif token.startswith("--"):
+            flags.append(token)
+        elif re.fullmatch(r"\d{4}-\d{2}-\d{2}", token):
+            event_date = token  # backward-compatible positional date
+        elif allow_league:
+            league_parts.append(token)
+        index += 1
+    league = " ".join(league_parts).strip() or None
+    if league and league.startswith("--"):
+        league = None
+    if sport == "mlb":
+        league = None
+    return {"sport": sport, "league": league, "event_date": event_date, "include_started": include_started, "flags": flags}
+
+
 async def odds_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner-only: inspect odds provider fetch and game matching per sport.
 
@@ -4023,26 +4068,17 @@ async def odds_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     if not update.message:
         return
-    sport = "mlb"
-    league: str | None = None
-    event_date: str | None = None
-    args = context.args or []
-    if args:
-        if args[0].strip().lower() in ("mlb", "soccer", "nba", "nfl", "nhl"):
-            sport = args[0].strip().lower()
-    rest = args[1:] if len(args) > 1 else []
-    if rest:
-        import re
-        date_candidates: list[str] = []
-        league_parts: list[str] = []
-        for token in rest:
-            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", token):
-                date_candidates.append(token)
-            else:
-                league_parts.append(token)
-        league = " ".join(league_parts).strip() or None
-        if date_candidates:
-            event_date = date_candidates[-1]
+    parsed = _parse_debug_command_args(list(context.args or []))
+    sport = parsed["sport"]
+    league = parsed["league"]
+    event_date = parsed["event_date"]
+    include_started = bool(parsed["include_started"])
+    if event_date:
+        try:
+            datetime.strptime(event_date, "%Y-%m-%d")
+        except ValueError:
+            await update.message.reply_text("Invalid --date. Use YYYY-MM-DD.")
+            return
     selected_date = event_date or official_sports_date().isoformat()
     sport_label = sport.upper() if sport != "mlb" else "MLB"
     if league:
@@ -4058,6 +4094,8 @@ async def odds_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             sport,
             league,
             event_date,
+            include_started,
+            parsed["flags"],
         )
         await _send_long_message(update, _render_odds_debug_payload(payload, selected_date))
     except Exception as error:
@@ -4723,14 +4761,9 @@ async def card_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     if not update.message:
         return
-    args = context.args or []
-    include_started = "--include-started" in args
-    selected_date = official_sports_date().isoformat()
-    for idx, arg in enumerate(args):
-        if arg == "--date" and idx + 1 < len(args):
-            selected_date = args[idx + 1]
-        elif arg.startswith("--date="):
-            selected_date = arg.split("=", 1)[1]
+    parsed = _parse_debug_command_args(list(context.args or []), allow_league=False)
+    include_started = bool(parsed["include_started"])
+    selected_date = parsed["event_date"] or official_sports_date().isoformat()
     try:
         datetime.strptime(selected_date, "%Y-%m-%d")
     except ValueError:

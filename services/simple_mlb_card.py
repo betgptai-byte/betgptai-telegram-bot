@@ -341,8 +341,8 @@ def build_simple_mlb_card(card_date: str | None = None) -> dict:
         market_candidates = sorted(
             candidates,
             key=lambda cand: (
-                str((cand.get("edge_report") or {}).get("best_market") or "") == market,
-                str((cand.get("edge_report") or {}).get("best_market") or "") != "pass",
+                True if market == "play_of_day" else str((cand.get("edge_report") or {}).get("best_market") or "") == market,
+                {"qualified": 2, "watchlist": 1, "pass": 0}.get(str((cand.get("edge_report") or {}).get("qualification_status") or "pass"), 0),
                 cand["edge"],
             ),
             reverse=True,
@@ -350,6 +350,10 @@ def build_simple_mlb_card(card_date: str | None = None) -> dict:
         for cand in market_candidates:
             if len(out) >= n:
                 break
+            report = cand.get("edge_report") if isinstance(cand.get("edge_report"), dict) else {}
+            if market == "play_of_day" and edge_engine_on:
+                if report.get("qualification_status") != "qualified" or float(report.get("overall_edge_score") or 0) < 80:
+                    continue
             if exclude and _gid(cand) in exclude:
                 continue
             if require_min_edge and cand["edge"] <= 0:
@@ -403,16 +407,20 @@ def build_simple_mlb_card(card_date: str | None = None) -> dict:
         and (pick.get("odds_american") is not None or pick.get("posted_odds") is not None)
     ]
     live_mode = bool(verified_picks)
-    watch_reports = [report for report in edge_reports if report.get("watchlist")]
+    watch_reports = [report for report in edge_reports if report.get("qualification_status") == "watchlist"]
     passed_reports = [
         report for report in edge_reports
-        if report.get("best_market") == "pass" and not report.get("watchlist")
+        if report.get("qualification_status") == "pass"
     ]
     pass_games = len(passed_reports)
-    qualified_reports = [report for report in edge_reports if report.get("best_market") != "pass"]
+    qualified_reports = [report for report in edge_reports if report.get("qualification_status") == "qualified"]
+    edge_warning = None
+    if edge_engine_on and not qualified_reports and picks:
+        edge_warning = "Game Edge Engine produced zero qualified picks; using simple fallback."
+        errors.append(edge_warning)
     pass_reason_counts: dict[str, int] = {}
     for report in edge_reports:
-        if report.get("best_market") != "pass":
+        if report.get("qualification_status") != "pass":
             continue
         for reason in report.get("red_flags") or []:
             pass_reason_counts[str(reason)] = pass_reason_counts.get(str(reason), 0) + 1
@@ -449,6 +457,7 @@ def build_simple_mlb_card(card_date: str | None = None) -> dict:
         "game_edge_top": edge_reports[0] if edge_reports else None,
         "game_edge_market_distribution": market_distribution,
         "game_edge_pass_reason_counts": pass_reason_counts,
+        "game_edge_warning": edge_warning,
         "game_edge_reports": edge_reports,
         "picks": picks,
         "parlay": [leg["id"] for leg in parlay_legs],

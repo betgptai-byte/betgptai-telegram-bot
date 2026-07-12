@@ -5068,6 +5068,21 @@ async def game_edge_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text(f"❌ Game edge summary failed:\n{error!r}")
 
 
+async def game_edge_data_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only per-game API and market availability diagnostics."""
+    del context
+    if not await _require_admin(update) or not update.message:
+        return
+    try:
+        from services.mlb_game_edge_engine import render_game_edge_data_debug
+        selected_date = official_sports_date().isoformat()
+        card = await asyncio.to_thread(build_simple_mlb_card, selected_date)
+        await _send_long_message(update, render_game_edge_data_debug(card.get("game_edge_reports") or [], selected_date))
+    except Exception as error:
+        logging.exception("/game_edge_data_debug failed")
+        await update.message.reply_text(f"❌ Game edge data debug failed:\n{error!r}")
+
+
 async def simple_generate_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner-only: build and save today's simple MLB card."""
     del context
@@ -6661,6 +6676,7 @@ async def main() -> None:
     print("Registered command: /simple_card_debug", flush=True)
     application.add_handler(CommandHandler("game_edge_debug", game_edge_debug))
     application.add_handler(CommandHandler("game_edge_summary", game_edge_summary))
+    application.add_handler(CommandHandler("game_edge_data_debug", game_edge_data_debug))
     application.add_handler(CommandHandler("simple_generate_today", simple_generate_today))
     SYSTEM_LOG.info("Registered command: /simple_generate_today")
     print("Registered command: /simple_generate_today", flush=True)

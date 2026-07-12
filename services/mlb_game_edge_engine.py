@@ -173,7 +173,7 @@ def _dk_rows(game: dict[str, Any], override: dict[str, Any]) -> list[dict[str, A
     return [row for row in rows or [] if isinstance(row, dict) and str(row.get("bookmaker_key") or row.get("bookmaker") or "").lower() == "draftkings"]
 
 
-def _market_row(rows: list[dict[str, Any]], market: str, team: str) -> dict[str, Any] | None:
+def _market_row(rows: list[dict[str, Any]], market: str, team: str, direction: str | None = None) -> dict[str, Any] | None:
     from api.sharp_client import _normalize_team
     aliases = {"moneyline": "h2h", "f5_moneyline": "f5_h2h", "runline": "spreads", "game_total": "totals", "team_total": "team_totals"}
     target = _normalize_team(team)
@@ -181,6 +181,8 @@ def _market_row(rows: list[dict[str, Any]], market: str, team: str) -> dict[str,
         if str(row.get("market") or "").lower() != aliases[market]:
             continue
         outcome = str(row.get("outcome") or row.get("description") or "")
+        if direction and not outcome.lower().startswith(direction.lower()):
+            continue
         if market not in {"game_total"} and target not in _normalize_team(outcome):
             continue
         if row.get("price") is None and row.get("odds_american") is None:
@@ -211,7 +213,6 @@ def build_game_edge_reports(
         "weather": _weight("MLB_EDGE_WEIGHT_WEATHER", 10), "market": _weight("MLB_EDGE_WEIGHT_MARKET", 10),
         "h2h": _weight("MLB_EDGE_WEIGHT_H2H", 5), "situational": _weight("MLB_EDGE_WEIGHT_SITUATIONAL", 5),
     }
-    total_weight = sum(weights.values()) or 100.0
     reports: list[dict[str, Any]] = []
     for game in slate:
         away, home = str(game.get("away_team") or ""), str(game.get("home_team") or "")
@@ -237,69 +238,124 @@ def build_game_edge_reports(
         situational_home = _clamp(52 + ((_num(game.get("home_days_rest")) or 0) - (_num(game.get("away_days_rest")) or 0)) * 2)
         rows = _dk_rows(game, _context_for(market_context, game))
 
-        team_scores: dict[str, float] = {}
-        for team, side in ((away, "away"), (home, "home")):
-            values = {
-                "sp": away_sp if side == "away" else home_sp,
-                "offense": away_off if side == "away" else home_off,
-                "bullpen": away_bp if side == "away" else home_bp,
-                "recent": away_recent if side == "away" else home_recent,
-                "weather": 50.0,
-                "market": 62.0 if _market_row(rows, "moneyline", team) else 40.0,
-                "h2h": h2h_score if h2h_team == team else 100 - h2h_score,
-                "situational": situational_home if side == "home" else 100 - situational_home,
-            }
-            team_scores[team] = _clamp(sum(values[k] * weights[k] for k in weights) / total_weight)
-        selected_team = max(team_scores, key=team_scores.get)
-        overall = team_scores[selected_team]
-        available = {market: _market_row(rows, market, selected_team) for market in ("moneyline", "f5_moneyline", "runline", "game_total", "team_total")}
         lineup = _context_for(lineup_context, game) or _dict(game.get("lineups"))
         lineup_text = str(game.get("lineups") or lineup.get("status") or "").lower()
         lineup_confirmed = bool(lineup) and ("confirmed" in lineup_text or lineup.get("confirmed") is True)
+        savant_data = _dict(game.get("savant")) or pitcher_override
+        team_stats_available = any(
+            isinstance(game.get(key), dict) and bool(game.get(key))
+            for key in ("away_team_stats", "home_team_stats")
+        ) or any(isinstance(savant_data.get(key), dict) and bool(savant_data.get(key)) for key in ("away_team", "home_team"))
+        bullpen_available = any(
+            any(value is not None for value in _bullpen_facts(game, side, bullpen_override).values())
+            for side in ("away", "home")
+        )
+        data_available = {
+            "mlb_stats": bool(game.get("game_pk") or game.get("game_id")) and bool(away and home),
+            "sharp_dk": bool(rows), "savant": bool(savant_data),
+            "team_stats": team_stats_available, "bullpen": bullpen_available,
+            "weather": isinstance(game.get("weather"), dict) and bool(game.get("weather")),
+            "lineup": lineup_confirmed,
+        }
+
+        # Rank the side by comparative advantages. Neutral/missing components
+        # contribute zero rather than forcing a pass.
+        directional_weight = weights["sp"] + weights["offense"] + weights["bullpen"] + weights["recent"] + weights["h2h"] + weights["situational"] or 1.0
+        net_home = (
+            (home_sp - away_sp) * weights["sp"]
+            + (home_off - away_off) * weights["offense"]
+            + (home_bp - away_bp) * weights["bullpen"]
+            + (home_recent - away_recent) * weights["recent"]
+            + ((h2h_score - 50) if h2h_team == home else -(h2h_score - 50)) * weights["h2h"]
+            + (situational_home - 50) * weights["situational"]
+        ) / directional_weight
+        selected_team = home if net_home >= 0 else away
+        selected_side = "home" if selected_team == home else "away"
+        selected_sp = home_sp if selected_side == "home" else away_sp
+        selected_bp = home_bp if selected_side == "home" else away_bp
+        selected_off = home_off if selected_side == "home" else away_off
+        opponent_sp = away_sp if selected_side == "home" else home_sp
+        opponent_bp = away_bp if selected_side == "home" else home_bp
+        gaps = {"sp": abs(home_sp - away_sp), "offense": abs(home_off - away_off), "bullpen": abs(home_bp - away_bp), "recent": abs(home_recent - away_recent)}
+        supporting = [
+            team for team, gap in ((sp_team, gaps["sp"]), (off_team, gaps["offense"]), (bp_team, gaps["bullpen"]))
+            if gap >= 3
+        ]
+        consensus = sum(team == selected_team for team in supporting)
+        quant = _dict(game.get("betgptai_quant_v21") or game.get("betgptai_quant_v20") or game.get("betgptai_internal"))
+        quant_score = _num(quant.get("final_edge_score")) or 50.0
+        missing_penalty = sum(not data_available[key] for key in ("savant", "team_stats", "bullpen", "weather")) * 1.25
+        overall = _clamp(
+            55 + abs(net_home) * 1.2 + max(0, consensus - 1) * 3
+            + max(-3, min(6, (quant_score - 50) * .20))
+            - missing_penalty - (0 if lineup_confirmed else 2)
+        )
+        total_direction = "over" if away_sp <= 46 and home_sp <= 46 and weather["side"] == "over" else "under" if away_sp >= 62 and home_sp >= 62 and weather["side"] == "under" else None
+        if total_direction == "over":
+            total_confidence = 55 + max(0, 50 - away_sp) * .30 + max(0, 50 - home_sp) * .30 + max(0, weather["score"] - 50) * .30
+            overall = max(overall, _clamp(total_confidence))
+        elif total_direction == "under":
+            total_confidence = 55 + max(0, away_sp - 55) * .25 + max(0, home_sp - 55) * .25 + max(0, 50 - weather["score"]) * .30
+            overall = max(overall, _clamp(total_confidence))
+        available = {
+            "moneyline": _market_row(rows, "moneyline", selected_team),
+            "f5_moneyline": _market_row(rows, "f5_moneyline", selected_team),
+            "runline": _market_row(rows, "runline", selected_team),
+            "game_total": _market_row(rows, "game_total", selected_team, total_direction) if total_direction else None,
+            "team_total": _market_row(rows, "team_total", selected_team),
+        }
+        available_markets = [market for market, row in available.items() if row]
+        all_markets = ["moneyline", "f5_moneyline", "runline", "game_total", "team_total"]
+        missing_markets = [market for market in all_markets if market not in available_markets]
         red_flags: list[str] = []
         if not lineup_confirmed: red_flags.append("lineup_not_confirmed")
         if weather["score"] <= 35: red_flags.append("weather_risk")
         if not any(available.values()): red_flags.append("market_not_verified")
         if abs(away_sp - home_sp) < 4: red_flags.append("starter_volatility")
         if bp_team != selected_team and abs(away_bp - home_bp) >= 8: red_flags.append("bullpen_conflict")
-        if sum(team == selected_team for team in (sp_team, off_team, bp_team)) < 2: red_flags.append("conflicting_signals")
-        if overall < 70: red_flags.append("low_edge")
+        if supporting and consensus < max(1, len(supporting) // 2): red_flags.append("conflicting_signals")
+        if overall < 55: red_flags.append("low_edge")
 
         best_market = "pass"
-        if overall >= 70 and lineup_confirmed and weather["score"] > 35:
-            selected_sp = home_sp if selected_team == home else away_sp
-            selected_bp = home_bp if selected_team == home else away_bp
-            selected_off = home_off if selected_team == home else away_off
-            if selected_sp >= 68 and selected_bp < 55 and available["f5_moneyline"]:
-                best_market = "f5_moneyline"
-            elif selected_off >= 78 and available["team_total"]:
-                best_market = "team_total"
-            elif selected_off >= 75 and selected_bp >= 58 and available["runline"]:
-                best_market = "runline"
-            elif sp_team == selected_team and bp_team == selected_team and off_team == selected_team and available["moneyline"]:
-                best_market = "moneyline"
-            elif weather["side"] != "neutral" and available["game_total"]:
+        strongest_factor = max(gaps, key=gaps.get)
+        if overall >= 55 and weather["score"] > 30 and available_markets:
+            if total_direction and available["game_total"]:
                 best_market = "game_total"
+            elif strongest_factor == "sp" and sp_team == selected_team and available["f5_moneyline"]:
+                best_market = "f5_moneyline"
+            elif sp_team == selected_team and bp_team == selected_team and available["moneyline"]:
+                best_market = "moneyline"
+            elif strongest_factor == "offense" and off_team == selected_team and opponent_bp <= 47 and available["runline"]:
+                best_market = "runline"
+            elif strongest_factor == "offense" and off_team == selected_team and available["team_total"]:
+                best_market = "team_total"
             elif available["moneyline"]:
                 best_market = "moneyline"
-            elif overall >= 75:
-                best_market = "moneyline"  # stats-first fallback; line stays unverified
+            elif available["f5_moneyline"]:
+                best_market = "f5_moneyline"
+            elif available["team_total"]:
+                best_market = "team_total"
+            elif available["runline"]:
+                best_market = "runline"
+            elif available["game_total"]:
+                best_market = "game_total"
         row = available.get(best_market) if best_market != "pass" else None
         odds = row.get("price") if row and row.get("price") is not None else row.get("odds_american") if row else None
         line = row.get("point") if row else None
         selection = str(row.get("outcome") or row.get("description") or selected_team) if row else selected_team
         market_verified = bool(row and odds is not None and (best_market not in {"runline", "game_total", "team_total"} or line is not None))
-        market_score = 70.0 if market_verified else 35.0
+        market_score = 70.0 if market_verified or available_markets else 35.0
+        thresholds = {"moneyline": 65, "f5_moneyline": 62, "runline": 65, "game_total": 62, "team_total": 62}
+        qualified = bool(best_market != "pass" and overall >= thresholds.get(best_market, 65))
+        watchlist = bool(best_market != "pass" and not qualified and overall >= 55)
+        qualification_status = "qualified" if qualified else "watchlist" if watchlist else "pass"
         pass_reason = None
         if best_market == "pass":
-            pass_reason = "Signals conflicted, lineup/market verification was incomplete, or overall edge was below 70."
-        watch_market = "f5_moneyline" if sp_team == selected_team and sp_score >= 68 else "moneyline"
-        watchlist = bool(
-            best_market == "pass" and (
-                60 <= overall < 70
-                or (sp_team == selected_team and sp_score >= 68 and (not lineup_confirmed or not any(available.values())))
-            )
-        )
+            if not available_markets: pass_reason = "No usable verified DraftKings market was available."
+            elif overall < 55: pass_reason = "No side produced a clear statistical edge above the minimum confidence floor."
+            elif weather["score"] <= 30: pass_reason = "Weather creates major uncertainty."
+            else: pass_reason = "SP, offense, and bullpen signals conflict too severely."
+        watch_market = best_market if best_market != "pass" else ("f5_moneyline" if sp_team == selected_team and available.get("f5_moneyline") else "moneyline")
         market_lines = []
         for market_name, market_row in available.items():
             if not market_row:
@@ -310,7 +366,13 @@ def build_game_edge_reports(
                 "line": market_row.get("point"),
                 "odds_american": market_row.get("price") if market_row.get("price") is not None else market_row.get("odds_american"),
             })
-        key_reason = f"{sp_team} SP {sp_score}; {off_team} offense {off_score}; {bp_team} bullpen {bp_score}"
+        per_market_value = {
+            market: {"available": bool(available.get(market)), "score": 70.0 if available.get(market) else None}
+            for market in all_markets
+        }
+        key_reason = (
+            f"Starter edge favors {sp_team}; offense favors {off_team}; bullpen favors {bp_team}."
+        )
         reports.append({
             "game_id": game.get("game_id") or game.get("game_pk"), "game_pk": game.get("game_pk") or game.get("game_id"),
             "away_team": away, "home_team": home, "start_time": game.get("game_time") or game.get("start_time"),
@@ -320,12 +382,14 @@ def build_game_edge_reports(
             "weather_park_edge": weather,
             "recent_form_edge": {"team": recent_team, "score": recent_score, "reason": "Recent wins and scoring form"},
             "h2h_trend_edge": {"team": h2h_team, "score": h2h_score, "reason": "Small-weight head-to-head context"},
-            "market_value": {"market": best_market, "score": market_score, "sportsbook": "draftkings", "line_verified": market_verified, "reference_lines_verified": bool(market_lines), "reason": "Verified DraftKings reference" if market_verified else "No matching verified DraftKings row", "available_lines": market_lines},
+            "market_value": {"market": best_market, "score": market_score, "sportsbook": "draftkings", "line_verified": market_verified, "reference_lines_verified": bool(market_lines), "reason": "Verified DraftKings reference" if market_verified else "Other usable DraftKings markets are available" if market_lines else "No matching verified DraftKings row", "available_lines": market_lines, "per_market": per_market_value},
+            "available_markets": available_markets, "missing_markets": missing_markets,
+            "data_available": data_available,
             "best_market": best_market,
-            "official_pick_candidate": {"market_type": best_market, "team": selected_team, "selection": selection, "line": line, "odds_american": odds, "confidence": overall, "edge_score": overall, "source": SOURCE},
-            "overall_edge_score": overall, "confidence_grade": "Elite" if overall >= 85 else "Strong" if overall >= 75 else "Lean" if overall >= 70 else "Pass",
+            "official_pick_candidate": {"market_type": best_market, "team": selected_team, "selection": selection, "line": line, "odds_american": odds, "confidence": overall, "edge_score": overall, "source": SOURCE, "qualified": qualified, "watchlist_only": watchlist},
+            "overall_edge_score": overall, "confidence_grade": "Elite" if overall >= 85 else "Strong" if overall >= 75 else "Lean" if overall >= 55 else "Pass",
             "key_reason": key_reason, "red_flags": red_flags, "pass_reason": pass_reason,
-            "watchlist": watchlist, "watch_market": watch_market,
+            "watchlist": watchlist, "watch_market": watch_market, "qualification_status": qualification_status,
         })
     return sorted(reports, key=lambda report: float(report.get("overall_edge_score") or 0), reverse=True)
 
@@ -415,12 +479,36 @@ def _format_watchouts(report: dict[str, Any]) -> str:
     return "; ".join(_FLAG_LABELS.get(flag, str(flag).replace("_", " ").title()) for flag in report.get("red_flags") or []) or "No major watchouts"
 
 
+def _format_data_used(report: dict[str, Any]) -> str:
+    data = _dict(report.get("data_available"))
+    labels = (("mlb_stats", "MLB"), ("sharp_dk", "DK"), ("savant", "Savant"), ("team_stats", "team stats"), ("bullpen", "bullpen"), ("weather", "weather"), ("lineup", "lineup"))
+    return ", ".join(label for key, label in labels if data.get(key)) or "MLB schedule only"
+
+
 def _format_decision_text(report: dict[str, Any]) -> str:
     candidate = _dict(report.get("official_pick_candidate"))
     market = str(report.get("best_market") or "pass")
     if market == "pass":
         return f"PASS — {report.get('pass_reason') or 'signals do not align clearly enough.'}"
+    if report.get("qualification_status") == "watchlist":
+        return f"👀 {candidate.get('team')} {_MARKET_LABELS.get(market, market.title())} Watch — {_format_watchouts(report)}"
     return f"✅ {candidate.get('team')} {_MARKET_LABELS.get(market, market.title())} — {report.get('key_reason')}"
+
+
+def _format_summary_why(report: dict[str, Any]) -> str:
+    candidate = _dict(report.get("official_pick_candidate"))
+    team = candidate.get("team")
+    data = _dict(report.get("data_available"))
+    reasons = []
+    if _dict(report.get("sp_edge")).get("team") == team:
+        reasons.append("SP edge")
+    if data.get("team_stats") and _dict(report.get("offense_edge")).get("team") == team:
+        reasons.append("offense vs handedness")
+    if data.get("bullpen") and _dict(report.get("bullpen_edge")).get("team") == team:
+        reasons.append("bullpen support")
+    if _dict(report.get("market_value")).get("line_verified"):
+        reasons.append("DK line verified")
+    return " + ".join(reasons) or "Best available API signals support the lean"
 
 
 def render_game_edge_debug(reports: list[dict[str, Any]], card_date: str | None = None) -> str:
@@ -432,8 +520,8 @@ def render_game_edge_debug(reports: list[dict[str, Any]], card_date: str | None 
         lines.extend([
             "", "━━━━━━━━━━━━━━",
             f"{report.get('away_team')} @ {report.get('home_team')}",
-            f"Lean: {candidate.get('team')} {_MARKET_LABELS.get(str(lean_market), 'ML')} Watch",
-            f"Best Market: {_MARKET_LABELS.get(best_market, best_market.title())}",
+            f"Best Lean: {candidate.get('team')} {_MARKET_LABELS.get(str(lean_market), 'ML')} | Best Market: {_MARKET_LABELS.get(best_market, best_market.title())}",
+            f"Data Used: {_format_data_used(report)}",
             f"• SP edge: {_format_sp_edge_text(report)}",
             f"• Offense: {_format_offense_edge_text(report)}",
             f"• Bullpen: {_format_bullpen_edge_text(report)}",
@@ -445,17 +533,17 @@ def render_game_edge_debug(reports: list[dict[str, Any]], card_date: str | None 
 
 
 def render_game_edge_summary(reports: list[dict[str, Any]], card_date: str | None = None) -> str:
-    qualified = [report for report in reports if report.get("best_market") != "pass"]
-    watchlist = [report for report in reports if report.get("watchlist")]
-    passed = [report for report in reports if report.get("best_market") == "pass" and not report.get("watchlist")]
-    lines = ["⚾ MLB EDGE SUMMARY", f"📅 {_report_date(card_date, reports)}", "", "✅ Qualified Picks"]
+    qualified = [report for report in reports if report.get("qualification_status") == "qualified"]
+    watchlist = [report for report in reports if report.get("qualification_status") == "watchlist"]
+    passed = [report for report in reports if report.get("qualification_status") == "pass"]
+    lines = ["⚾ MLB EDGE SUMMARY", f"📅 {_report_date(card_date, reports)}", "", f"✅ Qualified Picks: {len(qualified)}"]
     if qualified:
         for index, report in enumerate(qualified[:10], start=1):
             candidate = _dict(report.get("official_pick_candidate"))
-            lines.extend([f"{index}. {candidate.get('team')} — {_MARKET_LABELS.get(str(report.get('best_market')), 'Pick')}", "   Why: SP/offense/bullpen edge with a verified DraftKings reference."])
+            lines.extend([f"{index}. {candidate.get('team')} — {_MARKET_LABELS.get(str(report.get('best_market')), 'Pick')}", f"   Why: {_format_summary_why(report)}."])
     else:
         lines.append("- None")
-    lines.extend(["", "👀 Watchlist"])
+    lines.extend(["", f"👀 Watchlist: {len(watchlist)}"])
     if watchlist:
         for index, report in enumerate(watchlist[:10], start=1):
             candidate = _dict(report.get("official_pick_candidate"))
@@ -470,4 +558,30 @@ def render_game_edge_summary(reports: list[dict[str, Any]], card_date: str | Non
     for flag, _ in sorted(reason_counts.items(), key=lambda item: item[1], reverse=True)[:3]:
         lines.append(f"• {_FLAG_LABELS.get(flag, flag.replace('_', ' ').title())}")
     if not reason_counts: lines.append("• None")
+    data_counts = {
+        key: sum(1 for report in reports if _dict(report.get("data_available")).get(key))
+        for key in ("mlb_stats", "sharp_dk", "savant", "weather", "bullpen")
+    }
+    lines.extend([
+        "", "Main data used:",
+        f"MLB Stats API: {'yes' if data_counts['mlb_stats'] else 'no'}",
+        f"Sharp DK: {'yes' if data_counts['sharp_dk'] else 'no'}, matched games {data_counts['sharp_dk']}",
+        f"Savant: {'yes' if data_counts['savant'] else 'no'}",
+        f"Weather: {'yes' if data_counts['weather'] else 'no'}",
+        f"Bullpen: {'yes' if data_counts['bullpen'] else 'no'}",
+    ])
+    return "\n".join(lines).strip()
+
+
+def render_game_edge_data_debug(reports: list[dict[str, Any]], card_date: str | None = None) -> str:
+    lines = ["🧬 MLB GAME EDGE DATA DEBUG", f"📅 {_report_date(card_date, reports)}", f"Games: {len(reports)}"]
+    for report in reports:
+        data = _dict(report.get("data_available"))
+        lines.extend([
+            "", f"- {report.get('away_team')} @ {report.get('home_team')}",
+            f"  MLB stats: {'YES' if data.get('mlb_stats') else 'NO'} | DK market: {'YES' if data.get('sharp_dk') else 'NO'} | Savant: {'YES' if data.get('savant') else 'NO'}",
+            f"  Team stats: {'YES' if data.get('team_stats') else 'NO'} | Bullpen: {'YES' if data.get('bullpen') else 'NO'} | Weather: {'YES' if data.get('weather') else 'NO'} | Lineup: {'YES' if data.get('lineup') else 'NO'}",
+            f"  Available DK markets: {', '.join(report.get('available_markets') or []) or 'none'}",
+            f"  Best market: {_MARKET_LABELS.get(str(report.get('best_market')), str(report.get('best_market')).title())} | Status: {report.get('qualification_status')}",
+        ])
     return "\n".join(lines).strip()

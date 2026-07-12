@@ -225,8 +225,10 @@ def parse_sharp_response(data: Any, *, endpoint: str = "/odds") -> dict[str, Any
         for row in raw_rows:
             home = str(row.get("home_team") or row.get("homeTeam") or "")
             away = str(row.get("away_team") or row.get("awayTeam") or "")
-            start = str(row.get("start_time") or row.get("commence_time") or row.get("commenceTime") or "")
-            event_id = str(row.get("event_id") or row.get("id") or "")
+            start = str(row.get("start_time") or row.get("event_start_time") or row.get("commence_time") or row.get("commenceTime") or row.get("starts_at") or row.get("scheduled_at") or "")
+            # A top-level row `id` is commonly an odds-row id, not a game id.
+            # Group flat rows by explicit event/game id plus matchup/time.
+            event_id = str(row.get("event_id") or row.get("game_id") or "")
             key = (event_id, away, home, start)
             event = grouped.setdefault(key, {"id": event_id, "away_team": away, "home_team": home, "commence_time": start, "bookmakers": []})
             book_key = str(row.get("sportsbook") or row.get("bookmaker") or "sharpapi")
@@ -235,17 +237,26 @@ def parse_sharp_response(data: Any, *, endpoint: str = "/odds") -> dict[str, Any
                 book = {"key": book_key, "title": book_key, "markets": []}
                 event["bookmakers"].append(book)
             raw_market = str(row.get("market_type") or row.get("market") or "").lower()
-            market_key = {"moneyline": "h2h", "spread": "spreads", "runline": "spreads", "total": "totals"}.get(raw_market, raw_market)
+            market_key = {
+                "moneyline": "h2h", "money_line": "h2h", "ml": "h2h", "h2h": "h2h",
+                "spread": "spreads", "runline": "spreads", "run_line": "spreads", "game_spread": "spreads",
+                "total": "totals", "game_total": "totals", "total_runs": "totals", "over_under": "totals",
+                "team_total": "team_totals", "f5_moneyline": "f5_h2h",
+                "first_5_moneyline": "f5_h2h", "first_five_moneyline": "f5_h2h", "f5_ml": "f5_h2h",
+            }.get(raw_market, raw_market)
             market = next((item for item in book["markets"] if item["key"] == market_key), None)
             if market is None:
                 market = {"key": market_key, "outcomes": []}
                 book["markets"].append(market)
             selection = row.get("selection") or row.get("outcome") or row.get("team") or ""
+            description = row.get("description") or (
+                f"{row.get('team')} {selection}" if row.get("team") and str(row.get("team")) not in str(selection) else selection
+            )
             market["outcomes"].append({
                 "name": selection,
                 "price": row.get("odds_american") if row.get("odds_american") is not None else row.get("odds"),
-                "point": row.get("line") if row.get("line") is not None else row.get("spread"),
-                "description": row.get("description") or selection,
+                "point": row.get("line") if row.get("line") is not None else row.get("spread") if row.get("spread") is not None else row.get("handicap"),
+                "description": description,
             })
         normalized = [_normalize_sharp_event(event) for event in grouped.values()]
     else:

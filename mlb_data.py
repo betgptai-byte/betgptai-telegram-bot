@@ -444,7 +444,7 @@ def odds_debug_payload(
     event_date: str | None = None,
 ) -> dict[str, Any]:
     """Owner-only diagnostics for odds providers by sport."""
-    from api.sharp_odds_client import ALL_SPORTSBOOKS, MLB_MAPPINGS, SHARP_ENDPOINT_BEST_ODDS, SHARP_ENDPOINT_ODDS, SHARP_SPORT_MAP, _active_endpoint, _use_best_odds, default_sportsbook, health as sharp_health, probe_sharp_mlb, secondary_sportsbook, sharp_api_enabled, sharp_api_key
+    from api.sharp_odds_client import ALL_SPORTSBOOKS, MLB_MAPPINGS, SHARP_ENDPOINT_BEST_ODDS, SHARP_ENDPOINT_ODDS, SHARP_SPORT_MAP, _active_endpoint, _use_best_odds, default_sportsbook, game_market_diagnostic, health as sharp_health, prop_market_diagnostic, secondary_sportsbook, sharp_api_enabled, sharp_api_key
     from services.odds_provider_router import provider_status as router_status
 
     sport_lower = sport.lower()
@@ -487,6 +487,16 @@ def odds_debug_payload(
         "events_returned": 0,
         "market_context_available": False,
         "first_matched_game": None,
+        "sharp_raw_rows": 0,
+        "accepted_game_market_rows": 0,
+        "rejected_prop_rows": 0,
+        "accepted_prop_rows": 0,
+        "moneyline_contexts": 0,
+        "runline_contexts": 0,
+        "total_contexts": 0,
+        "team_total_contexts": 0,
+        "game_market_sportsbook": "draftkings",
+        "prop_sportsbook": "fanduel",
     }
 
     schedule: list[dict[str, Any]] = []
@@ -579,25 +589,25 @@ def odds_debug_payload(
                 payload["last_error"] = redacted
                 payload["errors"].append(f"Odds API fallback: {redacted}")
 
-    # Populate probe results from active fetch, plus sportsbook-specific counts
+    # Reuse diagnostics from the isolated DraftKings game-market fetch. Never
+    # issue an unfiltered probe here because that can return player props.
     if sport_lower == "mlb" and isinstance(payload.get("sharp_mlb_probes"), list):
-        try:
-            probe_results = probe_sharp_mlb(event_date=event_date or selected_date)
-            for i, pr in enumerate(probe_results):
-                if i < len(payload["sharp_mlb_probes"]):
-                    payload["sharp_mlb_probes"][i]["status_code"] = pr.get("status_code")
-                    payload["sharp_mlb_probes"][i]["games_count"] = pr.get("games_count", 0)
-                    payload["sharp_mlb_probes"][i]["error"] = pr.get("error")
-                    payload["sharp_mlb_probes"][i]["first_matchup"] = pr.get("first_matchup")
-            # Track game counts per sportsbook
-            sb_counts: dict[str, int] = {}
-            for p in payload["sharp_mlb_probes"]:
-                sb = p.get("sportsbook")
-                if sb:
-                    sb_counts[sb] = max(sb_counts.get(sb, 0), p.get("games_count", 0))
-            payload["sportsbook_game_counts"] = sb_counts
-        except Exception as prob_err:
-            payload["errors"].append(f"Sharp MLB probe error: {prob_err}")
+        diagnostic = game_market_diagnostic()
+        prop_diagnostic = prop_market_diagnostic()
+        payload["sharp_mlb_probes"] = diagnostic.get("attempts") or []
+        payload["sharp_raw_rows"] = int(diagnostic.get("raw_rows") or 0)
+        payload["accepted_game_market_rows"] = int(diagnostic.get("accepted_game_market_rows") or 0)
+        payload["rejected_prop_rows"] = int(diagnostic.get("rejected_prop_rows") or 0)
+        payload["accepted_prop_rows"] = int(prop_diagnostic.get("accepted_prop_rows") or 0)
+        counts = diagnostic.get("market_counts") or {}
+        payload["moneyline_contexts"] = int(counts.get("moneyline") or 0)
+        payload["runline_contexts"] = int(counts.get("runline") or 0)
+        payload["total_contexts"] = int(counts.get("total") or 0)
+        payload["team_total_contexts"] = int(counts.get("team_total") or 0)
+        payload["events_returned"] = int(diagnostic.get("events_returned") or 0)
+        payload["active_sportsbook"] = diagnostic.get("sportsbook") or "draftkings"
+        if diagnostic.get("error"):
+            payload["errors"].append(str(diagnostic["error"]))
 
     if not odds:
         payload["errors"].append("No odds data returned from any provider.")
@@ -616,14 +626,14 @@ def odds_debug_payload(
             endpoint=SHARP_ENDPOINT_ODDS,
         )
     if schedule:
-        odds_keys = {
-            _game_key(odds_game.get("away_team", ""), odds_game.get("home_team", "")): odds_game
-            for odds_game in odds
-        }
+        odds_keys: dict[frozenset[str], list[dict[str, Any]]] = {}
+        for odds_game in odds:
+            odds_keys.setdefault(_game_key(odds_game.get("away_team", ""), odds_game.get("home_team", "")), []).append(odds_game)
         matched_keys = set()
         for game in schedule:
             key = _game_key(game.get("away_team", ""), game.get("home_team", ""))
-            if key in odds_keys:
+            match = _closest_odds_game(game, list(odds_keys.get(key, [])))
+            if match:
                 matched_keys.add(key)
                 payload["matched_to_mlb_game_pk"] += 1
                 if payload["first_matched_game"] is None:
@@ -635,8 +645,9 @@ def odds_debug_payload(
                     "home_team": game.get("home_team"),
                     "normalized_key": sorted(key),
                 })
-        for key, odds_game in odds_keys.items():
+        for key, odds_games in odds_keys.items():
             if key not in matched_keys:
+                odds_game = odds_games[0]
                 payload["unmatched_odds_games"].append({
                     "id": odds_game.get("id"),
                     "away_team": odds_game.get("away_team"),
@@ -644,14 +655,10 @@ def odds_debug_payload(
                     "commence_time": odds_game.get("commence_time"),
                     "normalized_key": sorted(key),
                 })
-    probes = payload.get("sharp_mlb_probes") or []
-    successful_probe = next((probe for probe in probes if int(probe.get("games_count") or 0) > 0), None)
-    if successful_probe:
+    if payload.get("accepted_game_market_rows"):
         payload["provider"] = "sharpapi"
-        payload["events_returned"] = int(successful_probe.get("events_returned") or successful_probe.get("games_count") or 0)
-        payload["active_sportsbook"] = successful_probe.get("sportsbook") or "best_odds"
-        payload["endpoint_used"] = successful_probe.get("endpoint") or payload.get("endpoint_used")
-    payload["market_context_available"] = bool(payload.get("matched_to_mlb_game_pk") and odds)
+        payload["endpoint_used"] = "/odds"
+    payload["market_context_available"] = bool(payload.get("accepted_game_market_rows") and payload.get("matched_to_mlb_game_pk"))
     return payload
 
 

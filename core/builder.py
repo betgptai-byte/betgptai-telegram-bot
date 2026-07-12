@@ -58,7 +58,10 @@ def _advanced_market_candidates(
         context = game.get("market_context") if isinstance(game.get("market_context"), dict) else {}
         prices = game.get("best_available_prices") if isinstance(game.get("best_available_prices"), list) else []
         provider = str(context.get("provider") or "")
-        if provider not in {"sharpapi", "sharp_api"} or not context.get("line_verified") or not prices:
+        accepted_rows = int(context.get("accepted_game_market_rows") or 0)
+        matched_games = int(context.get("matched_games") or 0)
+        context_available = bool(context.get("market_context_available"))
+        if provider not in {"sharpapi", "sharp_api"} or not context.get("line_verified") or not prices or accepted_rows < 1 or matched_games < 1 or not context_available:
             rejected.append(f"{label}: Sharp market_context unavailable or unverified")
             continue
 
@@ -875,6 +878,7 @@ def build_card_from_analysis(
         "official_picks_created": len(all_picks),
         "rejected_items": errors,
         "rejected_reasons": errors,
+        "market_mode": "live_odds" if (not stats_mode and bool(all_picks)) else "stats_only",
     }
     if _stats_only_mode():
         meta["market_mode"] = "stats_only"

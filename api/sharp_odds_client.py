@@ -50,6 +50,27 @@ from core.market import MarketContext
 
 logger = logging.getLogger(__name__)
 
+GAME_MARKET_BOOK = "draftkings"
+PROP_MARKET_BOOK = "fanduel"
+ADVANCED_GAME_MARKETS = {
+    "moneyline", "money_line", "h2h", "ml", "spread", "runline", "run_line",
+    "game_spread", "total", "game_total", "total_runs", "over_under", "team_total",
+    "f5_moneyline", "first_5_moneyline", "first_five_moneyline", "f5_ml",
+}
+PROP_MARKETS = {
+    "player_hits", "player_total_bases", "player_home_runs", "pitcher_strikeouts",
+    "player_strikeouts", "player_rbis", "player_runs",
+}
+_GAME_MARKET_GROUPS = {
+    "moneyline": {"moneyline", "money_line", "h2h", "ml"},
+    "runline": {"spread", "runline", "run_line", "game_spread"},
+    "total": {"total", "game_total", "total_runs", "over_under"},
+    "team_total": {"team_total"},
+    "f5_moneyline": {"f5_moneyline", "first_5_moneyline", "first_five_moneyline", "f5_ml"},
+}
+_LAST_GAME_MARKET_DIAGNOSTIC: dict[str, Any] = {}
+_LAST_PROP_MARKET_DIAGNOSTIC: dict[str, Any] = {}
+
 # ── Sport mapping ───────────────────────────────────────────────────────────
 # Sharp API parameters per sport.
 SHARP_SPORT_MAP: dict[str, dict[str, Any]] = {
@@ -108,6 +129,13 @@ __all__ = [
     "fetch_mlb_odds",
     "get_odds",
     "get_soccer_odds",
+    "fetch_mlb_game_markets",
+    "fetch_mlb_props",
+    "game_market_diagnostic",
+    "prop_market_diagnostic",
+    "ADVANCED_GAME_MARKETS",
+    "GAME_MARKET_BOOK",
+    "PROP_MARKET_BOOK",
     "probe_sharp_mlb",
     "health",
     "odds_api_backup_only",
@@ -149,6 +177,9 @@ def build_game_market_context(
         return next((row.get("line") for row in rows if _normalize_team_name(str(row.get("label") or "")) == target), None)
     def _total_line(label: str) -> Any:
         return next((row.get("line") for row in ctx.get("total", []) if str(row.get("label") or "").lower().startswith(label)), None)
+    def _team_total_line(team: str) -> Any:
+        target = _normalize_team_name(team)
+        return next((row.get("line") for row in ctx.get("team_totals", []) if target in _normalize_team_name(str(row.get("label") or ""))), None)
     sportsbook = next((price.get("bookmaker_key") or price.get("bookmaker") for price in prices if price.get("bookmaker_key") or price.get("bookmaker")), None)
     normalized_provider = "sharpapi" if provider in {"sharp_api", "sharpapi"} else provider
     return {
@@ -175,8 +206,13 @@ def build_game_market_context(
         "spread_away": _team_spread(ctx.get("spread_or_runline", []), away),
         "total_over": _total_line("over"),
         "total_under": _total_line("under"),
+        "team_total_home": _team_total_line(home),
+        "team_total_away": _team_total_line(away),
         "sportsbook": sportsbook,
         "line_verified": bool(prices),
+        "accepted_game_market_rows": len(prices),
+        "matched_games": 1 if prices else 0,
+        "market_context_available": bool(prices),
     }
 
 
@@ -241,10 +277,7 @@ _LAST_REQUEST_DIAGNOSTIC: dict[str, Any] = {}
 # Each mapping includes sport_param, optional league, and optional sportsbook.
 # The production request tries: best-odds → default sportsbook → secondary → probe all sportsbooks.
 MLB_MAPPINGS: list[dict[str, str | None]] = [
-    {"sport_param": "baseball", "league": "MLB", "sportsbook": sb}
-    for sb in ("draftkings", "fanduel", "hardrockbet")
-] + [
-    {"sport_param": "baseball", "league": "MLB", "sportsbook": None},
+    {"sport_param": "baseball", "league": "MLB", "sportsbook": GAME_MARKET_BOOK},
 ]
 
 
@@ -273,7 +306,7 @@ def build_sharp_odds_url(
     if league:
         params["league"] = league
     if ep == SHARP_ENDPOINT_ODDS:
-        params["markets"] = markets or "h2h,spreads,totals,team_totals"
+        params["market"] = markets or "moneyline,spread,total,team_total"
         if sportsbook:
             params["sportsbook"] = sportsbook
     if event_date:
@@ -342,7 +375,7 @@ def _sharpen_request(
         params["league"] = league
     # Only send markets and sportsbook for /odds endpoint, not /odds/best
     if endpoint == SHARP_ENDPOINT_ODDS:
-        params["markets"] = markets
+        params["market"] = markets
         if sportsbook:
             params["sportsbook"] = sportsbook
     if event_date:
@@ -514,7 +547,7 @@ def _sharpen_request_for_probe(
     if league:
         params["league"] = league
     if ep == SHARP_ENDPOINT_ODDS:
-        params["markets"] = markets
+        params["market"] = markets
         if sportsbook:
             params["sportsbook"] = sportsbook
     if event_date:
@@ -555,6 +588,167 @@ def _active_endpoint() -> str:
     return SHARP_ENDPOINT_ODDS
 
 
+def _flat_rows(payload: Any) -> tuple[list[dict[str, Any]], list[str]]:
+    keys = sorted(str(key) for key in payload.keys()) if isinstance(payload, dict) else ["<list>"] if isinstance(payload, list) else []
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        rows = next((payload.get(key) for key in ("data", "odds", "events", "results") if isinstance(payload.get(key), list)), [])
+    else:
+        rows = []
+    return [row for row in rows if isinstance(row, dict)], keys
+
+
+def _market_name(row: dict[str, Any]) -> str:
+    return str(row.get("market_type") or row.get("market") or "").strip().lower()
+
+
+def _market_group(market: str) -> str | None:
+    return next((group for group, aliases in _GAME_MARKET_GROUPS.items() if market in aliases), None)
+
+
+def _filtered_market_request(*, sportsbook: str, markets: str, kind: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    api_key = sharp_api_key()
+    if not api_key:
+        raise SharpAPIError("SHARP_API_KEY is missing from .env.")
+    endpoint = SHARP_ENDPOINT_ODDS
+    url = f"{_base_url()}{endpoint}"
+    params = {
+        "sport": "baseball", "league": "mlb", "sportsbook": sportsbook,
+        "market": markets, "limit": "200",
+    }
+    response = _do_sharp_request(url, params, {"X-API-Key": api_key})
+    attempt = {
+        "endpoint": endpoint, "http_status": response.status_code,
+        "market_requested": markets, "sportsbook": sportsbook,
+        "rows_returned": 0, "accepted_rows": 0, "rejected_rows": 0,
+        "rejected_prop_rows": 0, "rejected_game_market_rows": 0,
+        "rejected_missing_team_fields": 0, "top_level_keys": [], "error": None,
+        "first_rejected_prop_market": None,
+    }
+    if response.status_code == 401:
+        attempt["error"] = "auth_failed"
+        return [], attempt
+    if response.status_code == 429:
+        attempt["error"] = "rate_limited"
+        return [], attempt
+    if response.status_code != 200:
+        attempt["error"] = f"http_error_{response.status_code}"
+        return [], attempt
+    try:
+        payload = response.json()
+    except Exception:
+        attempt["error"] = "parse_failed"
+        return [], attempt
+    rows, keys = _flat_rows(payload)
+    attempt["top_level_keys"] = keys
+    attempt["rows_returned"] = len(rows)
+    accepted: list[dict[str, Any]] = []
+    for row in rows:
+        market = _market_name(row)
+        has_teams = bool(row.get("home_team") and row.get("away_team"))
+        if kind == "game":
+            if market in PROP_MARKETS or market.startswith("player_") or market.startswith("pitcher_"):
+                attempt["rejected_prop_rows"] += 1
+                attempt["first_rejected_prop_market"] = attempt["first_rejected_prop_market"] or market
+                continue
+            if market not in ADVANCED_GAME_MARKETS:
+                attempt["rejected_rows"] += 1
+                continue
+            if not has_teams:
+                attempt["rejected_missing_team_fields"] += 1
+                continue
+        else:
+            if market not in PROP_MARKETS:
+                attempt["rejected_game_market_rows"] += 1
+                continue
+        accepted.append(dict(row))
+    attempt["accepted_rows"] = len(accepted)
+    logger.info(
+        "Sharp filtered endpoint=%s sportsbook=%s market=%s status=%s rows=%d accepted=%d rejected=%d",
+        endpoint, sportsbook, markets, response.status_code, len(rows), len(accepted),
+        attempt["rejected_rows"] + attempt["rejected_prop_rows"] + attempt["rejected_game_market_rows"] + attempt["rejected_missing_team_fields"],
+    )
+    return accepted, attempt
+
+
+def fetch_mlb_game_markets(event_date: str | None = None) -> dict[str, Any]:
+    """Fetch only DraftKings MLB game markets for advanced card enrichment."""
+    del event_date  # Sharp current-odds endpoint is already scoped to live/upcoming rows.
+    attempts: list[dict[str, Any]] = []
+    accepted: list[dict[str, Any]] = []
+    request_sets = [
+        "moneyline,spread,total,team_total,f5_moneyline",
+        "moneyline,runline,game_total,total_runs,team_total,first_5_moneyline",
+        "h2h,money_line,ml",
+        "spread,runline,run_line,game_spread",
+        "total,game_total,total_runs,over_under",
+        "team_total",
+    ]
+    seen_rows: set[str] = set()
+    for markets in request_sets:
+        rows, attempt = _filtered_market_request(sportsbook=GAME_MARKET_BOOK, markets=markets, kind="game")
+        attempts.append(attempt)
+        for row in rows:
+            signature = json.dumps(row, sort_keys=True, default=str)
+            if signature not in seen_rows:
+                seen_rows.add(signature)
+                accepted.append(row)
+        groups = {_market_group(_market_name(row)) for row in accepted}
+        if {"moneyline", "runline", "total", "team_total"}.issubset(groups):
+            break
+    parsed = parse_sharp_response({"data": accepted}, endpoint=SHARP_ENDPOINT_ODDS) if accepted else {"odds": [], "events": [], "events_returned": 0}
+    counts = {group: sum(1 for row in accepted if _market_group(_market_name(row)) == group) for group in _GAME_MARKET_GROUPS}
+    rejected_props = sum(int(attempt.get("rejected_prop_rows") or 0) for attempt in attempts)
+    missing_teams = sum(int(attempt.get("rejected_missing_team_fields") or 0) for attempt in attempts)
+    first = accepted[0] if accepted else {}
+    result = {
+        "provider": "sharpapi", "sportsbook": GAME_MARKET_BOOK,
+        "events": parsed.get("events") or parsed.get("odds") or [],
+        "odds": parsed.get("odds") or [], "attempts": attempts,
+        "raw_rows": sum(int(attempt.get("rows_returned") or 0) for attempt in attempts),
+        "accepted_game_market_rows": len(accepted), "rejected_prop_rows": rejected_props,
+        "rejected_missing_team_fields": missing_teams, "market_counts": counts,
+        "events_returned": int(parsed.get("events_returned") or 0),
+        "first_accepted_matchup": f"{first.get('away_team')} @ {first.get('home_team')}" if first else None,
+        "first_accepted_market": _market_name(first) if first else None,
+        "first_rejected_prop_market": next((market for attempt in attempts for market in [attempt.get("first_rejected_prop_market")] if market), None),
+        "status": "available" if accepted else "unavailable",
+        "error": None if accepted else "draftkings_game_markets_unavailable",
+    }
+    global _LAST_GAME_MARKET_DIAGNOSTIC
+    _LAST_GAME_MARKET_DIAGNOSTIC = result
+    if result["odds"]:
+        _cache_write("baseball_mlb_game_markets", result["odds"])
+    return result
+
+
+def fetch_mlb_props(event_date: str | None = None) -> dict[str, Any]:
+    """Fetch only FanDuel player props; never feed these rows to game context."""
+    del event_date
+    markets = "player_hits,player_total_bases,player_home_runs,pitcher_strikeouts"
+    rows, attempt = _filtered_market_request(sportsbook=PROP_MARKET_BOOK, markets=markets, kind="prop")
+    counts = {market: sum(1 for row in rows if _market_name(row) == market) for market in PROP_MARKETS}
+    result = {
+        "provider": "sharpapi", "sportsbook": PROP_MARKET_BOOK, "rows": rows,
+        "attempts": [attempt], "raw_rows": attempt["rows_returned"],
+        "accepted_prop_rows": len(rows), "rejected_game_market_rows": attempt["rejected_game_market_rows"],
+        "market_counts": counts, "status": "available" if rows else "unavailable",
+        "error": None if rows else "fanduel_props_unavailable",
+    }
+    global _LAST_PROP_MARKET_DIAGNOSTIC
+    _LAST_PROP_MARKET_DIAGNOSTIC = result
+    return result
+
+
+def game_market_diagnostic() -> dict[str, Any]:
+    return dict(_LAST_GAME_MARKET_DIAGNOSTIC)
+
+
+def prop_market_diagnostic() -> dict[str, Any]:
+    return dict(_LAST_PROP_MARKET_DIAGNOSTIC)
+
+
 def get_odds(
     sport: str = "mlb",
     league: str | None = None,
@@ -591,65 +785,10 @@ def get_odds(
         raise SharpAPIError("SHARP_API_KEY is missing from .env.")
     base_url = _base_url()
 
-    # ── MLB: best-odds → sportsbook fallback → probe ─────────────────────
+    # ── MLB: isolated DraftKings game markets only ────────────────────────
     if sport_lower == "mlb":
-        # Step 1: /odds/best (no sportsbook filter, uses SHARP_USE_BEST_ODDS)
-        if _use_best_odds():
-            ck_best = f"{cfg['cache_key']}_best"
-            if event_date:
-                ck_best = f"{ck_best}_{event_date}"
-            cached = _cache_read(ck_best)
-            if cached is not None:
-                return cached
-            try:
-                odds = _sharpen_request(
-                    cfg["sport_param"], league or cfg["league"], event_date,
-                    api_key, base_url, cfg["markets"], ck_best,
-                    sportsbook=None, endpoint=SHARP_ENDPOINT_BEST_ODDS,
-                )
-                if odds:
-                    logger.info(
-                        "Sharp API /odds/best fetched %d MLB odds events",
-                        len(odds),
-                    )
-                    return odds
-            except (SharpAPIError, SharpRateLimitError):
-                logger.warning("Sharp /odds/best failed — falling back to /odds")
-
-        # Step 2: /odds with sportsbook filter (default → secondary → probe all)
-        default_sb = default_sportsbook()
-        secondary_sb = secondary_sportsbook()
-        sportsbooks_to_try: list[str | None] = []
-        for candidate in (default_sb, secondary_sb, "hardrockbet", None):
-            if candidate not in sportsbooks_to_try:
-                sportsbooks_to_try.append(candidate)
-
-        for sb in sportsbooks_to_try:
-            ck = cfg["cache_key"]
-            if league:
-                ck = f"{ck}_{league}"
-            if sb:
-                ck = f"{ck}_{sb}"
-            if event_date:
-                ck = f"{ck}_{event_date}"
-            cached = _cache_read(ck)
-            if cached is not None:
-                return cached
-            try:
-                odds = _sharpen_request(
-                    cfg["sport_param"], league or cfg["league"], event_date,
-                    api_key, base_url, cfg["markets"], ck,
-                    sportsbook=sb, endpoint=SHARP_ENDPOINT_ODDS,
-                )
-                if odds:
-                    logger.info(
-                        "Sharp API fetched %d MLB odds events (sportsbook=%s)",
-                        len(odds), sb or "none",
-                    )
-                    return odds
-            except (SharpAPIError, SharpRateLimitError):
-                logger.warning("Sharp MLB mapping failed (sportsbook=%s)", sb)
-        return []
+        result = fetch_mlb_game_markets(event_date=event_date)
+        return list(result.get("odds") or [])
 
     # ── Non-MLB sports ────────────────────────────────────────────────────
     cache_key = cfg["cache_key"]
@@ -721,4 +860,6 @@ def health(sport: str = "mlb") -> dict[str, Any]:
         "cache_age_seconds": cache_age,
         "cache_fresh": cache_age is not None and cache_age < SHARP_CACHE_TTL,
         "last_request": dict(_LAST_REQUEST_DIAGNOSTIC),
+        "game_markets": dict(_LAST_GAME_MARKET_DIAGNOSTIC),
+        "props": dict(_LAST_PROP_MARKET_DIAGNOSTIC),
     }

@@ -3937,6 +3937,12 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
         "",
         f"Active provider: {payload.get('provider') or 'None'}",
         f"Provider: {payload.get('provider') or 'None'}",
+        f"Sharp raw rows: {payload.get('sharp_raw_rows', 0)}",
+        f"Accepted game-market rows: {payload.get('accepted_game_market_rows', 0)}",
+        f"Rejected prop rows: {payload.get('rejected_prop_rows', 0)}",
+        f"Accepted prop rows: {payload.get('accepted_prop_rows', 0)}",
+        f"Game market sportsbook: {payload.get('game_market_sportsbook', 'draftkings')}",
+        f"Prop sportsbook: {payload.get('prop_sportsbook', 'fanduel')}",
         f"Events returned: {payload.get('events_returned', payload.get('games_returned', 0))}",
         f"Matched games: {payload.get('matched_to_mlb_game_pk', 0)}",
         f"Sportsbook used: {active_sb or 'none'}",
@@ -3944,6 +3950,10 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
         f"First matched game: {payload.get('first_matched_game') or 'None'}",
         f"Unmatched Sharp games: {len(payload.get('unmatched_odds_games') or [])}",
         f"Unmatched MLB slate games: {len(payload.get('unmatched_mlb_games') or [])}",
+        f"Moneyline contexts: {payload.get('moneyline_contexts', 0)}",
+        f"Runline contexts: {payload.get('runline_contexts', 0)}",
+        f"Total contexts: {payload.get('total_contexts', 0)}",
+        f"Team total contexts: {payload.get('team_total_contexts', 0)}",
         f"Markets: {payload.get('markets_requested')}",
         f"Games returned: {payload.get('games_returned')}",
     ]
@@ -3965,14 +3975,16 @@ def _render_odds_debug_payload(payload: dict[str, Any], selected_date: str) -> s
         lines.append("")
         lines.append("── Sharp MLB Mapping Probes ──")
         for p in probes:
-            status = p.get("status_code") or "—"
-            count = p.get("games_count", 0)
+            status = p.get("http_status") or p.get("status_code") or "—"
+            count = p.get("accepted_rows", p.get("games_count", 0))
             err = p.get("error") or ""
             ep = p.get("endpoint", "/odds")
             sp = p.get("sport_param")
             lg = p.get("league") or "none"
             sb = p.get("sportsbook") or "none"
-            lines.append(f"  endpoint={ep} sport={sp} league={lg} book={sb} → HTTP {status} games={count}{f' error={err}' if err else ''}")
+            requested = p.get("market_requested") or "all"
+            raw = p.get("rows_returned", 0)
+            lines.append(f"  endpoint={ep} market={requested} book={sb} → HTTP {status} rows={raw} accepted={count}{f' error={err}' if err else ''}")
     lines.append(f"Last error: {payload.get('last_error') or 'None'}")
     errors = payload.get("errors") if isinstance(payload.get("errors"), list) else []
     if errors:
@@ -4150,27 +4162,53 @@ async def sharp_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if sport != "mlb":
         await update.message.reply_text("/sharp_probe currently supports: mlb")
         return
-    from api.sharp_odds_client import _base_url, probe_sharp_mlb, sharp_api_enabled
+    mode = (context.args[1].strip().lower() if len(context.args or []) > 1 else "game_markets")
+    from api.sharp_odds_client import _base_url, fetch_mlb_game_markets, fetch_mlb_props, sharp_api_enabled
     try:
-        results = await asyncio.to_thread(probe_sharp_mlb, official_sports_date().isoformat())
-        selected = next((row for row in results if row.get("games_count", 0) > 0), None)
-        if selected is None:
-            selected = next((row for row in results if row.get("status_code") in (401, 429)), None)
-        selected = selected or (results[0] if results else {})
+        if mode == "props":
+            result = await asyncio.to_thread(fetch_mlb_props, official_sports_date().isoformat())
+            counts = result.get("market_counts") or {}
+            lines = [
+                "🔍 SHARP API PROBE — MLB PROPS",
+                f"Sharp API Enabled: {'YES' if sharp_api_enabled() else 'NO'}",
+                f"Base URL: {_base_url()}", "Auth Method: X-API-Key",
+                f"Sportsbook used: {result.get('sportsbook', 'fanduel')}",
+                f"Hit prop rows: {counts.get('player_hits', 0)}",
+                f"Total bases rows: {counts.get('player_total_bases', 0)}",
+                f"HR prop rows: {counts.get('player_home_runs', 0)}",
+                f"Pitcher K rows: {counts.get('pitcher_strikeouts', 0)}",
+                f"Rejected game-market rows: {result.get('rejected_game_market_rows', 0)}",
+                f"Error: {result.get('error') or 'None'}",
+            ]
+            await update.message.reply_text("\n".join(lines))
+            return
+        result = await asyncio.to_thread(fetch_mlb_game_markets, official_sports_date().isoformat())
+        counts = result.get("market_counts") or {}
         lines = [
-            "🔍 SHARP API PROBE — MLB",
+            "🔍 SHARP API PROBE — MLB GAME MARKETS",
             f"Sharp API Enabled: {'YES' if sharp_api_enabled() else 'NO'}",
             f"Base URL: {_base_url()}",
             "Auth Method: X-API-Key",
-            f"Endpoint tested: {selected.get('endpoint') or 'N/A'}",
-            f"HTTP Status: {selected.get('status_code') or 'N/A'}",
-            f"Top-level keys: {', '.join(selected.get('top_level_keys') or []) or 'None'}",
-            f"Events returned: {selected.get('events_returned', selected.get('games_count', 0))}",
-            f"Odds returned: {selected.get('odds_returned', selected.get('games_count', 0))}",
-            f"First matchup: {selected.get('first_matchup') or 'None'}",
-            f"First market: {selected.get('first_market') or 'None'}",
-            f"Error: {selected.get('error') or 'None'}",
+            f"Sportsbook used: {result.get('sportsbook', 'draftkings')}",
+            "Endpoint attempts:",
         ]
+        for attempt in result.get("attempts") or []:
+            lines.append(
+                f"- {attempt.get('endpoint')} | HTTP {attempt.get('http_status')} | "
+                f"market={attempt.get('market_requested')} | rows={attempt.get('rows_returned', 0)} | "
+                f"accepted={attempt.get('accepted_rows', 0)} | rejected_props={attempt.get('rejected_prop_rows', 0)}"
+            )
+        lines.extend([
+            f"Moneyline rows: {counts.get('moneyline', 0)}",
+            f"Spread/runline rows: {counts.get('runline', 0)}",
+            f"Total rows: {counts.get('total', 0)}",
+            f"Team total rows: {counts.get('team_total', 0)}",
+            f"Rejected prop rows: {result.get('rejected_prop_rows', 0)}",
+            f"First accepted matchup: {result.get('first_accepted_matchup') or 'None'}",
+            f"First accepted market: {result.get('first_accepted_market') or 'None'}",
+            f"First rejected prop market: {result.get('first_rejected_prop_market') or 'None'}",
+            f"Error: {result.get('error') or 'None'}",
+        ])
         await update.message.reply_text("\n".join(lines))
     except Exception as error:
         code = getattr(error, "code", None) or str(error)

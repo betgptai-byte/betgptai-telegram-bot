@@ -480,56 +480,122 @@ def simple_card_bridge_status(card_date: str | None = None) -> dict:
 
 def _display_date(card_date: str) -> str:
     try:
-        return datetime.strptime(card_date, "%Y-%m-%d").strftime("%m/%d/%Y")
+        return datetime.strptime(card_date, "%Y-%m-%d").strftime("%A, %m/%d/%Y")
     except (ValueError, TypeError):
         return str(card_date)
 
 
-def render_simple_mlb_card(card: dict) -> str:
-    """Render clean Telegram text for the simple stats-based card."""
-    by_id = {p["id"]: p for p in card.get("picks", [])}
-    sections = card.get("sections", {})
-    lines: list[str] = []
-    lines.append("🏆 BETGPTAI MLB CARD")
-    lines.append(f"📅 {_display_date(card.get('date', ''))}")
-    lines.append(f"Mode: {'Stats Only' if card.get('stats_only') else 'Normal'}")
-    lines.append("")
+def _format_market_label(market_type: str) -> str:
+    """Convert internal market keys into compact public-facing labels."""
+    normalized = str(market_type or "").strip().lower()
+    return {
+        "play_of_day": "ML",
+        "moneyline": "ML",
+        "ml": "ML",
+        "f5_moneyline": "F5 ML",
+        "f5_ml": "F5 ML",
+        "runline": "RL",
+        "run_line": "RL",
+        "game_total": "Game Total",
+        "total": "Game Total",
+        "team_total": "Team Total",
+    }.get(normalized, "Pick")
 
-    def _block(title: str, ids: list[str]) -> None:
-        if not ids:
-            return
-        lines.append(title)
-        for idx, pid in enumerate(ids, start=1):
-            pick = by_id.get(pid)
+
+def _format_pick_public(pick: dict) -> str:
+    """Render one simple-card pick without leaking technical market names."""
+    selection = str(
+        pick.get("selected_team") or pick.get("team") or pick.get("selection")
+        or pick.get("pick") or "Pick unavailable"
+    ).strip()
+    market = str(pick.get("market_type") or pick.get("market") or "")
+    label = _format_market_label(market)
+    line = pick.get("posted_line")
+    if line is None:
+        line = pick.get("line")
+    if line is not None and label in {"RL", "Game Total", "Team Total"}:
+        try:
+            line_number = float(line)
+            line_text = f"{line_number:+g}" if label == "RL" else f"{line_number:g}"
+        except (TypeError, ValueError):
+            line_text = str(line)
+        return f"{selection} {line_text} {label}".strip()
+    return f"{selection} {label}".strip()
+
+
+def render_simple_mlb_card(card: dict) -> str:
+    """Render a polished, public-safe BETGPTAI free-channel card."""
+    picks = [pick for pick in card.get("picks", []) if isinstance(pick, dict)]
+    by_id = {str(pick.get("id")): pick for pick in picks if pick.get("id")}
+    sections = card.get("sections", {}) if isinstance(card.get("sections"), dict) else {}
+    market_mode = str(card.get("market_mode") or "stats_only").lower()
+    mode_label = "Live Odds" if market_mode == "live_odds" else "Stats-Based"
+    sportsbooks = [
+        str(value).strip() for value in (
+            card.get("game_market_sportsbook"), card.get("sportsbook"),
+            *(pick.get("sportsbook") for pick in picks),
+        )
+        if value and str(value).strip().lower() not in {"none", "unavailable"}
+    ]
+    game_book = next((book for book in sportsbooks if book.lower() == "draftkings"), sportsbooks[0] if sportsbooks else "")
+    prop_book = next((book for book in sportsbooks if book.lower() == "fanduel"), "")
+    separator = "━━━━━━━━━━━━━━"
+    number_icons = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟")
+    blocks: list[list[str]] = [[
+        "🏆 BETGPTAI MLB CARD",
+        f"📅 {_display_date(card.get('date', ''))}",
+        "⚾ MLB Free Picks",
+        f"📊 Mode: {mode_label}",
+    ]]
+    book_labels = {"draftkings": "DraftKings", "fanduel": "FanDuel"}
+    if game_book:
+        blocks[0].append(f"📚 Game Lines: {book_labels.get(game_book.lower(), game_book)}")
+    if prop_book:
+        blocks[0].append(f"🎯 Props: {book_labels.get(prop_book.lower(), prop_book)}")
+
+    def _unique(ids: list[str]) -> list[dict[str, Any]]:
+        unique: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for pid in ids or []:
+            pick = by_id.get(str(pid))
             if not pick:
                 continue
-            label = pick.get("team") or pick.get("pick") or "Unknown"
-            market = pick.get("market", "")
-            suffix = f" {market}" if market not in ("play_of_day",) else ""
-            lines.append(f"{idx}. {label}{suffix}")
-        lines.append("")
+            key = (
+                str(pick.get("selected_team") or pick.get("team") or pick.get("selection") or "").casefold(),
+                str(pick.get("market_type") or pick.get("market") or "").casefold(),
+                str(pick.get("posted_line") if pick.get("posted_line") is not None else pick.get("line") or ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(pick)
+        return unique
 
-    _block("🔥 PLAY OF THE DAY", sections.get("play_of_day", []))
+    def _block(title: str, ids: list[str], *, headline: bool = False, checkmarks: bool = False) -> None:
+        section_picks = _unique(ids)
+        if not section_picks:
+            return
+        block = [title]
+        for index, pick in enumerate(section_picks[:10]):
+            prefix = "⭐" if headline else "✅" if checkmarks else number_icons[index]
+            block.append(f"{prefix} {_format_pick_public(pick)}")
+        blocks.append(block)
+
+    _block("🔥 PLAY OF THE DAY", sections.get("play_of_day", []), headline=True)
     _block("🏆 TOP MONEYLINES", sections.get("moneylines", []))
-    _block("🔥 TOP F5", sections.get("f5", []))
-
-    runlines = sections.get("runlines", [])
-    if runlines:
-        _block("📈 TOP RUNLINES", runlines)
-
-    parlay_ids = card.get("parlay", [])
-    if parlay_ids:
-        lines.append("🧩 SAFE PARLAY")
-        for idx, pid in enumerate(parlay_ids, start=1):
-            pick = by_id.get(pid)
-            label = pick.get("team") or "Unknown" if pick else "Unknown"
-            lines.append(f"Leg {idx}: {label}")
-        lines.append("")
-
+    _block("🔥 FIRST 5 INNINGS", sections.get("f5", []))
+    _block("📈 RUN LINE LEANS", sections.get("runlines", []))
+    _block("🧩 SAFE 2-LEG PARLAY", card.get("parlay", []), checkmarks=True)
     _block("⚾ CORE FIVE", sections.get("core_five", []))
-
-    lines.append("Stats-based card. Odds vary by sportsbook. Verify lines before placing any wager.")
-    return "\n".join(lines).strip()
+    blocks.append([
+        "⚠️ Reminder:",
+        "Stats-based card. Odds vary by sportsbook.",
+        "Verify final lines and lineups before placing any wager.",
+        "",
+        "@betgptai",
+    ])
+    rendered = f"\n\n{separator}\n\n".join("\n".join(block).rstrip() for block in blocks)
+    return rendered[:4096].rstrip()
 
 
 def _resolve_destination(channel: str) -> int | str:

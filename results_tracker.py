@@ -125,7 +125,7 @@ def _status_for_result(result: Any) -> str:
 
 def _is_pending_pick(pick: dict[str, Any]) -> bool:
     """Treat both modern null results and older 'pending' strings as pending."""
-    if pick.get("result") in FINAL_RESULTS or pick.get("status") == "graded":
+    if pick.get("result") in FINAL_RESULTS or pick.get("status") in {"graded", "ungraded"}:
         return False
     return pick.get("status") == PENDING_RESULT or pick.get("result") in (
         None,

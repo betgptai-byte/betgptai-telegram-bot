@@ -1386,6 +1386,51 @@ async def results_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(text, reply_markup=markup)
 
 
+async def results_debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only read-only grading and duplicate audit."""
+    if not await _require_admin(update) or not update.message:
+        return
+    target = normalize_pick_date((context.args or [eastern_today().isoformat()])[0])
+    if not target:
+        await update.message.reply_text("Usage: /results_debug YYYY-MM-DD")
+        return
+    try:
+        from services.results_vault import render_results_debug, results_debug_payload
+        payload = await asyncio.to_thread(results_debug_payload, target)
+        await _send_long_message(update, render_results_debug(payload))
+    except Exception as error:
+        logging.exception("/results_debug failed")
+        await update.message.reply_text(f"/results_debug failed: {error}")
+
+
+async def repair_results_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only exact-duplicate cleanup and final-game regrade."""
+    if not await _require_admin(update) or not update.message:
+        return
+    target = normalize_pick_date((context.args or [""])[0])
+    if not target:
+        await update.message.reply_text("Usage: /repair_results YYYY-MM-DD")
+        return
+    try:
+        from services.results_vault import repair_results_date
+        result = await asyncio.to_thread(repair_results_date, target, cleanup_duplicates=True)
+        if not result.get("success"):
+            await update.message.reply_text(f"Repair failed: {result.get('error')}")
+            return
+        await update.message.reply_text(
+            "✅ RESULTS REPAIR COMPLETE\n\n"
+            f"Date: {target}\n"
+            f"Duplicates removed: {result.get('duplicates_removed', 0)}\n"
+            f"MLB picks graded: {result.get('graded_picks', 0)}\n"
+            f"Still pending: {result.get('pending_picks', 0)}\n"
+            f"Ungraded: {result.get('ungraded_picks', 0)}\n"
+            f"Results path: {result.get('path')}"
+        )
+    except Exception as error:
+        logging.exception("/repair_results failed")
+        await update.message.reply_text(f"/repair_results failed: {error}")
+
+
 async def date_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner-only date diagnostics for results buttons."""
     del context
@@ -6540,6 +6585,8 @@ async def main() -> None:
     application.add_handler(CommandHandler("results_30days", results_30days))
     application.add_handler(CommandHandler("results_season", results_season))
     application.add_handler(CommandHandler("results_date", results_date))
+    application.add_handler(CommandHandler("results_debug", results_debug_command))
+    application.add_handler(CommandHandler("repair_results", repair_results_command))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("storage_status", storage_status))
     application.add_handler(CommandHandler("system_diagnostics", system_diagnostics))

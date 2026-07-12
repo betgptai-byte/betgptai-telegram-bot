@@ -352,6 +352,23 @@ def export_simple_card_to_official_picks(card_date: str | None = None) -> dict:
         return result
 
     existing_ids = {p.get("pick_id") for p in existing if isinstance(p, dict)}
+    def bridge_key(pick: dict[str, Any], *, include_source: bool = True) -> tuple[str, ...]:
+        market = str(pick.get("market_type") or pick.get("market") or "").lower()
+        if market == "play_of_day":
+            market = "moneyline"
+        values = (
+            str(pick.get("card_date") or pick.get("date") or ""),
+            str(pick.get("sport") or "mlb").lower(),
+            str(pick.get("game_pk") or pick.get("game_id") or ""), market,
+            str(pick.get("selected_team") or pick.get("team") or "").lower(),
+            str(pick.get("line") if pick.get("line") is not None else pick.get("market_line") or ""),
+        )
+        return values + ((str(pick.get("source") or ""),) if include_source else ())
+    existing_contract_keys = {bridge_key(pick) for pick in existing if isinstance(pick, dict)}
+    simple_underlying_keys = {
+        bridge_key(pick, include_source=False) for pick in existing
+        if isinstance(pick, dict) and pick.get("source") == "simple_mlb_card_v1"
+    }
     imported: list[dict[str, Any]] = []
     skipped = 0
 
@@ -360,6 +377,9 @@ def export_simple_card_to_official_picks(card_date: str | None = None) -> dict:
             continue
         market = str(sp.get("market") or "")
         market_type = _BRIDGE_MARKET_TYPE.get(market, market)
+        if market in {"parlay", "safe_parlay", "parlay_leg"} or sp.get("parlay_leg"):
+            skipped += 1
+            continue
         if not sp.get("team") or not sp.get("game_id"):
             skipped += 1
             continue
@@ -394,10 +414,15 @@ def export_simple_card_to_official_picks(card_date: str | None = None) -> dict:
         }
         _normalize_saved_pick(norm)
         pid = norm.get("pick_id") or _official_pick_id(norm)
-        if pid in existing_ids:
+        norm["pick_id"] = pid
+        contract_key = bridge_key(norm)
+        underlying_key = bridge_key(norm, include_source=False)
+        if pid in existing_ids or contract_key in existing_contract_keys or underlying_key in simple_underlying_keys:
             skipped += 1
             continue
         existing_ids.add(pid)
+        existing_contract_keys.add(contract_key)
+        simple_underlying_keys.add(underlying_key)
         imported.append(norm)
 
     if imported:

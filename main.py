@@ -866,7 +866,7 @@ async def _verified_best_hit_text_for_today() -> tuple[str, dict[str, Any] | Non
         if result.get("status") == "ready" and isinstance(prop, dict):
             return _best_hit_text_from_prop(prop), prop
         logging.warning("Best Hit Prop rejected: %s", result.get("rejections") or result.get("reason"))
-        return "Best Hit Prop is being verified. Check back after confirmed lineups are available.", None
+        return "No public hit props today — no FanDuel verified positive-edge Over 0.5 Hits passed the full matchup system.", None
     except Exception:
         logging.exception("Could not verify Best Hit Prop")
         return "Best Hit Prop is being verified. Check back soon.", None

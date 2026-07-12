@@ -23,6 +23,7 @@ from openai_image_generator import generate_image
 from player_props_engine import (
     APPROVED_PROPS_FILE,
     build_player_props_lab,
+    is_official_positive_ev_hit_prop,
     remove_prop_from_today_cache,
 )
 from player_verification import verify_hit_prop_context
@@ -168,7 +169,10 @@ def select_best_hit_prop(
 ) -> tuple[dict[str, Any] | None, list[str]]:
     """Select the highest-rated hit prop that passes every V2 verification."""
     rejections: list[str] = []
-    for prop in payload.get("candidates", {}).get("hits", []):
+    for prop in payload.get("official_hit_props", []):
+        if not is_official_positive_ev_hit_prop(prop):
+            rejections.append(f"{prop.get('player_name')}: strict_positive_edge_gate_failed")
+            continue
         check = _verification_result(prop, slate)
         prop["image_v2_verification"] = check
         if check.get("verified"):
@@ -179,6 +183,7 @@ def select_best_hit_prop(
             prop["opponent"] = prop["opponent_name"]
             prop["lineup_verification"] = {
                 "verified": True,
+                "state": "Confirmed",
                 "status": check.get("lineup_status"),
                 "lineup_spot": check.get("lineup_spot"),
                 "reason": check.get("reason") or "Lineup context verified.",
@@ -218,6 +223,10 @@ def _approved_verified_prop(card_date: str, slate: list[dict[str, Any]]) -> tupl
             continue
         if prop.get("prop_type") not in {"hits", "2_plus_hits"} and prop.get("market_type") != "hits":
             continue
+        if not is_official_positive_ev_hit_prop(prop):
+            rejections.append(f"{prop.get('player_name')}: strict_positive_edge_gate_failed")
+            rejected_keys.append(str(prop_key))
+            continue
         check = _verification_result(prop, slate)
         prop["image_v2_verification"] = check
         if check.get("verified"):
@@ -228,6 +237,7 @@ def _approved_verified_prop(card_date: str, slate: list[dict[str, Any]]) -> tupl
             prop["opponent"] = prop["opponent_name"]
             prop["lineup_verification"] = {
                 "verified": True,
+                "state": "Confirmed",
                 "status": check.get("lineup_status"),
                 "lineup_spot": check.get("lineup_spot"),
                 "reason": check.get("reason") or "Lineup context verified.",
@@ -272,7 +282,7 @@ def get_verified_best_hit_prop(
     if not prop:
         return {
             "status": "no_verified_prop",
-            "reason": "❌ Best hit prop rejected due to failed team verification.",
+            "reason": "No public hit props today — no FanDuel verified positive-edge Over 0.5 Hits passed the full matchup system.",
             "payload": payload,
             "rejections": rejections,
         }

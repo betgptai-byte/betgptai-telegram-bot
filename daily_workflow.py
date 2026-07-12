@@ -802,7 +802,7 @@ def _footer() -> str:
 
 def _best_hit_text(card_date: str) -> str:
     if os.getenv("PROP_PUBLIC_ENABLED", "false").strip().lower() not in {"1", "true", "yes", "on"}:
-        return "⚾ BEST HIT PROP\n\nPublic player props are disabled pending lineup verification."
+        return ""
     payload = _read_json(data_file("best_hit_prop.json"), {})
     prop = None
     if isinstance(payload, dict):
@@ -810,7 +810,7 @@ def _best_hit_text(card_date: str) -> str:
         if isinstance(day, dict):
             prop = day.get("prop")
     if not isinstance(prop, dict):
-        return "⚾ BEST HIT PROP\n\nBest Hit Prop is pending final verification."
+        return ""
     lineup = prop.get("lineup_verification") if isinstance(prop.get("lineup_verification"), dict) else {}
     lab = _read_json(data_file("props_lab.json"), {})
     day = lab.get(card_date) if isinstance(lab, dict) and isinstance(lab.get(card_date), dict) else {}
@@ -825,8 +825,10 @@ def _best_hit_text(card_date: str) -> str:
         item.get("prop_type") == "hits" and item.get("selection") == "Over"
         and item.get("line") == 0.5 and item.get("line_verified")
         and item.get("odds_verified") and item.get("over_odds") is not None
-        and ((item.get("edge_score") is not None and item.get("edge_score") > 0)
-             or float(item.get("model_score") or item.get("raw_score") or 0) >= 70)
+        and item.get("edge_score") is not None and item.get("edge_score") > 0
+        and float(item.get("model_score") or item.get("raw_score") or 0) >= 70
+        and float(item.get("matchup_score") or 0) >= 65
+        and not item.get("official_rejection_reasons")
         and isinstance(item.get("lineup_verification"), dict)
         and item["lineup_verification"].get("verified")
         and item["lineup_verification"].get("state") == "Confirmed"
@@ -841,7 +843,7 @@ def _best_hit_text(card_date: str) -> str:
         and bool(lab_match.get("line_verified")) and bool(lab_match.get("odds_verified"))
     )
     if not official_shape_ok or not lineup.get("verified") or lineup.get("state") == "Scratched" or prop.get("status") == "invalidated" or not scratch_passed:
-        return "⚾ BEST HIT PROP\n\nBest Hit Prop is pending verified lineup and scratch checks."
+        return ""
     return (
         "⚾ BEST HIT PROP\n\n"
         f"👤 {prop.get('player_name', 'Player')}\n"
@@ -887,26 +889,31 @@ def _top_mlb_plays(card: str) -> str:
 def _free_channel_posts(card: str, card_date: str) -> list[str]:
     best_hit = _best_hit_text(card_date)
     parlay = _safe_parlay_text(card_date)
-    return [
+    posts = [
         render_play_of_day_card(card_date),
         render_mlb_premium_card(card_date),
-        f"{best_hit}\n\n━━━━━━━━━━━━\n\n{_footer()}",
         f"{parlay}\n\nTap /vip for the full BETGPTAI card.",
     ]
+    if best_hit:
+        posts.insert(2, f"{best_hit}\n\n━━━━━━━━━━━━\n\n{_footer()}")
+    return posts
 
 
 def _vip_channel_posts(card: str, card_date: str) -> list[str]:
     vault = _safe_parlay_text(card_date)
-    return [
+    posts = [
         render_mlb_premium_card(card_date),
         render_category_card(card_date, "🏆 TOP 5 MONEYLINE", "moneyline"),
         render_category_card(card_date, "📈 TOP 5 RUNLINE", "runline"),
         render_category_card(card_date, "🔥 TOP 5 F5 MONEYLINE", "f5_moneyline"),
         render_category_card(card_date, "🎯 TOP 5 TOTALS", "total"),
         render_category_card(card_date, "💰 TOP 5 TEAM TOTALS", "team_total"),
-        f"⚾ FULL PROP CARD\n\n{_best_hit_text(card_date)}\n\nMore verified props pending admin approval.\n\n━━━━━━━━━━━━\n\n{_footer()}",
         f"🔥 BETGPTAI VIP VAULT\n\n{vault}\n\n━━━━━━━━━━━━\n\n{_footer()}",
     ]
+    best_hit = _best_hit_text(card_date)
+    if best_hit:
+        posts.insert(-1, f"⚾ FULL PROP CARD\n\n{best_hit}\n\n━━━━━━━━━━━━\n\n{_footer()}")
+    return posts
 
 
 def _community_teaser(card: str) -> str:

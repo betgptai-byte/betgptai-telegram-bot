@@ -337,6 +337,52 @@ def _ev_fields(score: float, odds: int | None) -> tuple[float, float | None, flo
     return projected, implied, edge, value_note
 
 
+def official_hit_rejection_reasons(prop: dict[str, Any]) -> list[str]:
+    """Return stable QC reason codes for the strict public FanDuel hit gate."""
+    reasons: list[str] = []
+    lineup = _dict(prop.get("lineup_verification"))
+    player = _dict(prop.get("player_verification"))
+    matchup = _dict(prop.get("matchup_analysis"))
+    edge = _num(prop.get("edge_score") if prop.get("edge_score") is not None else prop.get("edge"))
+    model_score = _num(prop.get("model_score") if prop.get("model_score") is not None else prop.get("raw_score")) or 0
+    matchup_score = _num(prop.get("matchup_score")) or 0
+    if not (
+        str(prop.get("sportsbook") or "").lower() == "fanduel"
+        and str(prop.get("market_type") or "").lower() == "player_hits"
+        and str(prop.get("selection_type") or "").lower() == "over"
+        and prop.get("over_odds") is not None
+        and prop.get("line_verified") and prop.get("odds_verified")
+    ):
+        reasons.append("no_verified_fanduel_line")
+    if _num(prop.get("line")) != 0.5:
+        reasons.append("hit_line_not_0_5")
+    if not lineup.get("verified") or lineup.get("state") != "Confirmed":
+        reasons.append("lineup_not_confirmed")
+    if not lineup.get("lineup_spot"):
+        reasons.append("not_starting")
+    if not player.get("verified") or not player.get("active_roster", True):
+        reasons.append("stale_roster")
+    if not prop.get("scratch_check_passed", prop.get("status") != "invalidated"):
+        reasons.append("scratched")
+    if edge is None or edge <= 0:
+        reasons.append("negative_edge")
+    if model_score < 70:
+        reasons.append("model_score_too_low")
+    if matchup_score < 65:
+        reasons.append("matchup_score_too_low")
+    if not _dict(matchup.get("bvp")):
+        reasons.append("no_bvp_data")
+    if (_num(matchup.get("pitch_type_edge_score")) or 0) < 45:
+        reasons.append("poor_pitch_type_matchup")
+    if (_num(matchup.get("strikeout_risk_score")) or 0) >= 65:
+        reasons.append("high_k_risk")
+    return list(dict.fromkeys(reasons))
+
+
+def is_official_positive_ev_hit_prop(prop: dict[str, Any]) -> bool:
+    return not official_hit_rejection_reasons(prop)
+
+
 def _reason(parts: list[str]) -> str:
     return " ".join(part for part in parts if part).strip()
 
@@ -553,6 +599,28 @@ def _build_hitter_props(context: dict[str, Any]) -> tuple[list[dict[str, Any]], 
                 prop["projected_batting_position"] = lineup_index
                 prop["hitting_streak"] = streak
                 prop["hitting_streak_adjustment"] = streak_adjustment
+                prop["matchup_score"] = _num(mu.get("overall_hit_score")) or 0
+                prop["matchup_analysis"] = {
+                    "opposing_pitcher": mu.get("opposing_pitcher") or context.get("opposing_pitcher"),
+                    "bvp": _dict(mu.get("bvp")),
+                    "contact_edge_score": mu.get("contact_edge_score"),
+                    "pitch_type_edge_score": mu.get("pitch_type_edge_score"),
+                    "strikeout_risk_score": mu.get("strikeout_risk_score"),
+                    "platoon_edge_score": mu.get("platoon_edge_score"),
+                    "savant": {
+                        "xBA": hitter.get("xBA"), "xwOBA": hitter.get("xwOBA"),
+                        "hard_hit_pct": hitter.get("Hard Hit %"), "barrel_pct": hitter.get("Barrel %"),
+                        "whiff_pct": hitter.get("Whiff %"), "chase_pct": hitter.get("Chase %"),
+                    },
+                    "recent_form": streak,
+                    "data_quality_grade": mu.get("data_quality_grade"),
+                    "red_flags": [
+                        code for code, failed in (
+                            ("poor_pitch_type_matchup", (_num(mu.get("pitch_type_edge_score")) or 0) < 45),
+                            ("high_k_risk", (_num(mu.get("strikeout_risk_score")) or 0) >= 65),
+                        ) if failed
+                    ],
+                }
                 prop["savant_verification"] = {
                     "verified": any(
                         hitter.get(field) not in (None, "", "unavailable")
@@ -781,7 +849,9 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
     fanduel_rejection_counts: dict[str, int] = {
         "no_matching_fanduel_market": 0, "hit_line_not_0_5": 0,
         "non_mlb_team_context": 0, "not_on_active_roster": int(reason_counts.get("not_on_active_roster") or 0),
+        "stale_roster": int(reason_counts.get("not_on_active_roster") or 0),
         "scratched": int(reason_counts.get("scratched") or 0), "missing_team_context": 0,
+        "no_verified_fanduel_line": 0, "lineup_not_confirmed": 0,
     }
     alternate_lines: list[dict[str, Any]] = []
     from api.sharp_client import _normalize_team as normalize_team
@@ -844,7 +914,9 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
             prop.update({
                 "line": match.get("line"), "odds": match.get("over_odds"),
                 "over_odds": match.get("over_odds"), "under_odds": match.get("under_odds"),
-                "selection": "Over", "line_verified": bool(match.get("line_verified")),
+                "selection": "Over", "selection_type": "over",
+                "market_type": match.get("market_type"),
+                "line_verified": bool(match.get("line_verified")),
                 "odds_verified": bool(match.get("odds_verified") or match.get("over_odds") is not None),
                 "sportsbook": "fanduel", "provider": "sharpapi",
                 "source": "sharpapi_fanduel_props", "fanduel_market_verified": True,
@@ -853,18 +925,21 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
             edge_text = f"{edge:.4f}" if edge is not None else "unavailable"
             verified_note = f"FanDuel line verified. Model score: {float(prop.get('raw_score') or 0):.1f}. Edge: {edge_text}."
             if edge is not None and edge <= 0:
-                verified_note += " Negative EV at current price — admin watch only."
+                verified_note += " Negative EV at current FanDuel price. Admin watch only."
             prop.update({
                 "projected_probability": projected, "implied_probability": implied,
                 "edge": edge, "edge_score": edge, "model_score": float(prop.get("raw_score") or 0),
                 "value_note": verified_note,
                 "reason": f"{str(prop.get('reason') or '').replace('Model lean — odds not verified.', '').strip()} {verified_note}".strip(),
+                "scratch_check_passed": prop.get("status") != "invalidated",
             })
             matched_players.add(pname)
         else:
             prop["fanduel_market_verified"] = False
             if not same_player_market:
                 reject("no_matching_fanduel_market", f"{prop.get('player_name')} {prop.get('prop_type')}")
+                if prop.get("prop_type") == "hits":
+                    reject("no_verified_fanduel_line", f"{prop.get('player_name')} has no verified FanDuel Over 0.5 Hits line")
 
     if grouped_fanduel:
         filtered_props: list[dict[str, Any]] = []
@@ -887,27 +962,18 @@ def build_player_props_lab(slate: list[dict[str, Any]], card_date: str) -> dict[
         prop_type: [prop for prop in all_props if prop.get("prop_type") == prop_type]
         for prop_type in SUPPORTED_PROP_TYPES
     }
-    def official_hit_ready(prop: dict[str, Any]) -> bool:
-        lineup = _dict(prop.get("lineup_verification"))
-        player = _dict(prop.get("player_verification"))
-        edge = _num(prop.get("edge_score") if prop.get("edge_score") is not None else prop.get("edge"))
-        score = _num(prop.get("model_score") if prop.get("model_score") is not None else prop.get("raw_score")) or 0
-        return bool(
-            prop.get("prop_type") == "hits"
-            and _num(prop.get("line")) == 0.5
-            and prop.get("selection") == "Over"
-            and prop.get("over_odds") is not None
-            and prop.get("line_verified") and prop.get("odds_verified")
-            and lineup.get("verified") and lineup.get("state") == "Confirmed"
-            and player.get("verified") and player.get("active_roster", True)
-            and prop.get("status") != "invalidated"
-            and ((edge is not None and edge > 0) or score >= 70)
-        )
-    official_hit_props = [prop for prop in grouped["hits"] if official_hit_ready(prop)]
+    official_hit_props = [prop for prop in grouped["hits"] if is_official_positive_ev_hit_prop(prop)]
     admin_hit_watch = [
         prop for prop in grouped["hits"]
         if prop.get("fanduel_market_verified") and prop not in official_hit_props
     ]
+    for prop in official_hit_props + admin_hit_watch:
+        prop["official_rejection_reasons"] = official_hit_rejection_reasons(prop)
+        score = _num(prop.get("model_score")) or 0
+        prop["confidence_grade"] = "Elite" if score >= 85 else "Strong" if score >= 75 else "Lean" if score >= 70 else "Watch only"
+    for prop in admin_hit_watch:
+        for code in prop.get("official_rejection_reasons") or []:
+            fanduel_rejection_counts[code] = fanduel_rejection_counts.get(code, 0) + 1
     teams_playing: list[str] = []
     for game in slate:
         for team in (game.get("away_team"), game.get("home_team")):
@@ -1378,26 +1444,32 @@ def render_hitprops_debug(payload: dict[str, Any]) -> str:
         lines.extend(["", "No qualified props available."])
     hit_candidates = payload.get("official_hit_props", []) if isinstance(payload, dict) else []
     admin_watch = payload.get("admin_hit_watch", []) if isinstance(payload, dict) else []
-    lines.extend(["", "Official Hit Props:"])
+    lines.extend(["", "Official Positive-EV Hit Props:"])
     for idx, prop in enumerate(hit_candidates[:10], start=1):
         lineup = _dict(prop.get("lineup_verification"))
         lines.extend([
             f"{idx}. {prop.get('player_name')} — {prop.get('team_name')} vs {prop.get('opponent_name')}",
-            f"   Pitcher: {_dict(prop.get('debug_context')).get('opposing_pitcher')}",
-            f"   Line: Over {prop.get('line')}",
+            f"   FD Line: Over {prop.get('line')} Hits",
             f"   Odds: {prop.get('odds')}",
+            f"   SP: {_dict(prop.get('matchup_analysis')).get('opposing_pitcher') or _dict(prop.get('debug_context')).get('opposing_pitcher')}",
+            f"   BvP: {_dict(_dict(prop.get('matchup_analysis')).get('bvp')) or 'Unavailable'}",
+            f"   Savant: {_dict(_dict(prop.get('matchup_analysis')).get('savant')) or 'Unavailable'}",
+            f"   Pitch-type edge: {_dict(prop.get('matchup_analysis')).get('pitch_type_edge_score')}",
+            f"   Recent form: {_dict(prop.get('matchup_analysis')).get('recent_form') or 'Unavailable'}",
             f"   Lineup: {lineup.get('state') or lineup.get('status')} spot {lineup.get('lineup_spot')}",
-            f"   Edge: {prop.get('edge')} | score {prop.get('raw_score')}",
+            f"   Edge: {prop.get('edge_score')}",
+            f"   Matchup score: {prop.get('matchup_score')}",
+            f"   Grade: {prop.get('confidence_grade')}",
             f"   Reason: {prop.get('reason')}",
         ])
     if not hit_candidates:
         lines.append("No official Over 0.5 hit props available from FanDuel right now.")
-    lines.extend(["", "Admin Watch:"])
+    lines.extend(["", "Admin Watch Only:"])
     for idx, prop in enumerate(admin_watch[:10], start=1):
         lines.append(
             f"{idx}. {prop.get('player_name')} — {prop.get('team_name')} vs {prop.get('opponent_name')} — "
             f"Over {prop.get('line')} Hits — {prop.get('odds')} — edge {prop.get('edge')} — "
-            f"{prop.get('value_note') or 'Below public qualification threshold.'}"
+            f"{', '.join(prop.get('official_rejection_reasons') or []) or 'Below public qualification threshold.'}"
         )
     if not admin_watch:
         lines.append("- None")
@@ -1411,6 +1483,9 @@ def render_hitprops_debug(payload: dict[str, Any]) -> str:
         f"- Rejected scratched/not active: {int(counts.get('scratched', 0)) + int(counts.get('not_on_active_roster', 0))}",
     ])
     rejection_items = fanduel.get("rejections") or []
+    lines.extend(["", "Rejected Summary:"])
+    for code in ("negative_edge", "matchup_score_too_low", "no_verified_fanduel_line", "lineup_not_confirmed", "stale_roster"):
+        lines.append(f"- {code}: {counts.get(code, 0)}")
     lines.extend(["", "FanDuel rejection reasons:"])
     lines.extend(f"- {reason}" for reason in rejection_items[:20])
     if not rejection_items:
